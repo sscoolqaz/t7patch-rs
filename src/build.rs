@@ -115,10 +115,17 @@ pub const fn live_rva(february_rva: usize, build: Build) -> usize {
 }
 
 /// Maps a live RVA in `build` back to its February-2026 equivalent.
+///
+/// The domain is RVAs that exist in the live image. On September, the shifted
+/// February range `[SEPTEMBER_SHIFT_START_RVA, PRIMARY_CODE_END_RVA)` lives at
+/// `[START - DELTA, END - DELTA)`, so that is the range moved back. The February
+/// bytes `[START - DELTA, START)` were removed in September, so a live RVA there
+/// is always shifted code, never an unchanged February address. Live RVAs in
+/// `[END - DELTA, END)` and outside the code range pass through unchanged.
 pub const fn february_rva(live_rva: usize, build: Build) -> usize {
     if matches!(build, Build::September2026)
-        && live_rva >= SEPTEMBER_SHIFT_START_RVA
-        && live_rva < PRIMARY_CODE_END_RVA
+        && live_rva >= SEPTEMBER_SHIFT_START_RVA - SEPTEMBER_CODE_DELTA
+        && live_rva < PRIMARY_CODE_END_RVA - SEPTEMBER_CODE_DELTA
     {
         live_rva + SEPTEMBER_CODE_DELTA
     } else {
@@ -174,6 +181,40 @@ mod tests {
                 february_rva(live_rva(rva, Build::September2026), Build::September2026),
                 rva
             );
+        }
+    }
+
+    #[test]
+    fn february_rva_uses_the_shifted_bounds() {
+        let sep = Build::September2026;
+        let start = SEPTEMBER_SHIFT_START_RVA;
+        let end = PRIMARY_CODE_END_RVA;
+        let delta = SEPTEMBER_CODE_DELTA;
+        // Lower live bound: the first shifted byte maps back to the shift start.
+        assert_eq!(february_rva(start - delta - 1, sep), start - delta - 1);
+        assert_eq!(february_rva(start - delta, sep), start);
+        assert_eq!(february_rva(start - delta + 1, sep), start + 1);
+        // Live RVAs between the shifted start and the February start are shifted code.
+        assert_eq!(february_rva(start - 1, sep), start - 1 + delta);
+        // Upper live bound.
+        assert_eq!(february_rva(end - delta - 1, sep), end - 1);
+        assert_eq!(february_rva(end - delta, sep), end - delta);
+        assert_eq!(february_rva(end, sep), end);
+        // Other builds are unchanged.
+        assert_eq!(february_rva(start, Build::February2026), start);
+    }
+
+    #[test]
+    fn february_rva_inverts_live_rva_across_the_shifted_range() {
+        let sep = Build::September2026;
+        for rva in [
+            SEPTEMBER_SHIFT_START_RVA,
+            SEPTEMBER_SHIFT_START_RVA + 1,
+            PRIMARY_CODE_END_RVA - 1,
+            SEPTEMBER_SHIFT_START_RVA - SEPTEMBER_CODE_DELTA - 1,
+            PRIMARY_CODE_END_RVA,
+        ] {
+            assert_eq!(february_rva(live_rva(rva, sep), sep), rva, "{rva:#x}");
         }
     }
 }
