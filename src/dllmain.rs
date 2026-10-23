@@ -138,6 +138,9 @@ impl Operations for PatchOps {
         if arxan::partial() {
             failures.push("T7 Patch: Arxan restoration is incomplete".to_owned());
         }
+        if crate::threads::thaw_failed() {
+            failures.push("T7 Patch: a game thread could not be resumed".to_owned());
+        }
         let priority = ORIGINAL_PRIORITY.load(Ordering::Acquire);
         if priority != 0 {
             // SAFETY: the current process handle is a pseudo-handle.
