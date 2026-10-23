@@ -10,6 +10,7 @@
 pub mod arxan;
 pub mod build;
 pub mod campaign;
+pub mod exception;
 pub mod ffi;
 pub mod fnv;
 pub mod gscu_hash;

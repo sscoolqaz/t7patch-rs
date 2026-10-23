@@ -1706,8 +1706,10 @@ unsafe extern "system" fn main_thread(_param: *mut c_void) -> u32 {
     }
 }
 
-/// TODO(port): `arxan_bypass::maintain` from Arxan.cpp. Called once per second by the main thread.
-pub fn arxan_bypass_maintain() {}
+/// Re-applies the Arxan bypass if the game restored it. Called once per second by the main thread.
+pub fn arxan_bypass_maintain() {
+    crate::arxan::maintain();
+}
 
 // ---------------------------------------------------------------------------
 // Lobby packet inspection
