@@ -3,9 +3,23 @@
 set -e
 
 cargo fmt --check
-cargo clippy --all-targets --quiet -- -D warnings
 
-# The mingw target must also build. Check it when its Rust target is installed.
-if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$'; then
+# The crate only builds for Windows targets. On a Windows host, check the default
+# target. On any host, also check mingw when its Rust target and the mingw C
+# compiler (needed to build MinHook) are both installed.
+checked=0
+case "$(rustc -vV | sed -n 's/^host: //p')" in
+    *windows*)
+        cargo clippy --all-targets --quiet -- -D warnings
+        checked=1
+        ;;
+esac
+if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$' \
+    && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     cargo clippy --all-targets --quiet --target x86_64-pc-windows-gnu -- -D warnings
+    checked=1
+fi
+if [ "$checked" = 0 ]; then
+    echo "pre-commit: no Windows target to check; install x86_64-pc-windows-gnu and mingw-w64" >&2
+    exit 1
 fi

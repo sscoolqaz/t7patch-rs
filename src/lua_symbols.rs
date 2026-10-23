@@ -1240,7 +1240,7 @@ mod tests {
             42,\n";
         let databases = parse_stock_database(&text[..]);
         assert_eq!(databases.symbols[&1234].source, b"scripts/a.gsc");
-        assert!(databases.symbols[&1234].function_name.is_empty());
+        assert_eq!(databases.symbols[&1234].function_name, b"");
         assert_eq!(databases.symbols[&5678].function_name, b"fn_v2");
         assert_eq!(databases.symbols[&9012].function_name, b"fn_v3");
         assert_eq!(databases.prototypes[&9012][0].code_offset, 16);
@@ -1253,7 +1253,7 @@ mod tests {
         let text = b"5678,a.gsc,fn_v2\n5678,a.gsc,fn_other\n";
         let databases = parse_stock_database(&text[..]);
         assert_eq!(databases.symbols[&5678].source, b"a.gsc");
-        assert!(databases.symbols[&5678].function_name.is_empty());
+        assert_eq!(databases.symbols[&5678].function_name, b"");
     }
 
     #[test]

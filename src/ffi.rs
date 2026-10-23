@@ -1,19 +1,35 @@
-//! Wrappers over `MinHook`.
+//! Bindings to `MinHook`.
 //!
-//! The `minhook-sys` crate builds `MinHook` from source with `cc`, so the same
-//! code links for the MSVC and mingw targets. Safe wrappers return `Result` so
-//! callers do not compare raw status codes.
+//! The `minhook` crate compiles `MinHook` v1.3.4 from source with `cc`, so the
+//! library links for the MSVC and mingw targets. Its Rust wrapper is not used:
+//! it panics when initialization fails and can uninitialize only once, and a
+//! panic inside `DllMain` aborts the game. The crate is linked only for its C
+//! library, and the functions the patch uses are declared here. Safe wrappers
+//! return `Result` so callers do not compare raw status codes.
 
 use std::ffi::c_void;
 use std::fmt;
 
-use minhook_sys::{
-    MH_CreateHook, MH_DisableHook, MH_EnableHook, MH_Initialize, MH_OK, MH_RemoveHook,
-    MH_Uninitialize,
-};
+// Links the `MinHook` static library that the crate builds.
+use minhook as _;
 
 /// Raw `MH_STATUS` value.
-pub type RawStatus = minhook_sys::MH_STATUS;
+pub type RawStatus = i32;
+
+const MH_OK: RawStatus = 0;
+
+unsafe extern "system" {
+    fn MH_Initialize() -> RawStatus;
+    fn MH_Uninitialize() -> RawStatus;
+    fn MH_CreateHook(
+        target: *mut c_void,
+        detour: *mut c_void,
+        original: *mut *mut c_void,
+    ) -> RawStatus;
+    fn MH_RemoveHook(target: *mut c_void) -> RawStatus;
+    fn MH_EnableHook(target: *mut c_void) -> RawStatus;
+    fn MH_DisableHook(target: *mut c_void) -> RawStatus;
+}
 
 /// Failure reported by `MinHook`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

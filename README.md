@@ -23,8 +23,9 @@ Status: all C++ modules ported; not yet run inside the game. See the checklist b
 
 ## Build
 
-`MinHook` comes from the `minhook-sys` crate, which compiles it from source, so
-both the MSVC and the mingw targets build.
+`MinHook` v1.3.4 is compiled from source by the `minhook` crate, so both the
+MSVC and the mingw targets build. The crate builds only for Windows targets, so
+on Linux the tests run under Wine (below).
 
 On Windows with MSVC:
 
@@ -50,7 +51,8 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-win
 ```
 
 A mingw build does not install the `__report_gsfailure` hook. That hook only
-exists for MSVC's `/GS` stack cookies, which gcc does not emit.
+exists for MSVC's `/GS` stack cookies, which gcc does not emit. In an MSVC build
+it covers only the `MinHook` C code, because Rust emits no stack cookies.
 
 ## Credits
 

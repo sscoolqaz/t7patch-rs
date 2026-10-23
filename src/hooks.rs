@@ -156,7 +156,7 @@ pub const LEGIT_PACKETS: [&str; 15] = [
 // ---------------------------------------------------------------------------
 
 #[cfg(target_env = "msvc")]
-type GsFailureFn = unsafe extern "system" fn(i64);
+type GsFailureFn = unsafe extern "system" fn(usize);
 type PrepWriteMsgFn = unsafe extern "system" fn(i64, i64, i32, i32) -> bool;
 type PrepReadMsgFn = unsafe extern "system" fn(i64) -> bool;
 type BuildTitleFn = unsafe extern "system" fn() -> *const c_char;
@@ -877,7 +877,7 @@ pub fn menu_allowed_without_host(verb: MenuVerb, is_campaign: bool) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_env = "msvc")]
-unsafe extern "C" {
+unsafe extern "system" {
     /// The MSVC CRT's `/GS` failure reporter. `cl` builds `MinHook` with `/GS` on,
     /// so its `__security_check_cookie` calls link this into the DLL.
     fn __report_gsfailure(stack_cookie: usize);
@@ -886,11 +886,14 @@ unsafe extern "C" {
 /// Port of `__report_gsfailure_hook`. Replaces the CRT's fast-fail on a `/GS` cookie
 /// mismatch with an access violation, which the exception handler can catch.
 ///
+/// The C++ hook covers every `/GS` check in the DLL. Rust emits no stack cookies,
+/// so here it covers only the `MinHook` C code. It is kept for parity.
+///
 /// # Safety
 ///
 /// Only `MinHook` calls this, in place of `__report_gsfailure`. It always faults.
 #[cfg(target_env = "msvc")]
-unsafe extern "system" fn report_gsfailure_hook(_security_cookie: i64) {
+unsafe extern "system" fn report_gsfailure_hook(_stack_cookie: usize) {
     // SAFETY: intentionally invalid, as in the C++. The write faults at address 0x17.
     unsafe { write_game::<i64>(0x17, 0) };
 }
@@ -1935,9 +1938,9 @@ pub fn apply_hooks() {
     // such function to hook.
     #[cfg(target_env = "msvc")]
     {
-        let target = __report_gsfailure as unsafe extern "C" fn(usize) as usize;
+        let target = __report_gsfailure as GsFailureFn as usize;
         let detour = report_gsfailure_hook as GsFailureFn as usize;
-        // SAFETY: both functions take one pointer-sized cookie and return nothing.
+        // SAFETY: both functions have the type `GsFailureFn`.
         let _ = unsafe { ffi::create_hook(target, detour) };
     }
     hook(
