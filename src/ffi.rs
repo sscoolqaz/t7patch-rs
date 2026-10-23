@@ -1,7 +1,10 @@
-//! Wrappers over `min_hook_rs`, a pure-Rust port of `MinHook`.
+//! Wrappers over `min_hook_rs`, a pure-Rust port of `MinHook`, vendored and
+//! patched in `vendor/min_hook_rs` (see its `VENDORED.md`).
 //!
 //! The port keeps `MinHook`'s design: the HDE64 length decoder, trampolines
 //! allocated within 2 GB of the target, and thread suspension while patching.
+//! The vendored copy freezes fail closed and applies each change as one
+//! transaction: on any error no hook changes state.
 //! Its functions are safe to call in Rust's type system, but hooking arbitrary
 //! addresses is not, so the wrappers below keep `unsafe` contracts. They take
 //! addresses as `usize`, as the rest of the port does.
@@ -10,7 +13,13 @@ use std::ffi::c_void;
 
 use min_hook_rs::{ALL_HOOKS, HookError};
 
-/// Failure reported by the hooking library. The codes match `MH_STATUS`.
+/// Failure reported by the hooking library. Codes 1 to 12 match `MH_STATUS`.
+/// The vendored copy adds two, both reported with nothing changed:
+///
+/// - [`HookError::ThreadSuspend`] (13): a thread could not be enumerated,
+///   opened or suspended, so nothing was patched.
+/// - [`HookError::ThreadContext`] (14): a suspended thread's context could not
+///   be read or written, and the change was rolled back.
 pub type MinHookError = HookError;
 
 /// Initializes the hooking library. Call once before creating hooks.
@@ -19,6 +28,8 @@ pub fn initialize() -> Result<(), MinHookError> {
 }
 
 /// Tears the hooking library down, disabling and removing every hook it created.
+/// The trampolines are freed only if no thread was found inside one; otherwise
+/// they are kept for the process lifetime. On error the library stays initialized.
 pub fn uninitialize() -> Result<(), MinHookError> {
     min_hook_rs::uninitialize()
 }
@@ -53,7 +64,8 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
     min_hook_rs::disable_hook(target as *mut c_void)
 }
 
-/// Removes a hook entirely.
+/// Removes a hook entirely. Its trampoline is freed only if no thread was found
+/// inside it. On error the hook is kept.
 ///
 /// # Safety
 ///
@@ -111,5 +123,21 @@ mod tests {
         // SAFETY: `target` was hooked above.
         unsafe { remove_hook(target) }.expect("remove_hook");
         uninitialize().expect("uninitialize");
+    }
+
+    #[test]
+    fn freeze_errors_have_stable_codes_and_messages() {
+        assert_eq!(MinHookError::ThreadSuspend as i32, 13);
+        assert_eq!(MinHookError::ThreadContext as i32, 14);
+        assert_eq!(MinHookError::from_code(13), MinHookError::ThreadSuspend);
+        assert_eq!(MinHookError::from_code(14), MinHookError::ThreadContext);
+        assert_eq!(
+            MinHookError::ThreadSuspend.to_string(),
+            "Thread suspension failed"
+        );
+        assert_eq!(
+            MinHookError::ThreadContext.to_string(),
+            "Thread context access failed"
+        );
     }
 }

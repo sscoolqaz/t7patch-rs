@@ -49,6 +49,12 @@ pub enum HookError {
 
     /// The specified function is not found
     FunctionNotFound = 12,
+
+    /// A thread could not be enumerated, opened or suspended, so nothing was patched
+    ThreadSuspend = 13,
+
+    /// A suspended thread's context could not be read or written; the change was rolled back
+    ThreadContext = 14,
 }
 
 impl HookError {
@@ -68,6 +74,8 @@ impl HookError {
             HookError::MemoryProtect => "Memory protection failed",
             HookError::ModuleNotFound => "Module not found",
             HookError::FunctionNotFound => "Function not found",
+            HookError::ThreadSuspend => "Thread suspension failed",
+            HookError::ThreadContext => "Thread context access failed",
         }
     }
 
@@ -87,6 +95,8 @@ impl HookError {
             10 => HookError::MemoryProtect,
             11 => HookError::ModuleNotFound,
             12 => HookError::FunctionNotFound,
+            13 => HookError::ThreadSuspend,
+            14 => HookError::ThreadContext,
             _ => HookError::Unknown,
         }
     }
