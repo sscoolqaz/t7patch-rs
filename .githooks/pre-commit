@@ -1,0 +1,6 @@
+#!/bin/sh
+# Pre-commit gate: formatting and clippy must pass before a commit lands.
+set -e
+
+cargo fmt --check
+cargo clippy --all-targets --quiet -- -D warnings
