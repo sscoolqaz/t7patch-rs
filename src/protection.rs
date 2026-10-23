@@ -2714,6 +2714,29 @@ pub unsafe fn inspect_lm(_record: *const EXCEPTION_RECORD, context: *mut CONTEXT
     }
 }
 
+/// Repairs a fault this crate induced on purpose: a read through the lobby-print
+/// marker. Returns `true` when the fault was ours. Runs before the handler-active
+/// check, because a thread can hold the marker after the patch is deactivated,
+/// and nothing else would repair it. Uses only statics that live for the process.
+///
+/// # Safety
+///
+/// Called by the exception dispatcher with the live record and context.
+pub unsafe fn repair_induced_exception(
+    record: *const EXCEPTION_RECORD,
+    context: *mut CONTEXT,
+) -> bool {
+    // SAFETY: the dispatcher passes a live context.
+    if unsafe { (*context).Rcx } != LOBBY_MSG_MARKER {
+        return false;
+    }
+    // SAFETY: forwarded from the dispatcher.
+    unsafe { inspect_lm(record, context) };
+    // SAFETY: forwarded from the dispatcher.
+    unsafe { resume(context) };
+    true
+}
+
 /// Port of `Protection::ExceptHook`. Applies the crash fixups and resumes the thread.
 ///
 /// # Safety
@@ -2722,13 +2745,8 @@ pub unsafe fn inspect_lm(_record: *const EXCEPTION_RECORD, context: *mut CONTEXT
 pub unsafe fn except_hook(record: *const EXCEPTION_RECORD, context: *mut CONTEXT) {
     // SAFETY: the dispatcher passes live records.
     let fault = unsafe { (*record).ExceptionAddress } as usize;
-    // SAFETY: as above.
-    let rcx = unsafe { (*context).Rcx };
-    if rcx == LOBBY_MSG_MARKER {
-        // SAFETY: forwarded from the dispatcher.
-        unsafe { inspect_lm(record, context) };
-        // SAFETY: forwarded from the dispatcher.
-        unsafe { resume(context) };
+    // SAFETY: forwarded from the dispatcher.
+    if unsafe { repair_induced_exception(record, context) } {
         return;
     }
     if fault == address(offsets::CHARACTER_INDEX_CRASH_A)

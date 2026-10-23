@@ -21,14 +21,17 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+use windows::Wdk::System::Threading::{NtQueryInformationThread, ThreadBasicInformation};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, STATUS_INFO_LENGTH_MISMATCH,
 };
-use windows::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext};
+use windows::Win32::System::Diagnostics::Debug::{
+    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, ReadProcessMemory,
+};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread, OpenThread, ResumeThread, Sleep,
-    SuspendThread, THREAD_ACCESS_RIGHTS, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread, OpenThread,
+    ResumeThread, Sleep, SuspendThread, THREAD_ACCESS_RIGHTS, THREAD_GET_CONTEXT,
+    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::arxan::WriteReport;
@@ -108,6 +111,7 @@ pub(crate) enum FreezeError {
     KeptAppearing,
     Resume,
     Disabled,
+    Stack,
 }
 
 impl FreezeError {
@@ -122,6 +126,7 @@ impl FreezeError {
             Self::KeptAppearing => "game threads kept appearing during the freeze",
             Self::Resume => "cannot resume every game thread",
             Self::Disabled => "code writes are disabled after a failed thread resume",
+            Self::Stack => "cannot read a game thread stack",
         }
     }
 }
@@ -192,7 +197,12 @@ pub(crate) trait ThreadOps {
     fn suspend(&mut self, handle: Self::Handle) -> bool;
     fn resume(&mut self, handle: Self::Handle) -> bool;
     fn exited(&mut self, handle: Self::Handle) -> bool;
-    fn rip(&mut self, handle: Self::Handle) -> Option<usize>;
+    /// The suspended thread's `(rip, rsp)`.
+    fn registers(&mut self, handle: Self::Handle) -> Option<(usize, usize)>;
+    /// The top (highest address) of the suspended thread's stack.
+    fn stack_base(&mut self, handle: Self::Handle) -> Option<usize>;
+    /// Reads `out.len()` words at `address` without faulting.
+    fn read_words(&mut self, address: usize, out: &mut [u64]) -> bool;
     fn close(&mut self, handle: Self::Handle);
     /// Waits briefly before a resume is retried.
     fn pause(&mut self);
@@ -201,6 +211,7 @@ pub(crate) trait ThreadOps {
 struct FrozenThread<H> {
     handle: H,
     rip: usize,
+    rsp: usize,
 }
 
 /// A suspended set of threads and the RIP captured for each.
@@ -227,8 +238,11 @@ impl<O: ThreadOps> Freeze<O> {
         }
         for index in 0..freeze.threads.len() {
             let handle = freeze.threads[index].handle;
-            match freeze.ops.rip(handle) {
-                Some(rip) => freeze.threads[index].rip = rip,
+            match freeze.ops.registers(handle) {
+                Some((rip, rsp)) => {
+                    freeze.threads[index].rip = rip;
+                    freeze.threads[index].rsp = rsp;
+                }
                 None => return Err(freeze.abort(FreezeError::Context)),
             }
         }
@@ -283,7 +297,11 @@ impl<O: ThreadOps> Freeze<O> {
             self.resume_one(handle);
             return Err(FreezeError::TooManyThreads);
         }
-        self.threads.push(FrozenThread { handle, rip: 0 });
+        self.threads.push(FrozenThread {
+            handle,
+            rip: 0,
+            rsp: 0,
+        });
         Ok(true)
     }
 
@@ -300,6 +318,44 @@ impl<O: ThreadOps> Freeze<O> {
         self.threads
             .iter()
             .any(|thread| rip_in(thread.rip, start, end))
+    }
+
+    /// True when any suspended thread has a word in `[start, end)` anywhere on
+    /// its live stack, from RSP up to the stack base. A return address into the
+    /// range means the thread will execute it again. The scan is conservative:
+    /// a stale value that only looks like such an address also counts.
+    pub(crate) fn any_stack_word_in(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<bool, FreezeError> {
+        const CHUNK_WORDS: usize = 64;
+        let mut chunk = [0u64; CHUNK_WORDS];
+        for index in 0..self.threads.len() {
+            let FrozenThread { handle, rsp, .. } = self.threads[index];
+            let base = self.ops.stack_base(handle).ok_or(FreezeError::Stack)?;
+            if rsp == 0 || rsp > base {
+                return Err(FreezeError::Stack);
+            }
+            let mut cursor = rsp & !7;
+            while cursor < base {
+                let words = ((base - cursor) / 8).min(CHUNK_WORDS);
+                if words == 0 {
+                    break;
+                }
+                if !self.ops.read_words(cursor, &mut chunk[..words]) {
+                    return Err(FreezeError::Stack);
+                }
+                if chunk[..words]
+                    .iter()
+                    .any(|&word| usize::try_from(word).is_ok_and(|word| rip_in(word, start, end)))
+                {
+                    return Ok(true);
+                }
+                cursor += words * 8;
+            }
+        }
+        Ok(false)
     }
 
     /// Resumes every thread exactly once.
@@ -472,14 +528,60 @@ impl ThreadOps for LiveOps {
         unsafe { GetExitCodeThread(handle, &raw mut code) }.is_ok() && code != STILL_ACTIVE_CODE
     }
 
-    fn rip(&mut self, handle: HANDLE) -> Option<usize> {
+    fn registers(&mut self, handle: HANDLE) -> Option<(usize, usize)> {
         let mut context = CONTEXT {
             ContextFlags: CONTEXT_FULL_AMD64,
             ..Default::default()
         };
         // SAFETY: the thread is suspended and the context is a valid out-buffer.
         unsafe { GetThreadContext(handle, &raw mut context) }.ok()?;
-        usize::try_from(context.Rip).ok()
+        Some((
+            usize::try_from(context.Rip).ok()?,
+            usize::try_from(context.Rsp).ok()?,
+        ))
+    }
+
+    fn stack_base(&mut self, handle: HANDLE) -> Option<usize> {
+        // x64 THREAD_BASIC_INFORMATION is 0x30 bytes; TebBaseAddress is at +8.
+        let mut information = [0u64; 6];
+        let mut returned = 0u32;
+        // SAFETY: the handle has THREAD_QUERY_INFORMATION and the buffer is 0x30 bytes.
+        let status = unsafe {
+            NtQueryInformationThread(
+                handle,
+                ThreadBasicInformation,
+                information.as_mut_ptr().cast(),
+                u32::try_from(size_of_val(&information)).ok()?,
+                &raw mut returned,
+            )
+        };
+        if status.is_err() {
+            return None;
+        }
+        let teb = usize::try_from(information[1]).ok()?;
+        // NT_TIB.StackBase is the second word of the TEB.
+        let mut base = [0u64; 1];
+        (teb != 0 && self.read_words(teb + 8, &mut base))
+            .then(|| usize::try_from(base[0]).ok())
+            .flatten()
+    }
+
+    fn read_words(&mut self, address: usize, out: &mut [u64]) -> bool {
+        let bytes = size_of_val(out);
+        let mut copied = 0usize;
+        // SAFETY: ReadProcessMemory validates the source range and fails instead of
+        // faulting; `out` is a writable buffer of `bytes` bytes.
+        unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                address as *const _,
+                out.as_mut_ptr().cast(),
+                bytes,
+                Some(&raw mut copied),
+            )
+        }
+        .is_ok()
+            && copied == bytes
     }
 
     fn close(&mut self, handle: HANDLE) {
@@ -615,6 +717,32 @@ pub(crate) unsafe fn write_code(
 pub(crate) unsafe fn write_code_batch(
     patches: &[CodePatch<'_>],
 ) -> Result<Vec<WriteReport>, CodeWriteError> {
+    // SAFETY: forwarded from the caller.
+    unsafe { write_code_batch_guarded(patches, None) }
+}
+
+/// Writes one range like [`write_code`], and also treats the patch as busy while
+/// any thread's stack holds a word in `[guard.0, guard.1)`. For code that other
+/// threads call out of, so a pending return address must not land in new bytes.
+///
+/// # Safety
+///
+/// As for [`write_code`].
+pub(crate) unsafe fn write_code_guarded(
+    address: usize,
+    bytes: &[u8],
+    guard: (usize, usize),
+) -> Result<WriteReport, CodeWriteError> {
+    let patch = CodePatch { address, bytes };
+    // SAFETY: forwarded from the caller.
+    let result = unsafe { write_code_batch_guarded(std::slice::from_ref(&patch), Some(guard)) };
+    result.map(|mut reports| reports.pop().unwrap_or_default())
+}
+
+unsafe fn write_code_batch_guarded(
+    patches: &[CodePatch<'_>],
+    guard: Option<(usize, usize)>,
+) -> Result<Vec<WriteReport>, CodeWriteError> {
     if patches.is_empty() {
         return Ok(Vec::new());
     }
@@ -623,11 +751,30 @@ pub(crate) unsafe fn write_code_batch(
     let mut reports = Vec::with_capacity(patches.len());
 
     for _attempt in 0..BUSY_ATTEMPTS {
-        let freeze = freeze_live()?;
-        let busy = patches.iter().any(|patch| {
+        let mut freeze = freeze_live()?;
+        let mut busy = patches.iter().any(|patch| {
             let (start, end) = hazard_range(patch.address, patch.bytes.len());
             freeze.any_rip_in(start, end)
         });
+        let mut scan_error = None;
+        if let (false, Some((start, end))) = (busy, guard) {
+            match freeze.any_stack_word_in(start, end) {
+                Ok(hit) => busy = hit,
+                Err(error) => scan_error = Some(error),
+            }
+        }
+        if let Some(error) = scan_error {
+            return match freeze.thaw() {
+                Ok(()) => Err(CodeWriteError::Freeze(error.as_str().to_owned())),
+                Err(thaw) => {
+                    THAW_FAILED.store(true, Ordering::Release);
+                    Err(CodeWriteError::Thaw {
+                        reports: Vec::new(),
+                        message: thaw.as_str().to_owned(),
+                    })
+                }
+            };
+        }
         if busy {
             if let Err(error) = freeze.thaw() {
                 THAW_FAILED.store(true, Ordering::Release);
@@ -697,6 +844,7 @@ mod tests {
         Suspend,
         Resume,
         Rip,
+        Stack,
     }
 
     #[derive(Clone, Copy)]
@@ -714,7 +862,9 @@ mod tests {
         /// Threads that appear after the given enumeration call.
         spawn_after: Vec<(usize, u32)>,
         fail: Vec<(Op, usize, bool)>,
-        calls: [usize; 5],
+        calls: [usize; 6],
+        /// Words on each thread's stack, lowest address first; RSP is at 0x10000 * (index + 1).
+        stacks: Vec<Vec<u64>>,
         /// The enumerate error to inject.
         enumerate_error: FreezeError,
         /// Marks a thread exited when its resume fails.
@@ -735,7 +885,8 @@ mod tests {
                     .collect(),
                 spawn_after: Vec::new(),
                 fail: Vec::new(),
-                calls: [0; 5],
+                calls: [0; 6],
+                stacks: Vec::new(),
                 enumerate_error: FreezeError::Enumerate,
                 exit_on_failed_resume: false,
             }
@@ -832,11 +983,32 @@ mod tests {
             !self.thread(handle).alive
         }
 
-        fn rip(&mut self, handle: usize) -> Option<usize> {
+        fn registers(&mut self, handle: usize) -> Option<(usize, usize)> {
             if self.should_fail(Op::Rip) {
                 return None;
             }
-            Some(0x1000 + handle)
+            Some((0x1000 + handle, 0x10000 * (handle + 1)))
+        }
+
+        fn stack_base(&mut self, handle: usize) -> Option<usize> {
+            let words = self.stacks.get(handle).map_or(0, Vec::len);
+            Some(0x10000 * (handle + 1) + words * 8)
+        }
+
+        fn read_words(&mut self, address: usize, out: &mut [u64]) -> bool {
+            if self.should_fail(Op::Stack) {
+                return false;
+            }
+            let handle = address / 0x10000 - 1;
+            let first = (address % 0x10000) / 8;
+            let Some(stack) = self.stacks.get(handle) else {
+                return false;
+            };
+            let Some(words) = stack.get(first..first + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(words);
+            true
         }
 
         fn close(&mut self, handle: usize) {
@@ -990,14 +1162,18 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
 
+        const SENTINEL: u64 = 0x5EAF_00D5_1234_5678;
         let counter = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let worker = {
             let (counter, stop) = (Arc::clone(&counter), Arc::clone(&stop));
             std::thread::spawn(move || {
+                // Keep a recognizable word on this thread's stack for the scan.
+                let marker = std::hint::black_box([SENTINEL; 4]);
                 while !stop.load(Ordering::Relaxed) {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
+                std::hint::black_box(marker);
             })
         };
         while counter.load(Ordering::Relaxed) == 0 {
@@ -1008,7 +1184,10 @@ mod tests {
         let freeze = Freeze::acquire(LiveOps::new().expect("buffer")).expect("freeze");
         // Nothing below may allocate or panic until the thaw: a frozen test
         // thread may hold the heap lock.
+        let mut freeze = freeze;
         let frozen = freeze.threads.len();
+        let sentinel = usize::try_from(SENTINEL).unwrap_or(0);
+        let found = freeze.any_stack_word_in(sentinel, sentinel + 1);
         let before = counter.load(Ordering::Relaxed);
         // SAFETY: Sleep takes a plain duration.
         unsafe { Sleep(20) };
@@ -1016,6 +1195,7 @@ mod tests {
         let thawed = freeze.thaw();
         thawed.expect("thaw");
         assert!(frozen > 0);
+        assert_eq!(found, Ok(true), "stack scan missed the worker's sentinel");
         assert_eq!(before, after, "worker ran while frozen");
 
         let resumed = counter.load(Ordering::Relaxed);
@@ -1024,6 +1204,30 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn stack_scan_finds_a_return_address_anywhere_on_any_stack() {
+        let mut fake = Fake::new(&[1, 2]);
+        let mut deep = vec![0u64; 200];
+        deep[150] = 0x5005;
+        fake.stacks = vec![vec![1, 2, 3], deep];
+        let mut freeze = Freeze::acquire(&mut fake).expect("freeze");
+        assert_eq!(freeze.any_stack_word_in(0x5000, 0x5010), Ok(true));
+        assert_eq!(freeze.any_stack_word_in(0x5006, 0x5010), Ok(false));
+        assert_eq!(freeze.any_stack_word_in(1, 2), Ok(true));
+        freeze.thaw().expect("thaw");
+        assert_released(&fake);
+    }
+
+    #[test]
+    fn unreadable_stack_is_an_error_not_a_clean_scan() {
+        let mut fake = Fake::new(&[1]).failing(Op::Stack, 0, false);
+        fake.stacks = vec![vec![0; 4]];
+        let mut freeze = Freeze::acquire(&mut fake).expect("freeze");
+        assert_eq!(freeze.any_stack_word_in(0, 1), Err(FreezeError::Stack));
+        freeze.thaw().expect("thaw");
+        assert_released(&fake);
     }
 
     #[test]

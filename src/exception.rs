@@ -3,7 +3,7 @@
 //! Port of the exception handling in `dllmain.cpp`. The hook is installed into
 //! `KiUserExceptionDispatcher`, either through its function pointer (current
 //! Windows) or by patching its entry stub (Wine). It redirects known crash sites
-//! past the faulting instruction, writes crash logs, and suspends the process on
+//! past the faulting instruction, writes crash logs, and terminates the process on
 //! fatal faults.
 //!
 //! The mechanism depends on undocumented ntdll internals. It is the riskiest
@@ -12,9 +12,9 @@
 use std::ffi::{CStr, c_void};
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::Foundation::{CloseHandle, HMODULE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileA, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FlushFileBuffers, OPEN_ALWAYS, WriteFile,
@@ -22,9 +22,12 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT, EXCEPTION_RECORD, OutputDebugStringA, ReadProcessMemory, RtlPcToFileHeader,
 };
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress};
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameA,
+    GetModuleHandleA, GetModuleHandleExW, GetProcAddress,
+};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, SuspendThread, TerminateProcess,
+    GetCurrentProcess, GetCurrentThreadId, Sleep, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBoxA};
 use windows::core::{PCSTR, s};
@@ -38,8 +41,6 @@ const CRASH_LOG_NAME: &str = "crashes.log";
 /// [`CRASH_LOG_NAME`] for the allocation-free emergency path.
 const CRASH_LOG_NAME_C: &CStr = c"crashes.log";
 const LOG_FAILED_EXIT_CODE: i32 = -444;
-/// Exit code when the process cannot be suspended, as in the fork.
-const SUSPEND_FAILED_EXIT_CODE: u32 = (-444_i32).cast_unsigned();
 
 const STATUS_ILLEGAL_INSTRUCTION: i32 = 0xC000_001D_u32.cast_signed();
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC000_0005_u32.cast_signed();
@@ -64,9 +65,14 @@ static HANDLER_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// dispatcher is kept for the life of the process: an in-flight thread can still hold
 /// a marker or a detour address that a scan cannot rule out.
 static PRODUCERS_EXPOSED: AtomicBool = AtomicBool::new(false);
-// The Wine stub is never rewritten back: a thread can return into it from the
-// handler, so the saved original bytes would not make removal safe. Unload keeps
-// the stub and the handler for the life of the process on that layout.
+/// The Wine stub bytes our hook replaced, so Unload can put them back once a
+/// stack scan shows no thread will return into the hook.
+static WINE_ORIGINAL: [AtomicU8; WINE_HOOK_SIZE] = [const { AtomicU8::new(0) }; WINE_HOOK_SIZE];
+/// Set by the crash-session owner once its log is written, so parked faulting
+/// threads stop waiting.
+static SESSION_DONE: AtomicBool = AtomicBool::new(false);
+/// Set once this module is pinned for the process lifetime.
+static MODULE_PINNED: AtomicBool = AtomicBool::new(false);
 
 /// Maximum number of fatal faults logged in full in one session (fork `MAX_SAVED_EXCEPTIONS`).
 const MAX_SAVED_EXCEPTIONS: usize = 16;
@@ -83,6 +89,12 @@ static SAVED_EXCEPTIONS: CrashQueue<SavedException, MAX_SAVED_EXCEPTIONS> = Cras
 
 /// Bounded wait for a reserved slot to be published.
 const PUBLISH_SPIN_LIMIT: u32 = 1_000_000;
+/// How long a faulting thread that is not the session owner waits for the owner
+/// to finish its log before it terminates the process itself.
+const OWNER_WAIT_MS: u32 = 5_000;
+const OWNER_POLL_MS: u32 = 10;
+/// Exit code for a fatal fault once it is logged.
+const FATAL_EXIT_CODE: u32 = 0xC000_0005;
 
 const WINE_HOOK_SIZE: usize = 0x1B;
 const WINE_KI_DISPATCH_OFFSET: usize = 0xB;
@@ -90,7 +102,6 @@ const WINE_STUB_PATTERN: i32 = 0x248C_8B48;
 const KI_DISPATCH_PTR_PATTERN: i32 = 0x058B_48FC;
 
 type ZwContinueFn = unsafe extern "system" fn(*mut CONTEXT, u8) -> i32;
-type NtSuspendProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
 
 /// Resolves an export from `module`, or 0 if it is missing.
 ///
@@ -151,27 +162,6 @@ fn try_open_crash_log() -> Option<std::fs::File> {
         .append(true)
         .open(CRASH_LOG_NAME)
         .ok()
-}
-
-/// Stops every thread of the process by suspending the process itself. Port of the fork's
-/// `SuspendProcess`: the pseudo-handle needs no access rights and cannot leak, and the
-/// process is terminated if it cannot be suspended.
-fn suspend_process() {
-    // SAFETY: resolves an ntdll export by static NUL-terminated names.
-    let address = unsafe { proc_address(s!("ntdll.dll"), s!("NtSuspendProcess")) };
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and has no preconditions.
-    let process = unsafe { GetCurrentProcess() };
-    let suspended = address != 0 && {
-        // SAFETY: the resolved export is `NtSuspendProcess`, matching the signature.
-        let function: NtSuspendProcessFn = unsafe { std::mem::transmute(address) };
-        // SAFETY: `process` is the current-process pseudo-handle.
-        let status = unsafe { function(process) };
-        status >= 0
-    };
-    if !suspended {
-        // SAFETY: terminates the current process through its pseudo-handle.
-        let _ = unsafe { TerminateProcess(process, SUSPEND_FAILED_EXIT_CODE) };
-    }
 }
 
 /// Bytes read per stack line: two 64-bit words.
@@ -273,12 +263,24 @@ fn emergency_exception(address: i64, code: u32) {
 
 /// Port of the fork's `DumpException`: writes one crash-log entry. The header and
 /// registers are flushed before the stack is read, so they survive a failure there.
-fn dump_exception(log: &mut std::fs::File, address: i64, context: &CONTEXT, code: i32) {
+///
+/// With `lookup_module` false the module lookup is skipped. `RtlPcToFileHeader`
+/// and `GetModuleFileNameA` take loader locks that a second faulting thread may
+/// hold, so they run only while this is the only fault in flight.
+fn dump_exception(
+    log: &mut std::fs::File,
+    address: i64,
+    context: &CONTEXT,
+    code: i32,
+    lookup_module: bool,
+) {
     let image_base = build::image_base() as u64;
 
     let mut module_base: *mut c_void = std::ptr::null_mut();
-    // SAFETY: only looks up which loaded image contains `address`; it does not dereference it.
-    unsafe { RtlPcToFileHeader(address as *const c_void, &raw mut module_base) };
+    if lookup_module {
+        // SAFETY: only looks up which loaded image contains `address`; it does not dereference it.
+        unsafe { RtlPcToFileHeader(address as *const c_void, &raw mut module_base) };
+    }
     let faulting_module = module_base as u64;
     let mut module_name = UNKNOWN_MODULE.to_owned();
     if faulting_module != 0 {
@@ -378,7 +380,8 @@ fn write_crash_session(address: i64, code: u32) {
     loop {
         while consumed < SAVED_EXCEPTIONS.count() {
             if let Some(saved) = wait_published(consumed) {
-                dump_exception(&mut log, saved.address, &saved.context, saved.code);
+                let alone = SAVED_EXCEPTIONS.count() == 1;
+                dump_exception(&mut log, saved.address, &saved.context, saved.code, alone);
             } else {
                 let _ = writeln!(
                     log,
@@ -424,6 +427,12 @@ unsafe fn forward_to_original(record: *mut EXCEPTION_RECORD, context: *mut CONTE
 /// Called by the process's exception dispatcher with a valid record and context.
 unsafe extern "system" fn exception_hook(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) {
     if record.is_null() || context.is_null() {
+        return;
+    }
+    // Induced faults are repaired even after deactivation: a thread can still
+    // hold the marker, and no other handler knows how to resume it.
+    // SAFETY: `record` and `context` are valid for the duration of the call.
+    if unsafe { protection::repair_induced_exception(record, context) } {
         return;
     }
     if !HANDLER_ACTIVE.load(Ordering::Acquire)
@@ -511,7 +520,8 @@ unsafe fn redirect_known_crash(at: usize, context: *mut CONTEXT) -> bool {
             (*context).Rax = 0;
             resume_at(context, address(0x22C49FE));
         } else if at == address(offsets::SCRVM_ERROR) {
-            handle_script_error(context);
+            // An index outside the VM tables falls through to the general path.
+            return handle_script_error(context);
         } else {
             return false;
         }
@@ -529,53 +539,106 @@ const GSC_CLIENTFIELD_CRASHES: [usize; 9] = [
 const SCR_VM_FATAL_TABLE_RVA: usize = 0x5124869;
 /// Script VM error-message table, one pointer per VM, stride 0x78.
 const SCR_VM_ERROR_TABLE_RVA: usize = 0x51A3710;
+/// T7's `scriptInstance_t`: server and client. Taken from the engine enum and the
+/// upstream C++, not checked against the binary, which is Arxan-encrypted on
+/// disk. Do not widen it without evidence from a runtime dump.
+const MAX_SCRIPT_VMS: usize = 2;
+/// Longest script error message read from the game.
+const MAX_SCRIPT_ERROR: usize = 1024;
+
+/// Reads a `T` at `address` without faulting.
+fn read_game<T: Copy + Default>(address: usize) -> Option<T> {
+    let mut value = T::default();
+    let mut copied = 0usize;
+    // SAFETY: `ReadProcessMemory` validates the source range and fails instead of
+    // faulting; the destination is a local `T`.
+    unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            (&raw mut value).cast(),
+            size_of::<T>(),
+            Some(&raw mut copied),
+        )
+    }
+    .ok()?;
+    (copied == size_of::<T>()).then_some(value)
+}
+
+/// Copies the NUL-terminated string at `address` into `out`, a byte at a time so
+/// the read stops at the terminator rather than at an unmapped page past it.
+/// Returns the length, capped at `out.len()`, or `None` if it is unreadable.
+fn read_game_string(address: usize, out: &mut [u8]) -> Option<usize> {
+    for (index, slot) in out.iter_mut().enumerate() {
+        let byte: u8 = read_game(address.checked_add(index)?)?;
+        if byte == 0 {
+            return Some(index);
+        }
+        *slot = byte;
+    }
+    Some(out.len())
+}
+
+/// The VM a `SCRVM_Error` call names, if it is inside the VM tables.
+fn script_vm_index(rcx: u64) -> Option<usize> {
+    usize::try_from(rcx)
+        .ok()
+        .filter(|&index| index < MAX_SCRIPT_VMS)
+}
 
 /// Handles a `SCRVM_Error` call: writes a fatal script error or resumes the VM.
+/// Returns `false`, with the context untouched, when the VM index or its table
+/// entries cannot be trusted; the caller then takes the general fatal path.
 ///
 /// # Safety
 ///
 /// `context` must be the context of the script VM error call.
-unsafe fn handle_script_error(context: *mut CONTEXT) {
+unsafe fn handle_script_error(context: *mut CONTEXT) -> bool {
+    // SAFETY: the caller guarantees `context`; `Rcx` is the VM index in the original.
+    let Some(index) = script_vm_index(unsafe { (*context).Rcx }) else {
+        return false;
+    };
+    let Some(fatal_flag) = read_game::<u8>(address(SCR_VM_FATAL_TABLE_RVA) + 35392 * index) else {
+        return false;
+    };
+    let Some(error_pointer) = read_game::<usize>(address(SCR_VM_ERROR_TABLE_RVA) + 0x78 * index)
+    else {
+        return false;
+    };
+    let mut message = [0u8; MAX_SCRIPT_ERROR];
+    let length = if error_pointer == 0 {
+        0
+    } else {
+        read_game_string(error_pointer, &mut message).unwrap_or(0)
+    };
+    let message = &message[..length];
+    let is_fatal = fatal_flag != 0
+        || message
+            .windows(b"Invalid opcode".len())
+            .any(|window| window == b"Invalid opcode");
+
+    // Every check passed; only now is the context changed.
     // SAFETY: the caller guarantees `context`; the advances mirror the original.
     unsafe {
         (*context).Rip = (*context).Rip.wrapping_add(4);
         (*context).Rsp = (*context).Rsp.wrapping_sub(0x30);
     }
 
-    // SAFETY: `context` is valid; its `Rcx` is the VM index in the original.
-    let index = usize::from(unsafe { (*context).Rcx }.to_le_bytes()[0]);
-    // SAFETY: the tables are indexed by the VM number, as in the original.
-    let (fatal_flag, error_pointer) = unsafe {
-        (
-            *((address(SCR_VM_FATAL_TABLE_RVA) + 35392 * index) as *const u8),
-            *((address(SCR_VM_ERROR_TABLE_RVA) + 0x78 * index) as *const usize),
-        )
-    };
-    let mut is_fatal = fatal_flag != 0;
-
-    let error_message = if error_pointer != 0 {
-        // SAFETY: a non-null error pointer is a NUL-terminated string in the game's table.
-        let message = unsafe { CStr::from_ptr(error_pointer as *const std::ffi::c_char) };
-        if message.to_bytes().is_empty() {
-            "unknown".to_owned()
-        } else {
-            message.to_string_lossy().into_owned()
-        }
-    } else {
-        "unknown".to_owned()
-    };
-    if error_message.contains("Invalid opcode") {
-        is_fatal = true;
-    }
-
     if !is_fatal {
+        // Nothing owned is alive here: the message is a stack array, so the
+        // non-returning `ZwContinue` skips no destructor.
         // SAFETY: `context` is the VM error call's context, so resuming it is the original behaviour.
         unsafe { zw_continue(context) };
-        return;
+        return true;
     }
 
-    // SAFETY: the VM table holds one fault record per index, read only on the fatal path.
-    let fs_value = unsafe { *((address(offsets::SCRVM_FS) as *const i64).add(index * 4)) };
+    let fs_value = read_game::<i64>(address(offsets::SCRVM_FS) + index * 4 * size_of::<i64>())
+        .unwrap_or_default();
+    let error_message = if message.is_empty() {
+        "unknown".into()
+    } else {
+        String::from_utf8_lossy(message)
+    };
 
     let mut log = open_crash_log();
     let client = if index != 0 { "Client" } else { "Server" };
@@ -601,8 +664,9 @@ unsafe fn handle_script_error(context: *mut CONTEXT) {
     std::process::exit(0);
 }
 
-/// Logs an unrecognized access violation or non-continuable fault, then suspends the
-/// process. Port of the fork's fatal path in `ExceptHook`.
+/// Logs an unrecognized access violation or non-continuable fault, then terminates
+/// the process. Port of the fork's fatal path in `ExceptHook`, with the fork's
+/// indefinite parking replaced by a bounded wait (see [`wait_for_owner`]).
 ///
 /// # Safety
 ///
@@ -626,7 +690,7 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
     if LCK_DUMPING.load(Ordering::Acquire) == thread {
         // A fault inside the dumper itself: log without the crash log machinery.
         emergency_exception(at, code_bits);
-        suspend_process();
+        terminate_process();
         return;
     }
 
@@ -652,13 +716,40 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
         .is_ok()
     {
         write_crash_session(at, code_bits);
+        SESSION_DONE.store(true, Ordering::Release);
         // Ownership is kept: nothing may append to a sealed session.
-        suspend_process();
+        terminate_process();
     } else {
-        // Park only this thread; the owner must stay runnable to finish its log.
-        // SAFETY: suspends the current thread through its pseudo-handle.
-        unsafe { SuspendThread(GetCurrentThread()) };
+        wait_for_owner(at, code_bits);
     }
+}
+
+/// A faulting thread that is not the session owner waits here, bounded. If the
+/// owner has not finished within [`OWNER_WAIT_MS`] it may be blocked on a lock
+/// that a faulting thread holds. This thread then writes its emergency line and
+/// terminates the process itself. Uses no heap, lock or file API beyond the
+/// emergency path.
+fn wait_for_owner(at: i64, code: u32) {
+    let mut waited = 0;
+    while waited < OWNER_WAIT_MS {
+        if SESSION_DONE.load(Ordering::Acquire) {
+            // The owner is terminating the process.
+            break;
+        }
+        // SAFETY: Sleep takes a plain duration.
+        unsafe { Sleep(OWNER_POLL_MS) };
+        waited += OWNER_POLL_MS;
+    }
+    if !SESSION_DONE.load(Ordering::Acquire) {
+        emergency_exception(at, code);
+    }
+    terminate_process();
+}
+
+/// Ends the process after a fatal fault. Never returns in practice.
+fn terminate_process() {
+    // SAFETY: terminates the current process through its pseudo-handle.
+    let _ = unsafe { TerminateProcess(GetCurrentProcess(), FATAL_EXIT_CODE) };
 }
 
 /// Patches the stub on current Windows, which stores a pointer to the handler. The slot's
@@ -703,6 +794,13 @@ fn wine_stub(handler: usize) -> [u8; WINE_HOOK_SIZE] {
     bytes
 }
 
+/// The range no thread may be executing or about to return into while the Wine
+/// stub is rewritten: the stub, plus the longest instruction that can start
+/// before it.
+fn wine_guard(begin: usize) -> (usize, usize) {
+    (begin.saturating_sub(14), begin + WINE_HOOK_SIZE)
+}
+
 /// Overwrites the Wine-style dispatcher stub with a call to `handler`.
 ///
 /// # Safety
@@ -710,11 +808,19 @@ fn wine_stub(handler: usize) -> [u8; WINE_HOOK_SIZE] {
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` with the Wine stub.
 unsafe fn install_wine_hook(dispatcher: usize, handler: usize) -> Result<(), String> {
     let begin = dispatcher + WINE_KI_DISPATCH_OFFSET;
+    // SAFETY: the stub is readable code of `WINE_HOOK_SIZE` bytes at `begin`.
+    let original = unsafe { std::slice::from_raw_parts(begin as *const u8, WINE_HOOK_SIZE) };
+    for (saved, byte) in WINE_ORIGINAL.iter().zip(original) {
+        saved.store(*byte, Ordering::Relaxed);
+    }
     DISPATCHER_INSTALLED.store(true, Ordering::Release);
 
-    // SAFETY: `begin` is the stub described above; it is rewritten with the new
-    // bytes and `write_code` freezes every other thread first.
-    match unsafe { crate::threads::write_code(begin, &wine_stub(handler)) } {
+    // SAFETY: `begin` is the stub described above. The guarded write freezes every
+    // other thread and refuses while any RIP or stack word points into the stub, so
+    // no pending return lands in the middle of the new bytes.
+    match unsafe {
+        crate::threads::write_code_guarded(begin, &wine_stub(handler), wine_guard(begin))
+    } {
         Ok(report) if report.complete() => Ok(()),
         Ok(report) => {
             if !report.bytes_written {
@@ -733,6 +839,47 @@ unsafe fn install_wine_hook(dispatcher: usize, handler: usize) -> Result<(), Str
                 "T7 Patch: cannot write the Wine exception dispatcher stub: {error}"
             ))
         }
+    }
+}
+
+/// Pins the module containing `address` for the life of the process. A pinned
+/// module ignores `FreeLibrary`, so the handler stays mapped.
+fn pin_module(address: usize) -> Result<(), String> {
+    if MODULE_PINNED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut module = HMODULE::default();
+    // SAFETY: with FROM_ADDRESS the name argument is an address inside the module;
+    // `module` is a valid out-pointer.
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            windows::core::PCWSTR(address as *const u16),
+            &raw mut module,
+        )
+    }
+    .map_err(|_| "T7 Patch: cannot pin the patch module".to_owned())?;
+    MODULE_PINNED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Puts the saved Wine stub back under a guarded freeze. Returns `false`, with
+/// the hook still in place, if a thread may still return into it or the write
+/// did not happen.
+///
+/// # Safety
+///
+/// `dispatcher` must be the Wine `KiUserExceptionDispatcher` that `install_wine_hook` patched.
+unsafe fn restore_wine_stub(dispatcher: usize) -> bool {
+    let begin = dispatcher + WINE_KI_DISPATCH_OFFSET;
+    let mut original = [0u8; WINE_HOOK_SIZE];
+    for (byte, saved) in original.iter_mut().zip(&WINE_ORIGINAL) {
+        *byte = saved.load(Ordering::Relaxed);
+    }
+    // SAFETY: as for the install; the guard covers the stub and the handler's return site.
+    match unsafe { crate::threads::write_code_guarded(begin, &original, wine_guard(begin)) } {
+        Ok(report) => report.complete(),
+        Err(_) => false,
     }
 }
 
@@ -764,6 +911,9 @@ pub unsafe fn install() -> Result<(), String> {
     }
     let (dispatcher, first_word) = dispatcher_layout()?;
     let handler = exception_hook as *const () as usize;
+    // The dispatcher calls into this module for the rest of the process, so it
+    // must never be unmapped. Unload is logical deactivation only.
+    pin_module(handler)?;
     let result = if first_word == KI_DISPATCH_PTR_PATTERN {
         // SAFETY: the pattern matches the pointer layout handled by `install_pointer_hook`.
         unsafe { install_pointer_hook(dispatcher, handler) }
@@ -799,12 +949,25 @@ pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
     if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         return Ok(());
     }
-    let (_dispatcher, first_word) = dispatcher_layout()?;
+    let (dispatcher, first_word) = dispatcher_layout()?;
+    if first_word == WINE_STUB_PATTERN && !PRODUCERS_EXPOSED.load(Ordering::Acquire) {
+        // A handler invocation returns into the stub, so the original bytes go
+        // back only when a frozen stack scan shows no thread inside or about to
+        // return into it. Otherwise the stub and the handler are kept.
+        // SAFETY: `dispatcher_layout` matched the Wine stub that `install_wine_hook` wrote.
+        if unsafe { restore_wine_stub(dispatcher) } {
+            HANDLER_ACTIVE.store(false, Ordering::Release);
+            DISPATCHER_INSTALLED.store(false, Ordering::Release);
+            return Ok(());
+        }
+        HANDLER_ACTIVE.store(true, Ordering::Release);
+        crate::dllmain::debug_print(
+            "T7 Patch: Wine exception stub is in use; retained for the process lifetime.\n",
+        );
+        return Ok(());
+    }
     if first_word == WINE_STUB_PATTERN {
-        // The stub is executable code and a handler invocation returns into it.
-        // RIP-only freezing cannot prove that no thread will return there, so keep
-        // the stub and the handler. Wine is the test layout; native Windows uses
-        // the pointer layout below.
+        // A producer was live, so an in-flight marker may still need the handler.
         HANDLER_ACTIVE.store(true, Ordering::Release);
         crate::dllmain::debug_print(
             "T7 Patch: Wine exception stub retained for the process lifetime.\n",
@@ -912,6 +1075,46 @@ mod tests {
         assert_eq!(read_stack_line(base, 0), Some(words));
         assert_eq!(read_stack_line(0, 0), None);
         assert_eq!(read_stack_line(usize::MAX - 8, 0), None);
+    }
+
+    #[test]
+    fn script_vm_index_rejects_anything_past_the_tables() {
+        assert_eq!(script_vm_index(0), Some(0));
+        assert_eq!(script_vm_index(1), Some(1));
+        assert_eq!(script_vm_index(2), None);
+        // The old low-byte truncation would have mapped these to 0 and 1.
+        assert_eq!(script_vm_index(0x100), None);
+        assert_eq!(script_vm_index(0xFFFF_FFFF_FFFF_FF01), None);
+    }
+
+    #[test]
+    fn game_reads_are_bounded_and_non_faulting() {
+        let text = *b"Invalid opcode\0trailing";
+        let mut out = [0u8; 64];
+        assert_eq!(read_game_string(text.as_ptr() as usize, &mut out), Some(14));
+        assert_eq!(&out[..14], b"Invalid opcode");
+        let mut short = [0u8; 4];
+        assert_eq!(
+            read_game_string(text.as_ptr() as usize, &mut short),
+            Some(4)
+        );
+        assert_eq!(read_game_string(0, &mut out), None);
+        assert_eq!(read_game::<u64>(0), None);
+        let value = 0x1234_5678_u32;
+        assert_eq!(read_game::<u32>(&raw const value as usize), Some(value));
+    }
+
+    #[test]
+    fn pinning_the_module_succeeds_once_and_is_idempotent() {
+        let here = pinning_the_module_succeeds_once_and_is_idempotent as *const () as usize;
+        assert!(pin_module(here).is_ok());
+        assert!(pin_module(here).is_ok());
+        assert!(MODULE_PINNED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn wine_guard_covers_the_stub_and_instructions_before_it() {
+        assert_eq!(wine_guard(0x1000), (0x1000 - 14, 0x1000 + WINE_HOOK_SIZE));
     }
 
     #[test]

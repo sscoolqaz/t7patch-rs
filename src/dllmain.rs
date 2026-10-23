@@ -258,7 +258,9 @@ pub unsafe extern "C" fn zbr_run_gamemode_lui(input: *const c_char) {
 /// Port of the fork's `Unload`: a logical deactivation. Hooks, Steam vtable slots, the lobby
 /// marker and the update-preload pointer are restored. The exception dispatcher stays
 /// installed once an induced-exception patch has been live, and the dvar settings changed at
-/// install stay applied. Callers must not `FreeLibrary` while game callbacks are in flight.
+/// install stay applied. Physical unloading is not available: installing the dispatcher pins
+/// this module (`GET_MODULE_HANDLE_EX_FLAG_PIN`), so `FreeLibrary` leaves it mapped and every
+/// callback address it handed out stays valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn Unload() {
     if !LIFECYCLE.unload(&mut PatchOps) {
