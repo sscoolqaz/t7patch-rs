@@ -14,6 +14,7 @@ pub mod exception;
 pub mod ffi;
 pub mod fnv;
 pub mod gscu_hash;
+pub mod hooks;
 pub mod lua_symbols;
 pub mod offsets;
 pub mod protection;
