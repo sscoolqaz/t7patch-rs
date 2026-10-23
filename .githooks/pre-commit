@@ -4,3 +4,8 @@ set -e
 
 cargo fmt --check
 cargo clippy --all-targets --quiet -- -D warnings
+
+# The mingw target must also build. Check it when its Rust target is installed.
+if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$'; then
+    cargo clippy --all-targets --quiet --target x86_64-pc-windows-gnu -- -D warnings
+fi

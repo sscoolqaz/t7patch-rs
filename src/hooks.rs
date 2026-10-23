@@ -155,6 +155,8 @@ pub const LEGIT_PACKETS: [&str; 15] = [
 // Function types
 // ---------------------------------------------------------------------------
 
+#[cfg(target_env = "msvc")]
+type GsFailureFn = unsafe extern "system" fn(i64);
 type PrepWriteMsgFn = unsafe extern "system" fn(i64, i64, i32, i32) -> bool;
 type PrepReadMsgFn = unsafe extern "system" fn(i64) -> bool;
 type BuildTitleFn = unsafe extern "system" fn() -> *const c_char;
@@ -874,14 +876,22 @@ pub fn menu_allowed_without_host(verb: MenuVerb, is_campaign: bool) -> bool {
 // Detours
 // ---------------------------------------------------------------------------
 
-/// Stub for `__report_gsfailure`. Not installed: the MSVC CRT symbol that the C++
-/// hooks exists only in the C++ build. TODO(port): no Rust equivalent yet.
+#[cfg(target_env = "msvc")]
+unsafe extern "C" {
+    /// The MSVC CRT's `/GS` failure reporter. `cl` builds `MinHook` with `/GS` on,
+    /// so its `__security_check_cookie` calls link this into the DLL.
+    fn __report_gsfailure(stack_cookie: usize);
+}
+
+/// Port of `__report_gsfailure_hook`. Replaces the CRT's fast-fail on a `/GS` cookie
+/// mismatch with an access violation, which the exception handler can catch.
 ///
 /// # Safety
 ///
-/// Never called by this port. The body writes to address 0x17, as the C++ does.
-pub unsafe extern "system" fn report_gsfailure_hook(_security_cookie: i64) {
-    // SAFETY: intentionally invalid, as in the C++. This is unreachable because the hook is not installed.
+/// Only `MinHook` calls this, in place of `__report_gsfailure`. It always faults.
+#[cfg(target_env = "msvc")]
+unsafe extern "system" fn report_gsfailure_hook(_security_cookie: i64) {
+    // SAFETY: intentionally invalid, as in the C++. The write faults at address 0x17.
     unsafe { write_game::<i64>(0x17, 0) };
 }
 
@@ -1920,9 +1930,16 @@ pub fn apply_hooks() {
         hk_live_user_get_name as LiveUserGetNameFn,
         None,
     );
-    // TODO(port): `MH_CreateHook((LPVOID)&__report_gsfailure, ...)` hooks the MSVC CRT
-    // `__report_gsfailure` symbol. A Rust build has no such symbol, so this hook is not
-    // created. `report_gsfailure_hook` above is the detour body.
+    // `__report_gsfailure` is this DLL's own CRT copy, not a game function, so it is
+    // hooked by absolute address. A mingw build has no `/GS` cookies, so it has no
+    // such function to hook.
+    #[cfg(target_env = "msvc")]
+    {
+        let target = __report_gsfailure as unsafe extern "C" fn(usize) as usize;
+        let detour = report_gsfailure_hook as GsFailureFn as usize;
+        // SAFETY: both functions take one pointer-sized cookie and return nothing.
+        let _ = unsafe { ffi::create_hook(target, detour) };
+    }
     hook(
         offsets::PTR_DW_INSTANT_DISPATCH_MESSAGE,
         hk_dw_instant_dispatch_message as DispatchMessageFn,

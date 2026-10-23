@@ -1,15 +1,19 @@
-//! Bindings to the vendored `MinHook` library.
+//! Wrappers over `MinHook`.
 //!
-//! The library is linked by `build.rs` from `vendor/minhook/lib`. Only the
-//! functions the patch uses are declared. Safe wrappers return `Result` so
+//! The `minhook-sys` crate builds `MinHook` from source with `cc`, so the same
+//! code links for the MSVC and mingw targets. Safe wrappers return `Result` so
 //! callers do not compare raw status codes.
 
+use std::ffi::c_void;
 use std::fmt;
 
-/// Raw `MH_STATUS` value.
-pub type RawStatus = i32;
+use minhook_sys::{
+    MH_CreateHook, MH_DisableHook, MH_EnableHook, MH_Initialize, MH_OK, MH_RemoveHook,
+    MH_Uninitialize,
+};
 
-const MH_OK: RawStatus = 0;
+/// Raw `MH_STATUS` value.
+pub type RawStatus = minhook_sys::MH_STATUS;
 
 /// Failure reported by `MinHook`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,15 +33,6 @@ fn check(status: RawStatus) -> Result<(), MinHookError> {
     } else {
         Err(MinHookError(status))
     }
-}
-
-unsafe extern "system" {
-    fn MH_Initialize() -> RawStatus;
-    fn MH_Uninitialize() -> RawStatus;
-    fn MH_CreateHook(target: *mut u8, detour: *mut u8, original: *mut *mut u8) -> RawStatus;
-    fn MH_RemoveHook(target: *mut u8) -> RawStatus;
-    fn MH_EnableHook(target: *mut u8) -> RawStatus;
-    fn MH_DisableHook(target: *mut u8) -> RawStatus;
 }
 
 /// Initializes `MinHook`. Call once before creating hooks.
@@ -60,9 +55,15 @@ pub fn uninitialize() -> Result<(), MinHookError> {
 /// `target` must be the entry point of a function whose signature matches
 /// `detour`. `detour` must stay valid for the lifetime of the hook.
 pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHookError> {
-    let mut original: *mut u8 = std::ptr::null_mut();
+    let mut original: *mut c_void = std::ptr::null_mut();
     // SAFETY: the caller guarantees `target` is a valid function and `detour` a matching function.
-    check(unsafe { MH_CreateHook(target as *mut u8, detour as *mut u8, &raw mut original) })?;
+    check(unsafe {
+        MH_CreateHook(
+            target as *mut c_void,
+            detour as *mut c_void,
+            &raw mut original,
+        )
+    })?;
     Ok(original as usize)
 }
 
@@ -73,7 +74,7 @@ pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHook
 /// `target` must be the address passed to [`create_hook`].
 pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
     // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_EnableHook(target as *mut u8) })
+    check(unsafe { MH_EnableHook(target as *mut c_void) })
 }
 
 /// Disables a hook without removing it.
@@ -83,7 +84,7 @@ pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
 /// `target` must be the address passed to [`create_hook`].
 pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
     // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_DisableHook(target as *mut u8) })
+    check(unsafe { MH_DisableHook(target as *mut c_void) })
 }
 
 /// Removes a hook entirely.
@@ -93,7 +94,7 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
 /// `target` must be the address passed to [`create_hook`].
 pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
     // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_RemoveHook(target as *mut u8) })
+    check(unsafe { MH_RemoveHook(target as *mut c_void) })
 }
 
 /// Enables every hook created so far.
