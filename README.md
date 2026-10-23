@@ -32,7 +32,7 @@ under Wine. It has not yet been run in the game.
 ## Build
 
 The project is Rust only. Hooking uses `min_hook_rs`, a pure-Rust port of
-MinHook, so no C compiler is needed, only the toolchain's linker. The crate builds
+MinHook vendored in `vendor/min_hook_rs` with fail-closed freeze patches, so no C compiler is needed, only the toolchain's linker. The crate builds
 only for Windows targets, so on Linux the tests run under Wine (below).
 
 On Windows with MSVC:
