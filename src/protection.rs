@@ -751,9 +751,9 @@ pub fn player_name_fields(name: &[u8]) -> Option<[u8; PLAYER_NAME_LEN]> {
 /// because the C `char` is signed.
 pub fn sanitize_chat(message: &mut [u8]) {
     let original = message.to_vec();
-    for (i, slot) in message.iter_mut().enumerate() {
+    for (i, (slot, &byte)) in message.iter_mut().zip(original.iter()).enumerate() {
         let next = original.get(i + 1).copied();
-        let replace = match original[i] {
+        let replace = match byte {
             b'^' | b'%' => true,
             b'$' => next == Some(b'('),
             b'[' => next == Some(b'{'),

@@ -230,13 +230,16 @@ unsafe fn dump_saved_exceptions(log: &mut std::fs::File, code: i32) {
         for offset in (0..span).step_by(0x10) {
             let stack = context.Rsp + u64::try_from(offset).unwrap_or_default();
             // SAFETY: the faulting thread's stack is mapped for at least this range.
-            let (low, high) = unsafe {
+            let (first_word, second_word) = unsafe {
                 (
                     (stack as *const u64).read_unaligned(),
                     ((stack + 8) as *const u64).read_unaligned(),
                 )
             };
-            let _ = writeln!(text, "[{stack:016x}] {low:016x} {high:016x}\n");
+            let _ = writeln!(
+                text,
+                "[{stack:016x}] {first_word:016x} {second_word:016x}\n"
+            );
         }
 
         let _ = log.write_all(text.as_bytes());
