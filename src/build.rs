@@ -4,6 +4,8 @@
 //! the later part of the primary code section, so February-era RVAs must be
 //! shifted before they are used on the September executable.
 
+use std::sync::OnceLock;
+
 use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
@@ -82,6 +84,19 @@ pub unsafe fn detect_build() -> Build {
     }
 
     classify(nt.FileHeader.TimeDateStamp, nt.OptionalHeader.SizeOfImage)
+}
+
+/// Base address of the running executable, or 0 if it cannot be queried.
+pub fn image_base() -> usize {
+    // SAFETY: a null module name asks for the calling process's executable; no pointers are passed.
+    unsafe { GetModuleHandleW(None) }.map_or(0, |module| module.0 as usize)
+}
+
+/// The build of the running executable, detected once and cached.
+pub fn current() -> Build {
+    static BUILD: OnceLock<Build> = OnceLock::new();
+    // SAFETY: this runs inside the game process, which has its main module mapped.
+    *BUILD.get_or_init(|| unsafe { detect_build() })
 }
 
 /// Maps a February-2026 RVA to the RVA that exists in `build`.
