@@ -13,5 +13,6 @@ pub mod campaign;
 pub mod ffi;
 pub mod fnv;
 pub mod gscu_hash;
+pub mod lua_symbols;
 pub mod offsets;
 pub mod structs;
