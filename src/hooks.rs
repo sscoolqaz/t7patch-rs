@@ -886,11 +886,12 @@ unsafe extern "system" fn hk_lobby_msg_rw_prep_write_msg(
     if !unsafe { ORIG_LOBBY_MSG_RW_PREP_WRITE_MSG.get()(lobby_msg, data, length, msg_type) } {
         return false;
     }
-    if protection::zbr_prefix_byte() != 0 {
+    let (prefix1, prefix2) = protection::zbr_prefix();
+    if prefix1 != 0 {
         // SAFETY: `lobby_msg` is the handle the original just wrote into.
-        unsafe { msg_write_byte(lobby_msg, protection::zbr_prefix_byte()) };
+        unsafe { msg_write_byte(lobby_msg, prefix1) };
         // SAFETY: as above.
-        unsafe { msg_write_byte(lobby_msg, protection::zbr_prefix_byte2()) };
+        unsafe { msg_write_byte(lobby_msg, prefix2) };
     }
     true
 }
@@ -900,7 +901,7 @@ unsafe extern "system" fn hk_lobby_msg_rw_prep_read_msg(lm: i64) -> bool {
     if !unsafe { ORIG_LOBBY_MSG_RW_PREP_READ_MSG.get()(lm) } {
         return false;
     }
-    let expected1 = protection::zbr_prefix_byte();
+    let (expected1, expected2) = protection::zbr_prefix();
     if expected1 == 0 {
         return true;
     }
@@ -908,7 +909,7 @@ unsafe extern "system" fn hk_lobby_msg_rw_prep_read_msg(lm: i64) -> bool {
     let prefix1 = unsafe { msg_read_byte(addr(lm) as *mut c_void) };
     // SAFETY: as above.
     let prefix2 = unsafe { msg_read_byte(addr(lm) as *mut c_void) };
-    prefix1 == expected1 && prefix2 == protection::zbr_prefix_byte2()
+    prefix1 == expected1 && prefix2 == expected2
 }
 
 unsafe extern "system" fn hk_cod_get_build_title() -> *const c_char {
@@ -942,11 +943,8 @@ unsafe extern "system" fn hk_lobby_types_get_msg_type_name(index: i32) -> *const
 
 unsafe extern "system" fn hk_qmemcpy(dest: *mut c_char, source: *mut c_char, size: i32) -> i64 {
     if size < 0 {
-        // SAFETY: the C++ writes a NUL to both pointers on this path, so both are writable.
-        unsafe {
-            dest.write(0);
-            source.write(0);
-        }
+        // Reject without touching either buffer. The C++ wrote a NUL through both
+        // pointers here, but `source` is an input and may be read-only or shared.
         return 0;
     }
     // SAFETY: the trampoline was created for `qmemcpy` with this signature.

@@ -737,16 +737,17 @@ fn byte_at(value: i64, shift: u32) -> u8 {
     u8::try_from((value >> shift) & 0xFF).unwrap_or_default()
 }
 
-/// `ZBR_PREFIX_BYTE`: bits 16..24 of the current password hash.
+/// `(ZBR_PREFIX_BYTE, ZBR_PREFIX_BYTE2)` of one password hash: bits 16..24 and 24..32.
 #[must_use]
-pub fn zbr_prefix_byte() -> u8 {
-    byte_at(lock(&PRIVATE_PASSWORD)[1], 16)
+pub fn zbr_prefix_of(hash: i64) -> (u8, u8) {
+    (byte_at(hash, 16), byte_at(hash, 24))
 }
 
-/// `ZBR_PREFIX_BYTE2`: bits 24..32 of the current password hash.
+/// Both prefix bytes of the current password hash, read under one lock, so a
+/// packet never mixes bytes from a password before and after a rotation.
 #[must_use]
-pub fn zbr_prefix_byte2() -> u8 {
-    byte_at(lock(&PRIVATE_PASSWORD)[1], 24)
+pub fn zbr_prefix() -> (u8, u8) {
+    zbr_prefix_of(lock(&PRIVATE_PASSWORD)[1])
 }
 
 /// Validates a player name, returning the NUL-padded buffer. Names longer than
@@ -3347,6 +3348,13 @@ mod tests {
         rotate_private_password(&mut state, 5, 100);
         rotate_private_password(&mut state, 9, 200);
         assert_eq!(state, [5, 9, 200]);
+    }
+
+    #[test]
+    fn prefix_bytes_come_from_one_hash() {
+        assert_eq!(zbr_prefix_of(0x0000_0000_AABB_CCDD), (0xBB, 0xAA));
+        assert_eq!(zbr_prefix_of(0), (0, 0));
+        assert_eq!(zbr_prefix_of(-1), (0xFF, 0xFF));
     }
 
     #[test]
