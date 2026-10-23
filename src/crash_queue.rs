@@ -5,25 +5,77 @@
 //! looks for the dump owner, and sealing fails if any reservation arrived after the
 //! owner's last drain. Nothing reopens a session once it is sealed. The queue neither
 //! allocates nor locks, so it is safe to use inside the exception dispatcher.
+//!
+//! A reservation is a [`Reservation`] token, not an index. It cannot be copied,
+//! so a slot is published at most once and only by the thread that reserved it.
+//! A token dropped without publishing marks its slot abandoned, and the owner's
+//! drain skips it instead of waiting.
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// High bit of the admission word: set once the session is sealed.
 const CLOSED: u32 = 0x8000_0000;
 
+/// Slot states. A slot leaves `EMPTY` exactly once, to `READY` or `ABANDONED`.
+const EMPTY: u8 = 0;
+const READY: u8 = 1;
+const ABANDONED: u8 = 2;
+
 struct Slot<T> {
     record: UnsafeCell<MaybeUninit<T>>,
-    ready: AtomicBool,
+    state: AtomicU8,
 }
 
 impl<T> Slot<T> {
     const fn new() -> Self {
         Self {
             record: UnsafeCell::new(MaybeUninit::uninit()),
-            ready: AtomicBool::new(false),
+            state: AtomicU8::new(EMPTY),
         }
+    }
+}
+
+/// What the owner sees in a reserved slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState<T> {
+    /// Reserved, not yet published.
+    Pending,
+    Ready(T),
+    /// The reserving thread dropped its token without publishing.
+    Abandoned,
+}
+
+/// The right to publish one slot. Neither `Clone` nor `Copy`; consumed by
+/// [`CrashQueue::publish`].
+///
+/// ```compile_fail
+/// use t7patch::crash_queue::CrashQueue;
+/// let queue: CrashQueue<u8, 2> = CrashQueue::new();
+/// let token = queue.reserve().unwrap();
+/// queue.publish(token, 1);
+/// queue.publish(token, 2); // use of moved value
+/// ```
+#[must_use = "dropping a reservation abandons its slot"]
+pub struct Reservation<'q, T: Copy, const N: usize> {
+    queue: &'q CrashQueue<T, N>,
+    slot: usize,
+}
+
+impl<T: Copy, const N: usize> Reservation<'_, T, N> {
+    /// The reserved slot index.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+impl<T: Copy, const N: usize> Drop for Reservation<'_, T, N> {
+    fn drop(&mut self) {
+        // `publish` forgets the token, so reaching here means it was never published.
+        self.queue.slots[self.slot]
+            .state
+            .store(ABANDONED, Ordering::Release);
     }
 }
 
@@ -34,10 +86,11 @@ pub struct CrashQueue<T: Copy, const N: usize> {
     admission: AtomicU32,
 }
 
-// SAFETY: a slot's record is written only by the one producer that reserved its index
-// (`reserve` hands each index out once, and indices never return), before that producer
-// sets `ready` with release ordering. Readers access the record only after observing
-// `ready` with acquire ordering, and nobody writes it again. `T: Copy` means records hold
+// SAFETY: a slot's record is written only through the one `Reservation` for its index
+// (`reserve` hands each index out once, indices never return, and the token is neither
+// `Clone` nor `Copy`), before the state is set to READY with release ordering. Readers
+// access the record only after observing READY with acquire ordering, and nobody writes
+// it again. `T: Copy` means records hold
 // no drop glue or interior references, so sharing copies across threads is sound when
 // `T: Send`.
 unsafe impl<T: Copy + Send, const N: usize> Sync for CrashQueue<T, N> {}
@@ -55,7 +108,7 @@ impl<T: Copy, const N: usize> CrashQueue<T, N> {
     }
 
     /// Reserves the next slot, or `None` when the queue is full or sealed.
-    pub fn reserve(&self) -> Option<usize> {
+    pub fn reserve(&self) -> Option<Reservation<'_, T, N>> {
         let mut state = self.admission.load(Ordering::Acquire);
         loop {
             if state & CLOSED != 0 || state as usize >= N {
@@ -67,38 +120,57 @@ impl<T: Copy, const N: usize> CrashQueue<T, N> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(state as usize),
+                Ok(_) => {
+                    return Some(Reservation {
+                        queue: self,
+                        slot: state as usize,
+                    });
+                }
                 Err(current) => state = current,
             }
         }
     }
 
-    /// Writes `record` into `slot` and marks it ready.
+    /// Writes `record` into the reserved slot and marks it ready.
     ///
-    /// `slot` must come from [`reserve`](Self::reserve) on this queue and be published
-    /// once. An index out of range is ignored.
-    pub fn publish(&self, slot: usize, record: T) {
-        let Some(entry) = self.slots.get(slot) else {
-            return;
-        };
-        if entry.ready.load(Ordering::Acquire) {
-            return;
-        }
-        // SAFETY: the caller reserved `slot`, so no other thread writes it, and no reader
-        // touches it until `ready` is set below.
+    /// # Panics
+    ///
+    /// If `reservation` came from a different queue.
+    pub fn publish(&self, reservation: Reservation<'_, T, N>, record: T) {
+        assert!(
+            std::ptr::eq(reservation.queue, self),
+            "reservation from another queue"
+        );
+        let entry = &self.slots[reservation.slot];
+        std::mem::forget(reservation);
+        // SAFETY: the token was the only right to write this slot and it is consumed
+        // above, so no other thread writes it, and no reader touches it until READY.
         unsafe { (*entry.record.get()).write(record) };
-        entry.ready.store(true, Ordering::Release);
+        entry.state.store(READY, Ordering::Release);
+    }
+
+    /// The state of `slot`. Out-of-range or unreserved slots read as `Pending`.
+    pub fn slot_state(&self, slot: usize) -> SlotState<T> {
+        let Some(entry) = self.slots.get(slot) else {
+            return SlotState::Pending;
+        };
+        match entry.state.load(Ordering::Acquire) {
+            READY => {
+                // SAFETY: READY was stored with release ordering after the record was
+                // written, and the record is never written again.
+                SlotState::Ready(unsafe { (*entry.record.get()).assume_init() })
+            }
+            ABANDONED => SlotState::Abandoned,
+            _ => SlotState::Pending,
+        }
     }
 
     /// A copy of the record in `slot`, or `None` if it has not been published.
     pub fn published(&self, slot: usize) -> Option<T> {
-        let entry = self.slots.get(slot)?;
-        if !entry.ready.load(Ordering::Acquire) {
-            return None;
+        match self.slot_state(slot) {
+            SlotState::Ready(record) => Some(record),
+            SlotState::Pending | SlotState::Abandoned => None,
         }
-        // SAFETY: `ready` was set with release ordering after the record was written, and
-        // the record is never written again.
-        Some(unsafe { (*entry.record.get()).assume_init() })
     }
 
     /// Number of reserved slots, ignoring the sealed bit.
@@ -138,46 +210,76 @@ mod tests {
 
     static STATIC_QUEUE: CrashQueue<u64, 4> = CrashQueue::new();
 
+    fn slots<T: Copy, const N: usize>(
+        reservations: &[Option<Reservation<'_, T, N>>],
+    ) -> Vec<Option<usize>> {
+        reservations
+            .iter()
+            .map(|r| r.as_ref().map(Reservation::slot))
+            .collect()
+    }
+
     #[test]
     fn reserves_up_to_capacity() {
         let queue: CrashQueue<u32, 3> = CrashQueue::new();
-        assert_eq!(queue.reserve(), Some(0));
-        assert_eq!(queue.reserve(), Some(1));
-        assert_eq!(queue.reserve(), Some(2));
-        assert_eq!(queue.reserve(), None);
+        let held: Vec<_> = (0..4).map(|_| queue.reserve()).collect();
+        assert_eq!(slots(&held), [Some(0), Some(1), Some(2), None]);
         assert_eq!(queue.count(), 3);
     }
 
     #[test]
     fn publish_round_trips() {
         let queue: CrashQueue<(i64, u32), 2> = CrashQueue::new();
-        let slot = queue.reserve().unwrap();
-        assert_eq!(queue.published(slot), None);
-        queue.publish(slot, (-5, 0xC000_0005));
+        let token = queue.reserve().unwrap();
+        let slot = token.slot();
+        assert_eq!(queue.slot_state(slot), SlotState::Pending);
+        queue.publish(token, (-5, 0xC000_0005));
         assert_eq!(queue.published(slot), Some((-5, 0xC000_0005)));
         assert_eq!(queue.published(1), None);
         assert_eq!(queue.published(7), None);
     }
 
     #[test]
+    fn dropped_reservation_is_abandoned_and_still_sealable() {
+        let queue: CrashQueue<u8, 4> = CrashQueue::new();
+        drop(queue.reserve());
+        let token = queue.reserve().unwrap();
+        queue.publish(token, 9);
+        assert_eq!(queue.slot_state(0), SlotState::Abandoned);
+        assert_eq!(queue.slot_state(1), SlotState::Ready(9));
+        // The abandoned slot still counts as reserved, so a drain of both seals.
+        assert!(!queue.seal_if_drained(1));
+        assert!(queue.seal_if_drained(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "reservation from another queue")]
+    fn foreign_reservation_is_rejected() {
+        let first: CrashQueue<u8, 2> = CrashQueue::new();
+        let second: CrashQueue<u8, 2> = CrashQueue::new();
+        second.publish(first.reserve().unwrap(), 1);
+    }
+
+    #[test]
     fn seals_when_drained() {
         let queue: CrashQueue<u8, 4> = CrashQueue::new();
-        queue.reserve();
-        queue.reserve();
+        let _a = queue.reserve();
+        let _b = queue.reserve();
         assert!(queue.seal_if_drained(2));
-        assert_eq!(queue.reserve(), None);
+        assert!(queue.reserve().is_none());
         assert_eq!(queue.count(), 2);
     }
 
     #[test]
     fn seal_fails_after_late_reservation() {
         let queue: CrashQueue<u8, 4> = CrashQueue::new();
-        queue.reserve();
+        let _a = queue.reserve();
         let drained = queue.count();
-        assert_eq!(queue.reserve(), Some(1));
+        let late = queue.reserve();
+        assert_eq!(late.as_ref().map(Reservation::slot), Some(1));
         assert!(!queue.seal_if_drained(drained));
         assert!(queue.seal_if_drained(queue.count()));
-        assert_eq!(queue.reserve(), None);
+        assert!(queue.reserve().is_none());
     }
 
     #[test]
@@ -191,8 +293,9 @@ mod tests {
 
     #[test]
     fn works_as_static() {
-        let slot = STATIC_QUEUE.reserve().unwrap();
-        STATIC_QUEUE.publish(slot, 0xDEAD_BEEF);
+        let token = STATIC_QUEUE.reserve().unwrap();
+        let slot = token.slot();
+        STATIC_QUEUE.publish(token, 0xDEAD_BEEF);
         assert_eq!(STATIC_QUEUE.published(slot), Some(0xDEAD_BEEF));
     }
 }

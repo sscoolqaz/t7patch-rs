@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBoxA};
 use windows::core::{PCSTR, s};
 
 use crate::build;
-use crate::crash_queue::CrashQueue;
+use crate::crash_queue::{CrashQueue, SlotState};
 use crate::offsets::{self, address};
 use crate::protection;
 
@@ -349,12 +349,14 @@ fn dump_exception(log: &mut std::fs::File, address: i64, context: &CONTEXT, code
 }
 
 /// Waits a bounded time for `slot` to be published by the thread that reserved it.
+/// An abandoned slot returns at once.
 fn wait_published(slot: usize) -> Option<SavedException> {
     for _ in 0..PUBLISH_SPIN_LIMIT {
-        if let Some(saved) = SAVED_EXCEPTIONS.published(slot) {
-            return Some(saved);
+        match SAVED_EXCEPTIONS.slot_state(slot) {
+            SlotState::Ready(saved) => return Some(saved),
+            SlotState::Abandoned => return None,
+            SlotState::Pending => std::hint::spin_loop(),
         }
-        std::hint::spin_loop();
     }
     SAVED_EXCEPTIONS.published(slot)
 }
@@ -630,11 +632,11 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
 
     // Reserve before looking for the owner, so the owner cannot seal the session between
     // this thread seeing it and reserving a slot.
-    if let Some(slot) = SAVED_EXCEPTIONS.reserve() {
+    if let Some(reservation) = SAVED_EXCEPTIONS.reserve() {
         // SAFETY: `context` is valid for the current exception.
         let context_value = unsafe { *context };
         SAVED_EXCEPTIONS.publish(
-            slot,
+            reservation,
             SavedException {
                 address: at,
                 context: context_value,
