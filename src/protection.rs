@@ -6,10 +6,8 @@
 //! chat), the `t7patch.conf` settings watcher, and the exception fixups for the
 //! Lua and character-index crashes.
 //!
-//! Open items are marked `TODO(port)`: `arxan_bypass_maintain` (Arxan.cpp), the
-//! `ZW_CONTINUE` pointer (set by the DLL entry point in dllmain.cpp), the C
-//! `EXPORT` symbols, and the game RVAs in [`rva`] that `offsets.rs` does not
-//! list yet.
+//! Open items are marked `TODO(port)`: the game RVAs in [`rva`] that `offsets.rs`
+//! does not list yet, and a few helpers that belong in `structs.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, OsString, c_char, c_void};
@@ -504,8 +502,7 @@ pub static CACHED_XUID: AtomicI64 = AtomicI64::new(0);
 pub static IS_FRIENDS_ONLY: AtomicBool = AtomicBool::new(false);
 pub static IS_AUTO_INSTALL_MODS_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static IS_INJECTORLESS_INSTALL: AtomicBool = AtomicBool::new(true);
-/// `ZwContinue`. TODO(port): set by the DLL entry point (dllmain.cpp) from
-/// `GetProcAddress(ntdll, "ZwContinue")`. Zero until then.
+/// `ZwContinue`, resolved from ntdll by `DllMain`'s patch entry point. Zero until then.
 pub static ZW_CONTINUE: AtomicUsize = AtomicUsize::new(0);
 /// Original `oReadP2PPacket` (the value the C++ reads at `STEAMAPI_NETWORKING+0x10`).
 pub static O_READ_P2P_PACKET: AtomicUsize = AtomicUsize::new(0);
