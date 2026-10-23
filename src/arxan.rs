@@ -381,6 +381,11 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
     if slot == 0 || !slot.is_multiple_of(align_of::<usize>()) {
         return result;
     }
+    // SAFETY: the range is only queried. An unmapped slot (a freed interface, say)
+    // is refused before it is read.
+    if !unsafe { memory_range(slot, size_of::<usize>(), false) } {
+        return result;
+    }
     let _transaction = crate::threads::lock_transaction();
     // SAFETY: the slot is committed, aligned and read as a `usize` by other code.
     let atomic = unsafe { AtomicUsize::from_ptr(slot as *mut usize) };
@@ -399,22 +404,6 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
     }
     result.protection_restored = journal.restore(&mut ops);
     result
-}
-
-/// Atomically publishes `value` at `address`, replacing whatever it holds now.
-/// Use [`swap_usize`] when the current value is known.
-///
-/// # Safety
-///
-/// As for [`swap_usize`].
-pub(crate) unsafe fn write_usize(address: usize, value: usize) -> bool {
-    if address == 0 || !address.is_multiple_of(align_of::<usize>()) {
-        return false;
-    }
-    // SAFETY: forwarded from the caller; the slot is aligned.
-    let current = unsafe { AtomicUsize::from_ptr(address as *mut usize) }.load(Ordering::Acquire);
-    // SAFETY: forwarded from the caller.
-    unsafe { swap_usize(address, current, value) }.complete()
 }
 
 /// Finds all occurrences of `pattern` in the executable sections of the image.
@@ -972,6 +961,10 @@ mod tests {
         assert_eq!(slot.load(Ordering::Acquire), 9);
         // SAFETY: as above; a misaligned address is refused before any access.
         assert!(!unsafe { swap_usize(address + 1, 9, 1) }.written);
+        // SAFETY: an unmapped slot is refused by the VirtualQuery check, not read.
+        let unmapped = unsafe { swap_usize(0x10, 0, 1) };
+        assert!(!unmapped.written);
+        assert_eq!(unmapped.observed, 0);
     }
 
     #[test]

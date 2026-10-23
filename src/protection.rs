@@ -51,7 +51,7 @@ pub const PATCH_CONFIG_LOCATION: &str = "t7patch.conf";
 const PLAYER_NAME_LEN: usize = 16;
 const MAX_PLAYER_NAME: usize = 15;
 const MAX_LOBBY_CLIENTS: usize = 18;
-const MAX_LOBBY_VOTES: i32 = 216;
+const MAX_LOBBY_VOTES: usize = 216;
 const MAX_SETTINGS_VALUE: usize = 1023;
 const REQUEST_OUT_LEN: usize = 0x20000;
 const LOBBY_MSG_COPY_LEN: usize = 0x50;
@@ -509,10 +509,19 @@ pub static PRIVATE_PASSWORD: Mutex<[i64; 3]> = Mutex::new([0; 3]);
 /// Filled once by [`initialize`] and never changed afterwards.
 pub static STEAM_API_HOOKS: Mutex<BTreeMap<usize, BTreeMap<usize, usize>>> =
     Mutex::new(BTreeMap::new());
-/// `(interface, slot)` pairs [`swap_steam_api_pointer`] may have written, recorded before
-/// each write, so `uninstall` restores only those and leaves other hooks on the
-/// remaining slots alone.
-static STEAM_SWAPPED: Mutex<BTreeSet<(usize, usize)>> = Mutex::new(BTreeSet::new());
+/// One Steam vtable slot [`swap_steam_api_pointer`] wrote: the slot's address and the
+/// exact values before and after the swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwappedSlot {
+    slot: usize,
+    original: usize,
+    replacement: usize,
+}
+
+/// Every Steam vtable slot written, so `uninstall` puts back exactly those values. It
+/// writes a slot only while it still holds our replacement, so an interface that was
+/// replaced or freed since install is never written.
+static STEAM_SWAPPED: Mutex<Vec<SwappedSlot>> = Mutex::new(Vec::new());
 /// Lobby message handlers keyed by message type (a `BYTE` in the original).
 pub static PACKET_CALLBACKS: Mutex<BTreeMap<u8, PacketCallback>> = Mutex::new(BTreeMap::new());
 
@@ -1014,10 +1023,20 @@ pub unsafe fn swap_steam_api_pointer(
     }
     // SAFETY: the Steam interface global and its vtable are mapped while Steam is loaded.
     let vtable = unsafe { steam_vtable(library) }?;
-    lock(&STEAM_SWAPPED).insert((library, index));
-    // SAFETY: `vtable + index * 8` is a vtable entry; nothing is written if it cannot be
-    // made writable.
-    if !unsafe { crate::arxan::write_usize(vtable + index * 8, replacement) } {
+    let slot = vtable + index * 8;
+    // SAFETY: `slot` is a vtable entry inside the mapped vtable.
+    let original = unsafe { read_usize(slot) };
+    // SAFETY: `slot` is a vtable entry; nothing is written if it cannot be made
+    // writable or no longer holds `original`.
+    let write = unsafe { crate::arxan::swap_usize(slot, original, replacement) };
+    if write.written {
+        lock(&STEAM_SWAPPED).push(SwappedSlot {
+            slot,
+            original,
+            replacement,
+        });
+    }
+    if !write.complete() {
         return Err("T7 Patch: cannot write a Steam vtable slot".to_owned());
     }
     Ok(())
@@ -1582,33 +1601,70 @@ impl PatchConfig {
         c_prefix(&self.playername)
     }
 
-    /// Port of `patch_config::update_watcher_time`. Returns true when the file
-    /// appeared, disappeared, or changed its modification time.
-    fn update_watcher_time(&mut self, path: &Path) -> bool {
-        let did_exist_before = self.exists;
-        if !path.exists() {
-            self.exists = false;
-            return did_exist_before != self.exists;
-        }
-        self.exists = true;
-        let time = fs::metadata(path).and_then(|meta| meta.modified()).ok();
-        let was_same_time = self.modified == time;
-        self.modified = time;
-        (did_exist_before != self.exists) || !was_same_time
-    }
-
     /// Port of `patch_config::saveto`. Writes CRLF line endings, as the original's text-mode stream does.
     fn saveto(&mut self, path: &Path) {
-        let _ = fs::write(path, self.serialize());
-        self.update_watcher_time(path);
+        if fs::write(path, self.serialize()).is_err() {
+            return;
+        }
+        if let Ok(Some(time)) = observe_config(path) {
+            self.exists = true;
+            self.modified = Some(time);
+        }
     }
 
-    /// Port of `patch_config::loadfrom`.
-    fn loadfrom(&mut self, path: &Path) {
-        if let Ok(contents) = fs::read(path) {
-            self.apply_text(&contents);
+    /// Port of `patch_config::loadfrom`, without side effects: reads the whole
+    /// file, applies it over a copy of these settings, and returns the copy with
+    /// the modification time it was read at. The caller commits the result.
+    fn loadfrom(&self, path: &Path) -> Result<Self, ConfigError> {
+        let before = observe_config(path)?.ok_or(ConfigError::Missing)?;
+        let contents = fs::read(path).map_err(|error| ConfigError::from_io(&error))?;
+        // A writer that changed the file during the read may have left it torn.
+        if observe_config(path)? != Some(before) {
+            return Err(ConfigError::ChangedDuringRead);
         }
-        self.update_watcher_time(path);
+        let mut candidate = self.clone();
+        candidate.apply_text(&contents);
+        candidate.exists = true;
+        candidate.modified = Some(before);
+        Ok(candidate)
+    }
+
+    /// One watcher poll. `observed` is the file's state now, and `read` loads it.
+    /// Returns `true` when the settings changed and must be applied. The settings
+    /// and the timestamp change together, and only after a successful read. A
+    /// deleted file resets to the defaults. Any other error keeps both, so the
+    /// next poll retries.
+    fn refresh(
+        &mut self,
+        observed: Result<Option<SystemTime>, ConfigError>,
+        read: impl FnOnce(&Self) -> Result<Self, ConfigError>,
+    ) -> bool {
+        match observed {
+            Err(_) => false,
+            Ok(None) => {
+                if !self.exists {
+                    return false;
+                }
+                *self = Self::DEFAULT;
+                true
+            }
+            Ok(Some(time)) => {
+                if self.exists && self.modified == Some(time) {
+                    return false;
+                }
+                match read(self) {
+                    Ok(candidate) => {
+                        *self = candidate;
+                        true
+                    }
+                    Err(ConfigError::Missing) if self.exists => {
+                        *self = Self::DEFAULT;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -1679,6 +1735,34 @@ fn fs_exists(path: &Path) -> bool {
     path.exists()
 }
 
+/// Why the settings file could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigError {
+    Missing,
+    Access,
+    ChangedDuringRead,
+}
+
+impl ConfigError {
+    fn from_io(error: &std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Self::Missing
+        } else {
+            Self::Access
+        }
+    }
+}
+
+/// The settings file's modification time, `None` when it does not exist, or an
+/// error when it exists but cannot be inspected.
+fn observe_config(path: &Path) -> Result<Option<SystemTime>, ConfigError> {
+    match fs::metadata(path) {
+        Ok(meta) => meta.modified().map(Some).map_err(|_| ConfigError::Access),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ConfigError::Access),
+    }
+}
+
 /// Applies the settings to the running game.
 ///
 /// # Safety
@@ -1702,7 +1786,9 @@ unsafe fn load_settings_initial() {
     let snapshot = {
         let mut cfg = lock(&USER_CONFIG);
         if fs_exists(path) {
-            cfg.loadfrom(path);
+            if let Ok(candidate) = cfg.loadfrom(path) {
+                *cfg = candidate;
+            }
         } else {
             cfg.saveto(path);
         }
@@ -1734,12 +1820,9 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
             arxan_bypass_maintain();
             let changed = {
                 let mut cfg = lock(&USER_CONFIG);
-                if cfg.update_watcher_time(path) {
-                    cfg.loadfrom(path);
-                    Some(cfg.snapshot())
-                } else {
-                    None
-                }
+                let observed = observe_config(path);
+                cfg.refresh(observed, |current| current.loadfrom(path))
+                    .then(|| cfg.snapshot())
             };
             if let Some(cfg) = changed {
                 // SAFETY: the game is running.
@@ -2003,10 +2086,10 @@ pub unsafe fn msg_join_party_package_inspect(this: *mut u8, lobby_msg: *mut c_vo
         if !ok {
             return 1;
         }
-        if i32_at(at_bytes(this, 24)) > 18 {
+        let count = i32_at(at_bytes(this, 24));
+        if !count_in_range(count, MAX_LOBBY_CLIENTS) {
             return 2;
         }
-        let count = i32_at(at_bytes(this, 24));
         if rw::element(g, lm, count > 0) {
             if count <= 0 {
                 return 3;
@@ -2070,10 +2153,9 @@ pub unsafe fn msg_lobby_state_package_inspect(this: *mut u8, lobby_msg: *mut c_v
             return 1;
         }
         rw::array_start(g, lm, c"clientlist");
-        if i32_at(w(24)) > 18 {
+        let Some(count) = checked_count(i32_at(w(24)), MAX_LOBBY_CLIENTS) else {
             return 2;
-        }
-        let count = usize::try_from(i32_at(w(24))).unwrap_or(0);
+        };
         let mut index = 0usize;
         let mut has_next = rw::element(g, lm, index < count);
         while has_next && index < count {
@@ -2204,11 +2286,9 @@ pub unsafe fn msg_lobby_state_game_package_inspect(this: *mut u8, lobby_msg: *mu
         if lobby_mode == 1 {
             ok = ok && rw::int(g, lm, c"votecount", w(5397));
             rw::array_start(g, lm, c"votes");
-            let num_votes = i32_at(w(5397));
-            if ok && num_votes > MAX_LOBBY_VOTES {
+            let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
                 return 26;
-            }
-            let votes = usize::try_from(num_votes).unwrap_or(0);
+            };
             let mut index = 0usize;
             let mut has_next = rw::element(g, lm, index < votes);
             while has_next && index < votes {
@@ -2268,11 +2348,9 @@ pub unsafe fn msg_lobby_state_game_package_inspect(this: *mut u8, lobby_msg: *mu
             if !ok {
                 return 10;
             }
-            let num_votes = i32_at(w(5397));
-            if num_votes > MAX_LOBBY_VOTES {
+            let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
                 return 27;
-            }
-            let votes = usize::try_from(num_votes).unwrap_or(0);
+            };
             let mut index = 0usize;
             let mut has_next = rw::element(g, lm, index < votes);
             while has_next && index < votes {
@@ -2369,7 +2447,7 @@ pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyM
     let lobby_msg = lm.cast::<c_void>();
     // SAFETY: `info` and `lm` are valid per the function contract; `lobby` indices stay below 2.
     unsafe {
-        let mut pack_ok = rw::uint(g, lobby_msg, c"nonce", (&raw mut (*info).nonce).cast())
+        let pack_ok = rw::uint(g, lobby_msg, c"nonce", (&raw mut (*info).nonce).cast())
             && rw::int(
                 g,
                 lobby_msg,
@@ -2382,99 +2460,122 @@ pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyM
         }
 
         rw::array_start(g, lobby_msg, c"lobbies");
-        let mut has_next = rw::element(g, lobby_msg, true);
-        let mut c_response = 0usize;
-        while has_next && c_response < 2 {
-            rw::array_start(g, lobby_msg, c"lobbies");
-            let mut has_next2 = rw::element(g, lobby_msg, true);
-            let mut i = 0usize;
-            while has_next2 && i < 2 {
-                let lobby = &raw mut (*info).lobby[c_response];
-                pack_ok = pack_ok
-                    && rw::bool_(g, lobby_msg, c"valid", (&raw mut (*lobby).is_valid).cast());
-                if !pack_ok {
-                    return 2;
-                }
-                if (*lobby).is_valid != 0 {
-                    pack_ok = pack_ok
-                        && rw::xuid(
-                            g,
-                            lobby_msg,
-                            c"hostxuid",
-                            (&raw mut (*lobby).host_xuid).cast(),
-                        )
-                        && rw::string(
-                            g,
-                            lobby_msg,
-                            c"hostname",
-                            (&raw mut (*lobby).host_name).cast(),
-                            32,
-                        )
-                        && rw::int(
-                            g,
-                            lobby_msg,
-                            c"networkmode",
-                            (&raw mut (*lobby).lobby_params.network_mode).cast(),
-                        )
-                        && rw::int(
-                            g,
-                            lobby_msg,
-                            c"mainmode",
-                            (&raw mut (*lobby).lobby_params.main_mode).cast(),
-                        )
-                        && rw::glob(
-                            g,
-                            lobby_msg,
-                            c"secid",
-                            (&raw mut (*lobby).sec_id.id).cast(),
-                            8,
-                        )
-                        && rw::glob(
-                            g,
-                            lobby_msg,
-                            c"seckey",
-                            (&raw mut (*lobby).sec_key.ab).cast(),
-                            16,
-                        )
-                        && rw::glob(
-                            g,
-                            lobby_msg,
-                            c"addrbuff",
-                            (&raw mut (*lobby).serialized_adr.addr_buf).cast(),
-                            37,
-                        )
-                        && rw::string(
-                            g,
-                            lobby_msg,
-                            c"ugcName",
-                            (&raw mut (*lobby).ugc_name).cast(),
-                            32,
-                        )
-                        && rw::uint(
-                            g,
-                            lobby_msg,
-                            c"ugcVersion",
-                            (&raw mut (*lobby).ugc_version).cast(),
-                        );
-                    if !pack_ok {
-                        return 3;
-                    }
-                }
-                has_next2 = rw::element(g, lobby_msg, i < 2);
-                i += 1;
-            }
-            if has_next2 {
-                return 5;
-            }
-            has_next = rw::element(g, lobby_msg, c_response < 2);
-            c_response += 1;
+        let mut lobbies = LiveLobbies { g, lobby_msg, info };
+        if let Err(code) = read_lobby_pair(&mut lobbies) {
+            return code;
         }
-
-        if has_next || (*lm).msg.overflowed {
+        if (*lm).msg.overflowed {
             return 4;
         }
     }
     0
+}
+
+/// Reads the `lobbies` array of an info response.
+trait LobbyPairReader {
+    /// Advances to the next array element; `false` when there is none.
+    fn next_element(&mut self) -> bool;
+    /// Parses one lobby into output slot `index`, or returns the error code.
+    fn lobby(&mut self, index: usize) -> Result<(), i32>;
+}
+
+/// The `lobbies` array holds exactly two elements, one per output slot. A slot
+/// counts only once its element parsed. Fewer than two elements (6) or more
+/// than two (5) rejects the response. This replaces upstream's nested loop,
+/// which re-read the array header for each response and could fill a slot twice.
+fn read_lobby_pair(reader: &mut impl LobbyPairReader) -> Result<(), i32> {
+    for index in 0..2 {
+        if !reader.next_element() {
+            return Err(6);
+        }
+        reader.lobby(index)?;
+    }
+    if reader.next_element() {
+        return Err(5);
+    }
+    Ok(())
+}
+
+struct LiveLobbies<'a> {
+    g: &'a Game,
+    lobby_msg: *mut c_void,
+    info: *mut MsgInfoResponse,
+}
+
+impl LobbyPairReader for LiveLobbies<'_> {
+    fn next_element(&mut self) -> bool {
+        // SAFETY: `lobby_msg` is the live message `msg_info_response_safe` was given.
+        unsafe { rw::element(self.g, self.lobby_msg, true) }
+    }
+
+    fn lobby(&mut self, index: usize) -> Result<(), i32> {
+        let (g, lobby_msg) = (self.g, self.lobby_msg);
+        // SAFETY: `info` is writable per `msg_info_response_safe`'s contract and
+        // `index` is below 2, the length of `lobby`.
+        unsafe {
+            let lobby = &raw mut (*self.info).lobby[index];
+            if !rw::bool_(g, lobby_msg, c"valid", (&raw mut (*lobby).is_valid).cast()) {
+                return Err(2);
+            }
+            if (*lobby).is_valid != 0 {
+                let pack_ok = rw::xuid(
+                    g,
+                    lobby_msg,
+                    c"hostxuid",
+                    (&raw mut (*lobby).host_xuid).cast(),
+                ) && rw::string(
+                    g,
+                    lobby_msg,
+                    c"hostname",
+                    (&raw mut (*lobby).host_name).cast(),
+                    32,
+                ) && rw::int(
+                    g,
+                    lobby_msg,
+                    c"networkmode",
+                    (&raw mut (*lobby).lobby_params.network_mode).cast(),
+                ) && rw::int(
+                    g,
+                    lobby_msg,
+                    c"mainmode",
+                    (&raw mut (*lobby).lobby_params.main_mode).cast(),
+                ) && rw::glob(
+                    g,
+                    lobby_msg,
+                    c"secid",
+                    (&raw mut (*lobby).sec_id.id).cast(),
+                    8,
+                ) && rw::glob(
+                    g,
+                    lobby_msg,
+                    c"seckey",
+                    (&raw mut (*lobby).sec_key.ab).cast(),
+                    16,
+                ) && rw::glob(
+                    g,
+                    lobby_msg,
+                    c"addrbuff",
+                    (&raw mut (*lobby).serialized_adr.addr_buf).cast(),
+                    37,
+                ) && rw::string(
+                    g,
+                    lobby_msg,
+                    c"ugcName",
+                    (&raw mut (*lobby).ugc_name).cast(),
+                    32,
+                ) && rw::uint(
+                    g,
+                    lobby_msg,
+                    c"ugcVersion",
+                    (&raw mut (*lobby).ugc_version).cast(),
+                );
+                if !pack_ok {
+                    return Err(3);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Port of `Protection::CheckPendingInfoRequests`. Decides whether a pending
@@ -2629,42 +2730,17 @@ unsafe fn lobby_state_game_callback(lobby_msg_type: *mut i32, lobby_msg: i64) {
     }
 }
 
-/// Packet handler for host heartbeats (type 0x07). Checks the nominee list inline.
+/// Packet handler for host heartbeats (type 0x07). Runs the full inspector on a
+/// copy of the message, with a scratch buffer of at least 8 bytes for its XUID
+/// reads. Any required field that fails to parse drops the message, as does a
+/// nominee list longer than the lobby.
 ///
 /// # Safety
 ///
 /// Called by [`inspect_lm`].
 unsafe fn host_heartbeat_callback(lobby_msg_type: *mut i32, lobby_msg: i64) {
-    // SAFETY: the dispatcher passes a live message address.
-    let mut copy = unsafe { copy_lobby_msg(lobby_msg) };
-    let Some(g) = game() else {
-        return;
-    };
-    let lm = copy.as_mut_ptr().cast::<c_void>();
-    let mut out: i32 = 0;
-    let out_ptr = (&raw mut out).cast::<u8>();
-    // SAFETY: `lm` is the local copy and `out_ptr` addresses a live `i32`.
-    unsafe {
-        let ok = rw::int(g, lm, c"heartbeatnum", out_ptr)
-            && rw::int(g, lm, c"lobbytype", out_ptr)
-            && rw::int(g, lm, c"lasthosttimems", out_ptr);
-        if !ok {
-            return;
-        }
-        rw::array_start(g, lm, c"nomineelist");
-        let mut xuid_value: u64 = 1;
-        for _ in 0..MAX_LOBBY_CLIENTS {
-            if !rw::element(g, lm, true) {
-                return;
-            }
-            if !rw::xuid(g, lm, c"xuid", (&raw mut xuid_value).cast()) {
-                return;
-            }
-        }
-        if rw::element(g, lm, true) {
-            *lobby_msg_type = DROPPED_MSG_TYPE;
-        }
-    }
+    // SAFETY: forwarded from the dispatcher.
+    unsafe { drop_on_inspect_failure(lobby_msg_type, lobby_msg, msg_host_heartbeat_inspect) };
 }
 
 /// Port of the lobby-message handler table in `Protection::install`.
@@ -2678,6 +2754,17 @@ fn register_packet_callbacks() {
     map.insert(MSG_LOBBY_HOST_HEARTBEAT, host_heartbeat_callback);
     map.insert(0x2, lobby_state_callback);
     map.insert(0x3, lobby_state_game_callback);
+}
+
+/// True when a wire count is in `0..=max`. Negative counts are rejected, not
+/// read as empty.
+fn count_in_range(count: i32, max: usize) -> bool {
+    checked_count(count, max).is_some()
+}
+
+/// A wire count as an index bound, or `None` outside `0..=max`.
+fn checked_count(count: i32, max: usize) -> Option<usize> {
+    usize::try_from(count).ok().filter(|&count| count <= max)
 }
 
 /// Converts a low-order byte of `value`, as C's implicit `int` to `BYTE` conversion does.
@@ -3081,25 +3168,21 @@ pub(crate) fn exception_producers_remaining() -> bool {
 pub unsafe fn uninstall() -> Result<(), String> {
     let mut failures: Vec<&str> = Vec::new();
 
-    let snapshot = lock(&STEAM_API_HOOKS).clone();
-    let swapped: Vec<(usize, usize)> = lock(&STEAM_SWAPPED).iter().copied().collect();
-    for (library, index) in swapped {
-        let Some(original) = snapshot
-            .get(&library)
-            .and_then(|slots| slots.get(&index))
-            .copied()
-        else {
-            failures.push("Steam original");
-            continue;
-        };
-        // SAFETY: `library` is a Steam interface global recorded by `initialize`.
-        let Ok(vtable) = (unsafe { steam_vtable(library) }) else {
-            failures.push("Steam interface");
-            continue;
-        };
-        // SAFETY: restores the snapshot value of a vtable entry `install` wrote.
-        if unsafe { crate::arxan::write_usize(vtable + index * 8, original) } {
-            lock(&STEAM_SWAPPED).remove(&(library, index));
+    let swapped: Vec<SwappedSlot> = lock(&STEAM_SWAPPED).clone();
+    for record in swapped {
+        // SAFETY: `swap_usize` checks that the slot is still mapped, and writes only
+        // while it holds our replacement.
+        let write =
+            unsafe { crate::arxan::swap_usize(record.slot, record.replacement, record.original) };
+        if write.complete() || (!write.written && write.observed != record.replacement) {
+            if !write.written {
+                // The interface was replaced or rewritten since install: the slot
+                // is not ours any more, so it is left alone.
+                crate::dllmain::debug_print(
+                    "T7 Patch: a Steam vtable slot changed since install; left as is.\n",
+                );
+            }
+            lock(&STEAM_SWAPPED).retain(|kept| *kept != record);
         } else {
             failures.push("Steam vtable slot");
         }
@@ -3348,6 +3431,132 @@ mod tests {
         rotate_private_password(&mut state, 5, 100);
         rotate_private_password(&mut state, 9, 200);
         assert_eq!(state, [5, 9, 200]);
+    }
+
+    /// A fake `lobbies` array of `elements` entries; `bad` fails that lobby's parse.
+    struct FakeLobbies {
+        elements: usize,
+        cursor: usize,
+        bad: Option<(usize, i32)>,
+        parsed: Vec<usize>,
+    }
+
+    impl LobbyPairReader for FakeLobbies {
+        fn next_element(&mut self) -> bool {
+            let present = self.cursor < self.elements;
+            self.cursor += 1;
+            present
+        }
+
+        fn lobby(&mut self, index: usize) -> Result<(), i32> {
+            match self.bad {
+                Some((bad, code)) if bad == index => return Err(code),
+                _ => {}
+            }
+            self.parsed.push(index);
+            Ok(())
+        }
+    }
+
+    fn lobbies(elements: usize, bad: Option<(usize, i32)>) -> (Result<(), i32>, Vec<usize>) {
+        let mut fake = FakeLobbies {
+            elements,
+            cursor: 0,
+            bad,
+            parsed: Vec::new(),
+        };
+        (read_lobby_pair(&mut fake), fake.parsed)
+    }
+
+    #[test]
+    fn info_response_needs_exactly_two_lobbies() {
+        assert_eq!(lobbies(0, None), (Err(6), vec![]));
+        assert_eq!(lobbies(1, None), (Err(6), vec![0]));
+        assert_eq!(lobbies(2, None), (Ok(()), vec![0, 1]));
+        assert_eq!(lobbies(3, None), (Err(5), vec![0, 1]));
+        // A truncated field in either lobby rejects the response at once.
+        assert_eq!(lobbies(2, Some((0, 3))), (Err(3), vec![]));
+        assert_eq!(lobbies(2, Some((1, 2))), (Err(2), vec![0]));
+    }
+
+    #[test]
+    fn counts_must_be_inside_the_inclusive_range() {
+        assert_eq!(checked_count(0, MAX_LOBBY_CLIENTS), Some(0));
+        assert_eq!(checked_count(18, MAX_LOBBY_CLIENTS), Some(18));
+        assert_eq!(checked_count(19, MAX_LOBBY_CLIENTS), None);
+        assert_eq!(checked_count(-1, MAX_LOBBY_CLIENTS), None);
+        assert_eq!(checked_count(i32::MIN, MAX_LOBBY_VOTES), None);
+        assert_eq!(checked_count(216, MAX_LOBBY_VOTES), Some(216));
+        assert_eq!(checked_count(217, MAX_LOBBY_VOTES), None);
+        assert!(!count_in_range(-5, MAX_LOBBY_CLIENTS));
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    fn loaded(name: &[u8], seconds: u64) -> PatchConfig {
+        let mut cfg = PatchConfig::DEFAULT;
+        cfg.apply_line(&[b"playername=", name].concat());
+        cfg.exists = true;
+        cfg.modified = Some(at(seconds));
+        cfg
+    }
+
+    #[test]
+    fn refresh_commits_settings_and_time_only_on_success() {
+        let mut cfg = loaded(b"Old", 1);
+        // Unchanged time: no read at all.
+        assert!(!cfg.refresh(Ok(Some(at(1))), |_| panic!("read")));
+        // A failed read keeps the old settings and the old time, so it retries.
+        assert!(!cfg.refresh(Ok(Some(at(2))), |_| Err(ConfigError::Access)));
+        assert_eq!(cfg.playername_bytes(), b"Old");
+        assert_eq!(cfg.modified, Some(at(1)));
+        assert!(!cfg.refresh(Ok(Some(at(2))), |_| Err(ConfigError::ChangedDuringRead)));
+        assert_eq!(cfg.modified, Some(at(1)));
+        // The retry succeeds and commits both together.
+        assert!(cfg.refresh(Ok(Some(at(2))), |_| Ok(loaded(b"New", 2))));
+        assert_eq!(cfg.playername_bytes(), b"New");
+        assert_eq!(cfg.modified, Some(at(2)));
+    }
+
+    #[test]
+    fn refresh_keeps_settings_when_metadata_fails() {
+        let mut cfg = loaded(b"Kept", 1);
+        assert!(!cfg.refresh(Err(ConfigError::Access), |_| panic!("read")));
+        assert_eq!(cfg.playername_bytes(), b"Kept");
+        assert!(cfg.exists);
+    }
+
+    #[test]
+    fn refresh_resets_to_defaults_when_the_file_is_deleted() {
+        let mut cfg = loaded(b"Gone", 1);
+        assert!(cfg.refresh(Ok(None), |_| panic!("read")));
+        assert_eq!(cfg.playername_bytes(), b"Unknown Soldier");
+        assert!(!cfg.exists);
+        // Still missing: nothing more to apply.
+        assert!(!cfg.refresh(Ok(None), |_| panic!("read")));
+        // Deleted between the metadata check and the read.
+        let mut cfg = loaded(b"Racy", 1);
+        assert!(cfg.refresh(Ok(Some(at(2))), |_| Err(ConfigError::Missing)));
+        assert!(!cfg.exists);
+    }
+
+    #[test]
+    fn loadfrom_reads_a_real_file_without_committing() {
+        let dir = std::env::temp_dir().join(format!("t7patch-cfg-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("t7patch.conf");
+        fs::write(&path, b"playername=Disk\r\nisfriendsonly=0\r\n").unwrap();
+        let cfg = PatchConfig::DEFAULT;
+        let candidate = cfg.loadfrom(&path).expect("read");
+        assert_eq!(candidate.playername_bytes(), b"Disk");
+        assert_eq!(candidate.isfriendsonly, 0);
+        assert!(candidate.modified.is_some());
+        assert_eq!(cfg.playername_bytes(), b"Unknown Soldier");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(cfg.loadfrom(&path).err(), Some(ConfigError::Missing));
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
