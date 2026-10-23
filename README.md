@@ -2,7 +2,10 @@
 
 A Rust port of [shiversoftdev's T7Patch](https://github.com/Scroptss/T7Patch-src) for Call of Duty: Black Ops III (Windows x64).
 
-Status: all C++ modules ported; not yet run inside the game. See the checklist below.
+Status: ports upstream T7Patch plus the C++ fork's safety fixes: bounded chat, IM and
+event-index handling, a staged lifecycle with rollback, a managed config worker, restore on
+unload, and a fixed crash queue with a safe stack probe. The tests pass under Wine. It has
+not yet been run in the game.
 
 ## Port checklist
 
@@ -20,6 +23,7 @@ Status: all C++ modules ported; not yet run inside the game. See the checklist b
 | `LuaSymbols.cpp/.h` | `src/lua_symbols.rs` | ported, untested in game |
 | `dllmain.cpp` | `src/dllmain.rs` | ported, untested in game |
 | exception-dispatch hook (in `dllmain.cpp`) | `src/exception.rs` | ported, untested in game; undocumented ntdll internals |
+| `CrashQueue.h`, `StackProbe.h` (fork) | `src/crash_queue.rs`, `src/exception.rs` | ported, tested |
 
 ## Build
 
@@ -43,9 +47,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 The DLL is `target/x86_64-pc-windows-gnu/release/t7patch.dll`. It needs no
-mingw runtime DLLs, so it loads under Wine and Proton as it does on Windows.
-Run the tests
-under Wine with:
+mingw runtime DLLs, so it is expected to load under Wine and Proton as on
+Windows; that has not been verified in the game. Run the tests under Wine with:
 
 ```bash
 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-windows-gnu

@@ -9,30 +9,38 @@
 //! The mechanism depends on undocumented ntdll internals. It is the riskiest
 //! part of the port and has not been run against the game.
 
-use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
-use windows::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD, RtlPcToFileHeader};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileA, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FlushFileBuffers, OPEN_ALWAYS, WriteFile,
+};
+use windows::Win32::System::Diagnostics::Debug::{
+    CONTEXT, EXCEPTION_RECORD, OutputDebugStringA, ReadProcessMemory, RtlPcToFileHeader,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, OpenThread, PROCESS_ALL_ACCESS,
-    THREAD_ALL_ACCESS,
+    GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, SuspendThread, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBoxA};
 use windows::core::{PCSTR, s};
 
 use crate::build;
+use crate::crash_queue::CrashQueue;
 use crate::offsets::{self, address};
 use crate::protection;
 
 const CRASH_LOG_NAME: &str = "crashes.log";
+/// [`CRASH_LOG_NAME`] for the allocation-free emergency path.
+const CRASH_LOG_NAME_C: &CStr = c"crashes.log";
 const LOG_FAILED_EXIT_CODE: i32 = -444;
+/// Exit code when the process cannot be suspended, as in the fork.
+const SUSPEND_FAILED_EXIT_CODE: u32 = (-444_i32).cast_unsigned();
 
 const STATUS_ILLEGAL_INSTRUCTION: i32 = 0xC000_001D_u32.cast_signed();
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC000_0005_u32.cast_signed();
@@ -41,7 +49,8 @@ const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 const UNKNOWN_MODULE: &str = "<Unknown Module>";
 const CLIENTFIELD_DOESNT_EXIST: &CStr = c"Clientfield does not exist";
 
-/// Thread id currently writing the crash log, or 0 when nobody is.
+/// Thread id that owns the fatal crash session, or 0 before the first fatal fault.
+/// Never reset once claimed: the session is sealed and the process suspended.
 static LCK_DUMPING: AtomicU32 = AtomicU32::new(0);
 /// Pointer slot the hook was written into, or 0.
 static FN_PTR_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -51,7 +60,22 @@ static ORIGINAL_DISPATCH_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 static DISPATCHER_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Original stub bytes saved before the Wine-style patch.
 static WINE_OLD_DATA: Mutex<Option<[u8; WINE_HOOK_SIZE]>> = Mutex::new(None);
-static SAVED_EXCEPTIONS: Mutex<Option<HashMap<i64, CONTEXT>>> = Mutex::new(None);
+
+/// Maximum number of fatal faults logged in full in one session (fork `MAX_SAVED_EXCEPTIONS`).
+const MAX_SAVED_EXCEPTIONS: usize = 16;
+
+/// One fatal fault waiting to be written by the session owner.
+#[derive(Clone, Copy)]
+struct SavedException {
+    address: i64,
+    context: CONTEXT,
+    code: i32,
+}
+
+static SAVED_EXCEPTIONS: CrashQueue<SavedException, MAX_SAVED_EXCEPTIONS> = CrashQueue::new();
+
+/// Bounded wait for a reserved slot to be published.
+const PUBLISH_SPIN_LIMIT: u32 = 1_000_000;
 
 const WINE_HOOK_SIZE: usize = 0x1B;
 const WINE_KI_DISPATCH_OFFSET: usize = 0xB;
@@ -61,21 +85,15 @@ const KI_DISPATCH_PTR_PATTERN: i32 = 0x058B_48FC;
 type ZwContinueFn = unsafe extern "system" fn(*mut CONTEXT, u8) -> i32;
 type NtSuspendProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
 
-fn lock_saved() -> MutexGuard<'static, Option<HashMap<i64, CONTEXT>>> {
-    SAVED_EXCEPTIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Resolves an export from `module`, or 0 if it is missing.
 ///
 /// # Safety
 ///
-/// `module` must be a valid module handle or null; `name` must be NUL-terminated.
-unsafe fn proc_address(module: &str, name: PCSTR) -> usize {
-    let name_c = std::ffi::CString::new(module).unwrap_or_default();
-    // SAFETY: `name_c` is a valid NUL-terminated module name.
-    let handle = unsafe { GetModuleHandleA(PCSTR(name_c.as_ptr().cast())) }.unwrap_or_default();
+/// `module` and `name` must be NUL-terminated. Does not allocate, so it is usable on the
+/// fatal crash path.
+unsafe fn proc_address(module: PCSTR, name: PCSTR) -> usize {
+    // SAFETY: the caller guarantees `module` is a NUL-terminated module name.
+    let handle = unsafe { GetModuleHandleA(module) }.unwrap_or_default();
     // SAFETY: `handle` is a module handle from `GetModuleHandleA`; `name` is NUL-terminated.
     unsafe { GetProcAddress(handle, name) }.map_or(0, |function| function as *const () as usize)
 }
@@ -83,7 +101,7 @@ unsafe fn proc_address(module: &str, name: PCSTR) -> usize {
 /// Address of `ntdll!ZwContinue`, or 0 if it is missing.
 pub fn zw_continue_address() -> usize {
     // SAFETY: resolves an export of ntdll, which is always loaded in a Windows process.
-    unsafe { proc_address("ntdll.dll", s!("ZwContinue")) }
+    unsafe { proc_address(s!("ntdll.dll"), s!("ZwContinue")) }
 }
 
 /// Calls `ZwContinue`, which resumes execution at `context` and does not return on success.
@@ -93,7 +111,7 @@ pub fn zw_continue_address() -> usize {
 /// `context` must point to a `CONTEXT` captured for the current exception.
 unsafe fn zw_continue(context: *mut CONTEXT) {
     // SAFETY: `ntdll!ZwContinue` has this signature; the address is resolved from ntdll.
-    let address = unsafe { proc_address("ntdll.dll", s!("ZwContinue")) };
+    let address = unsafe { proc_address(s!("ntdll.dll"), s!("ZwContinue")) };
     if address == 0 {
         return;
     }
@@ -117,126 +135,258 @@ unsafe fn resume_at(context: *mut CONTEXT, rip: usize) {
 }
 
 fn open_crash_log() -> std::fs::File {
-    match OpenOptions::new()
+    try_open_crash_log().unwrap_or_else(|| std::process::exit(LOG_FAILED_EXIT_CODE))
+}
+
+fn try_open_crash_log() -> Option<std::fs::File> {
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(CRASH_LOG_NAME)
-    {
-        Ok(file) => file,
-        Err(_) => std::process::exit(LOG_FAILED_EXIT_CODE),
-    }
+        .ok()
 }
 
-/// Stops every thread of the process by suspending the process itself.
+/// Stops every thread of the process by suspending the process itself. Port of the fork's
+/// `SuspendProcess`: the pseudo-handle needs no access rights and cannot leak, and the
+/// process is terminated if it cannot be suspended.
 fn suspend_process() {
-    // SAFETY: opens the current process with full access, as the original does.
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, GetCurrentProcessId()) })
-    else {
-        return;
-    };
-    // SAFETY: `NtSuspendProcess` takes a process handle; the address comes from ntdll.
-    let address = unsafe { proc_address("ntdll.dll", s!("NtSuspendProcess")) };
-    if address != 0 {
+    // SAFETY: resolves an ntdll export by static NUL-terminated names.
+    let address = unsafe { proc_address(s!("ntdll.dll"), s!("NtSuspendProcess")) };
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and has no preconditions.
+    let process = unsafe { GetCurrentProcess() };
+    let suspended = address != 0 && {
         // SAFETY: the resolved export is `NtSuspendProcess`, matching the signature.
         let function: NtSuspendProcessFn = unsafe { std::mem::transmute(address) };
-        // SAFETY: `process` is a valid handle opened above.
-        unsafe { function(process) };
+        // SAFETY: `process` is the current-process pseudo-handle.
+        let status = unsafe { function(process) };
+        status >= 0
+    };
+    if !suspended {
+        // SAFETY: terminates the current process through its pseudo-handle.
+        let _ = unsafe { TerminateProcess(process, SUSPEND_FAILED_EXIT_CODE) };
     }
-    // SAFETY: `process` is a handle opened above and not used afterwards.
-    let _ = unsafe { CloseHandle(process) };
 }
 
-/// Removes and returns one saved exception context, if any.
-fn take_saved_exception() -> Option<(i64, CONTEXT)> {
-    let mut saved = lock_saved();
-    let map = saved.as_mut()?;
-    let key = *map.keys().next()?;
-    map.remove(&key).map(|context| (key, context))
+/// Bytes read per stack line: two 64-bit words.
+const STACK_LINE_BYTES: usize = 16;
+
+/// Start of the stack line at `stack + offset`, or `None` if the line would run past the
+/// end of the address space (fork `StackProbe.h`).
+fn stack_line_address(stack: usize, offset: usize) -> Option<usize> {
+    let start = stack.checked_add(offset)?;
+    start.checked_add(STACK_LINE_BYTES)?;
+    Some(start)
 }
 
-/// Writes one exception line block for every saved context, then empties the map.
-///
-/// # Safety
-///
-/// Reads the saved stack of each context; the addresses are the faulting thread's own stack.
-unsafe fn dump_saved_exceptions(log: &mut std::fs::File, code: i32) {
+/// Port of the fork's `ReadStackLine`: reads two words at `stack + offset` without
+/// faulting, or `None` if the range overflows or is not fully readable.
+fn read_stack_line(stack: usize, offset: usize) -> Option<[u64; 2]> {
+    let start = stack_line_address(stack, offset)?;
+    let mut words = [0u64; 2];
+    let mut copied = 0usize;
+    // SAFETY: `ReadProcessMemory` validates the source range itself and fails instead of
+    // faulting; the destination is a local 16-byte buffer.
+    unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            start as *const c_void,
+            words.as_mut_ptr().cast(),
+            STACK_LINE_BYTES,
+            Some(&raw mut copied),
+        )
+    }
+    .ok()?;
+    (copied == STACK_LINE_BYTES).then_some(words)
+}
+
+const EMERGENCY_TEMPLATE: &[u8] =
+    b"T7 Patch emergency exception: address=0x0000000000000000 code=0x00000000\r\n";
+const EMERGENCY_LINE_LEN: usize = EMERGENCY_TEMPLATE.len();
+const EMERGENCY_ADDRESS_START: usize = b"T7 Patch emergency exception: address=0x".len();
+const EMERGENCY_CODE_START: usize = EMERGENCY_ADDRESS_START + 16 + b" code=0x".len();
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Writes `value` as lowercase hex into `out`, most significant digit first, one digit per byte.
+fn write_hex(out: &mut [u8], value: u64) {
+    let digits = out.len();
+    for (index, byte) in out.iter_mut().enumerate() {
+        let shift = 4 * (digits - 1 - index);
+        let nibble = usize::try_from((value >> shift) & 0xF).unwrap_or_default();
+        *byte = HEX_DIGITS[nibble];
+    }
+}
+
+/// The emergency log line for a fault, built without allocating.
+fn format_emergency_line(address: i64, code: u32) -> [u8; EMERGENCY_LINE_LEN] {
+    let mut line = [0u8; EMERGENCY_LINE_LEN];
+    line.copy_from_slice(EMERGENCY_TEMPLATE);
+    write_hex(
+        &mut line[EMERGENCY_ADDRESS_START..EMERGENCY_ADDRESS_START + 16],
+        address.cast_unsigned(),
+    );
+    write_hex(
+        &mut line[EMERGENCY_CODE_START..EMERGENCY_CODE_START + 8],
+        u64::from(code),
+    );
+    line
+}
+
+/// Port of the fork's `EmergencyException`: logs one line for a fault that cannot be
+/// written in full, without the heap, `std::fs` or any lock this crate owns.
+fn emergency_exception(address: i64, code: u32) {
+    let line = format_emergency_line(address, code);
+    let mut text = [0u8; EMERGENCY_LINE_LEN + 1];
+    text[..EMERGENCY_LINE_LEN].copy_from_slice(&line);
+    // SAFETY: `text` is NUL-terminated by its final zero byte.
+    unsafe { OutputDebugStringA(PCSTR(text.as_ptr())) };
+
+    // SAFETY: the file name is a static NUL-terminated string; no security attributes or
+    // template file are passed.
+    let Ok(file) = (unsafe {
+        CreateFileA(
+            PCSTR(CRASH_LOG_NAME_C.as_ptr().cast()),
+            FILE_APPEND_DATA.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }) else {
+        return;
+    };
+    let mut written = 0u32;
+    // SAFETY: `file` is the handle opened above; `line` is a local buffer.
+    let _ = unsafe { WriteFile(file, Some(&line), Some(&raw mut written), None) };
+    // SAFETY: as above.
+    let _ = unsafe { FlushFileBuffers(file) };
+    // SAFETY: `file` was opened above and is not used afterwards.
+    let _ = unsafe { CloseHandle(file) };
+}
+
+/// Port of the fork's `DumpException`: writes one crash-log entry. The header and
+/// registers are flushed before the stack is read, so they survive a failure there.
+fn dump_exception(log: &mut std::fs::File, address: i64, context: &CONTEXT, code: i32) {
     let image_base = build::image_base() as u64;
 
-    // The lock is held only to take one entry. A fault while dumping, on this
-    // thread or another, can then add its context and is dumped by this loop.
-    while let Some((key, context)) = take_saved_exception() {
-        let mut module_base: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `key` is a code address captured from an exception record.
-        unsafe { RtlPcToFileHeader(key as *const c_void, &raw mut module_base) };
-        let faulting_module = module_base as u64;
-        let module_name = if faulting_module != 0 {
-            let mut buffer = [0u8; 260];
-            // SAFETY: the buffer is 260 bytes, matching MAX_PATH.
-            let length = unsafe { GetModuleFileNameA(Some(HMODULE(module_base)), &mut buffer) };
-            String::from_utf8_lossy(&buffer[..length as usize]).into_owned()
-        } else {
-            UNKNOWN_MODULE.to_owned()
-        };
-
-        let key_u = key.cast_unsigned();
-        let mut text = String::new();
-        let _ = writeln!(text, "Game: {image_base:016x}");
-        let _ = writeln!(text, "Module: {module_name}");
-        let _ = writeln!(
-            text,
-            "[{faulting_module:016x}]Exception at ({:016x}) (RIP:{:016x}) (Rsp: {:016x})",
-            key_u.wrapping_sub(faulting_module),
-            context.Rip,
-            context.Rsp
-        );
-        let _ = writeln!(
-            text,
-            "[{key_u:016x}]Rcx: ({:016x}) Rdx: ({:016x}) R8: ({:016x}) R9: ({:016x})",
-            context.Rcx, context.Rdx, context.R8, context.R9
-        );
-        let _ = writeln!(
-            text,
-            "[{key_u:016x}]Rax: ({:016x}) Rbx: ({:016x}) Rsi: ({:016x}) Rdi: ({:016x})",
-            context.Rax, context.Rbx, context.Rsi, context.Rdi
-        );
-        let _ = writeln!(
-            text,
-            "[{key_u:016x}]R10: ({:016x}) R11: ({:016x}) R12: ({:016x}) R13: ({:016x})",
-            context.R10, context.R11, context.R12, context.R13
-        );
-        let _ = writeln!(
-            text,
-            "[{key_u:016x}]Rbp: ({:016x}) R14: ({:016x}) R15: ({:016x}) Dr7: ({:016x})",
-            context.Rbp, context.R14, context.R15, context.Dr7
-        );
-        let _ = writeln!(
-            text,
-            "[{key_u:016x}]Dr0: ({:016x}) Dr1: ({:016x}) Dr2: ({:016x}) Dr3: ({:016x})",
-            context.Dr0, context.Dr1, context.Dr2, context.Dr3
-        );
-
-        let span = if code == STATUS_ILLEGAL_INSTRUCTION {
-            0x1200
-        } else {
-            0x400
-        };
-        for offset in (0..span).step_by(0x10) {
-            let stack = context.Rsp + u64::try_from(offset).unwrap_or_default();
-            // SAFETY: the faulting thread's stack is mapped for at least this range.
-            let (first_word, second_word) = unsafe {
-                (
-                    (stack as *const u64).read_unaligned(),
-                    ((stack + 8) as *const u64).read_unaligned(),
-                )
-            };
-            let _ = writeln!(
-                text,
-                "[{stack:016x}] {first_word:016x} {second_word:016x}\n"
-            );
+    let mut module_base: *mut c_void = std::ptr::null_mut();
+    // SAFETY: only looks up which loaded image contains `address`; it does not dereference it.
+    unsafe { RtlPcToFileHeader(address as *const c_void, &raw mut module_base) };
+    let faulting_module = module_base as u64;
+    let mut module_name = UNKNOWN_MODULE.to_owned();
+    if faulting_module != 0 {
+        let mut buffer = [0u8; 260];
+        // SAFETY: the buffer is 260 bytes, matching MAX_PATH.
+        let length = unsafe { GetModuleFileNameA(Some(HMODULE(module_base)), &mut buffer) };
+        if length != 0 {
+            module_name = String::from_utf8_lossy(&buffer[..length as usize]).into_owned();
         }
-
-        let _ = log.write_all(text.as_bytes());
     }
+
+    let key = address.cast_unsigned();
+    let _ = writeln!(log, "Game: {image_base:016x}");
+    let _ = writeln!(log, "Module: {module_name}");
+    let _ = writeln!(
+        log,
+        "[{faulting_module:016x}]Exception at ({:016x}) (RIP:{:016x}) (Rsp: {:016x})",
+        key.wrapping_sub(faulting_module),
+        context.Rip,
+        context.Rsp
+    );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]Rcx: ({:016x}) Rdx: ({:016x}) R8: ({:016x}) R9: ({:016x})",
+        context.Rcx, context.Rdx, context.R8, context.R9
+    );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]Rax: ({:016x}) Rbx: ({:016x}) Rsi: ({:016x}) Rdi: ({:016x})",
+        context.Rax, context.Rbx, context.Rsi, context.Rdi
+    );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]R10: ({:016x}) R11: ({:016x}) R12: ({:016x}) R13: ({:016x})",
+        context.R10, context.R11, context.R12, context.R13
+    );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]Rbp: ({:016x}) R14: ({:016x}) R15: ({:016x}) Dr7: ({:016x})",
+        context.Rbp, context.R14, context.R15, context.Dr7
+    );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]Dr0: ({:016x}) Dr1: ({:016x}) Dr2: ({:016x}) Dr3: ({:016x})",
+        context.Dr0, context.Dr1, context.Dr2, context.Dr3
+    );
+    // Preserve the exception and registers even if reading the stack fails.
+    let _ = log.flush();
+
+    let span = if code == STATUS_ILLEGAL_INSTRUCTION {
+        0x1200
+    } else {
+        0x400
+    };
+    let rsp = usize::try_from(context.Rsp).unwrap_or(usize::MAX);
+    for offset in (0..span).step_by(0x10) {
+        let Some([first_word, second_word]) = read_stack_line(rsp, offset) else {
+            let _ = writeln!(
+                log,
+                "Stack unreadable at RSP+0x{offset:x}; stack dump stopped."
+            );
+            break;
+        };
+        let stack = rsp + offset;
+        let _ = writeln!(log, "[{stack:016x}] {first_word:016x} {second_word:016x}\n");
+    }
+    let _ = log.flush();
+}
+
+/// Waits a bounded time for `slot` to be published by the thread that reserved it.
+fn wait_published(slot: usize) -> Option<SavedException> {
+    for _ in 0..PUBLISH_SPIN_LIMIT {
+        if let Some(saved) = SAVED_EXCEPTIONS.published(slot) {
+            return Some(saved);
+        }
+        std::hint::spin_loop();
+    }
+    SAVED_EXCEPTIONS.published(slot)
+}
+
+/// The session owner's work: drains every reserved fault into the crash log, then seals
+/// the queue so later faults fall back to the emergency log. Falls back to the emergency
+/// log for the owner's own fault if the crash log cannot be opened.
+fn write_crash_session(address: i64, code: u32) {
+    let Some(mut log) = try_open_crash_log() else {
+        emergency_exception(address, code);
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let _ = write!(log, "Crash log {stamp:016x}\n\n");
+
+    let mut consumed = 0;
+    loop {
+        while consumed < SAVED_EXCEPTIONS.count() {
+            if let Some(saved) = wait_published(consumed) {
+                dump_exception(&mut log, saved.address, &saved.context, saved.code);
+            } else {
+                let _ = writeln!(
+                    log,
+                    "Reserved exception {consumed} did not finish publishing; skipped."
+                );
+            }
+            consumed += 1;
+        }
+        if SAVED_EXCEPTIONS.seal_if_drained(consumed) {
+            break;
+        }
+    }
+    let _ = writeln!(
+        log,
+        "Crash session closed (capacity {MAX_SAVED_EXCEPTIONS}); later faults use emergency logging."
+    );
+    let _ = log.flush();
 }
 
 /// Writes a crash log entry and handles the fault, following the original dispatch order.
@@ -416,7 +566,8 @@ unsafe fn handle_script_error(context: *mut CONTEXT) {
     std::process::exit(0);
 }
 
-/// Logs an unrecognized access violation or non-continuable fault, then suspends the process.
+/// Logs an unrecognized access violation or non-continuable fault, then suspends the
+/// process. Port of the fork's fatal path in `ExceptHook`.
 ///
 /// # Safety
 ///
@@ -430,58 +581,48 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
             (*record).ExceptionAddress as i64,
         )
     };
-    let mut b_fatal = false;
-    if code == EXCEPTION_ACCESS_VIOLATION || flags & EXCEPTION_NONCONTINUABLE != 0 {
-        // SAFETY: `context` is valid for the current exception.
-        let context_value = unsafe { *context };
-        // SAFETY: `GetCurrentThreadId` has no preconditions.
-        let thread = unsafe { GetCurrentThreadId() };
+    if code != EXCEPTION_ACCESS_VIOLATION && flags & EXCEPTION_NONCONTINUABLE == 0 {
+        return;
+    }
+    let code_bits = code.cast_unsigned();
 
-        if LCK_DUMPING.load(Ordering::Acquire) != 0 {
-            lock_saved()
-                .get_or_insert_with(HashMap::new)
-                .insert(at, context_value);
-        } else {
-            LCK_DUMPING.store(thread, Ordering::Release);
-            let mut log = open_crash_log();
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs());
-            let _ = write!(log, "Crash log {stamp:016x}\n\n");
-            lock_saved()
-                .get_or_insert_with(HashMap::new)
-                .insert(at, context_value);
-            // SAFETY: the log is open and the saved contexts are read from the map.
-            unsafe { dump_saved_exceptions(&mut log, code) };
-            let _ = log.flush();
-            drop(log);
-            LCK_DUMPING.store(0, Ordering::Release);
-        }
-
-        if code != STATUS_ILLEGAL_INSTRUCTION {
-            b_fatal = true;
-        }
+    // SAFETY: `GetCurrentThreadId` has no preconditions.
+    let thread = unsafe { GetCurrentThreadId() };
+    if LCK_DUMPING.load(Ordering::Acquire) == thread {
+        // A fault inside the dumper itself: log without the crash log machinery.
+        emergency_exception(at, code_bits);
+        suspend_process();
+        return;
     }
 
-    if b_fatal {
-        // SAFETY: `GetCurrentThreadId` has no preconditions.
-        let thread = unsafe { GetCurrentThreadId() };
-        let dumping = LCK_DUMPING.load(Ordering::Acquire);
-        if dumping != 0 && dumping != thread {
-            // SAFETY: opens the current thread with full access, as the original does.
-            if let Ok(handle) = unsafe { OpenThread(THREAD_ALL_ACCESS, false, thread) } {
-                // SAFETY: `kernel32!SuspendThread` takes a thread handle.
-                let suspend = unsafe { proc_address("kernel32.dll", s!("SuspendThread")) };
-                // SAFETY: `context` is valid; the handler resumes at SuspendThread with the handle.
-                unsafe {
-                    (*context).Rip = suspend as u64;
-                    (*context).Rcx = handle.0 as u64;
-                    zw_continue(context);
-                }
-            }
-        } else {
-            suspend_process();
-        }
+    // Reserve before looking for the owner, so the owner cannot seal the session between
+    // this thread seeing it and reserving a slot.
+    if let Some(slot) = SAVED_EXCEPTIONS.reserve() {
+        // SAFETY: `context` is valid for the current exception.
+        let context_value = unsafe { *context };
+        SAVED_EXCEPTIONS.publish(
+            slot,
+            SavedException {
+                address: at,
+                context: context_value,
+                code,
+            },
+        );
+    } else {
+        emergency_exception(at, code_bits);
+    }
+
+    if LCK_DUMPING
+        .compare_exchange(0, thread, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        write_crash_session(at, code_bits);
+        // Ownership is kept: nothing may append to a sealed session.
+        suspend_process();
+    } else {
+        // Park only this thread; the owner must stay runnable to finish its log.
+        // SAFETY: suspends the current thread through its pseudo-handle.
+        unsafe { SuspendThread(GetCurrentThread()) };
     }
 }
 
@@ -570,7 +711,7 @@ unsafe fn uninstall_wine_hook(dispatcher: usize) -> Result<(), String> {
 /// selects the layout.
 fn dispatcher_layout() -> Result<(usize, i32), String> {
     // SAFETY: resolves ntdll's dispatcher export.
-    let dispatcher = unsafe { proc_address("ntdll.dll", s!("KiUserExceptionDispatcher")) };
+    let dispatcher = unsafe { proc_address(s!("ntdll.dll"), s!("KiUserExceptionDispatcher")) };
     if dispatcher == 0 {
         return Err("T7 Patch: missing exception dispatcher".to_owned());
     }
@@ -657,6 +798,48 @@ mod tests {
         assert_eq!(&stub[2..10], &0x1122_3344_5566_7788u64.to_le_bytes());
         assert_eq!(stub.len(), WINE_HOOK_SIZE);
         assert_eq!(&stub[0..2], &[0x48, 0xB8]);
+    }
+
+    #[test]
+    fn emergency_line_formats_hex_in_place() {
+        let line = format_emergency_line(0x7FF6_1234_ABCD_0042, 0xC000_0005);
+        assert_eq!(
+            &line[..],
+            b"T7 Patch emergency exception: address=0x7ff61234abcd0042 code=0xc0000005\r\n"
+        );
+        let line = format_emergency_line(-1, 0);
+        assert_eq!(
+            &line[..],
+            b"T7 Patch emergency exception: address=0xffffffffffffffff code=0x00000000\r\n"
+        );
+        assert_eq!(&format_emergency_line(0, 0)[..], EMERGENCY_TEMPLATE);
+    }
+
+    #[test]
+    fn stack_line_address_rejects_overflow() {
+        assert_eq!(stack_line_address(0x1000, 0x20), Some(0x1020));
+        assert_eq!(
+            stack_line_address(usize::MAX - 16, 0),
+            Some(usize::MAX - 16)
+        );
+        assert_eq!(stack_line_address(usize::MAX - 15, 0), None);
+        assert_eq!(
+            stack_line_address(usize::MAX - 20, 4),
+            Some(usize::MAX - 16)
+        );
+        assert_eq!(stack_line_address(usize::MAX - 20, 5), None);
+        assert_eq!(stack_line_address(usize::MAX, 1), None);
+        assert_eq!(stack_line_address(1, usize::MAX), None);
+        assert_eq!(stack_line_address(usize::MAX, 0), None);
+    }
+
+    #[test]
+    fn read_stack_line_reads_live_memory_and_rejects_bad_addresses() {
+        let words = [0x1122_3344_5566_7788_u64, 0x99AA_BBCC_DDEE_FF00];
+        let base = words.as_ptr() as usize;
+        assert_eq!(read_stack_line(base, 0), Some(words));
+        assert_eq!(read_stack_line(0, 0), None);
+        assert_eq!(read_stack_line(usize::MAX - 8, 0), None);
     }
 
     #[test]
