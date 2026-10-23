@@ -1,13 +1,15 @@
 //! Rust port of `T7Patch`, a community patch for Call of Duty: Black Ops III.
 //!
 //! Ported so far: name hashing, the FNV variant, build detection, game struct
-//! layouts, the offset table, and the `MinHook` bindings. Still to port: hooks,
-//! protection, Arxan bypass, Lua symbols, campaign fixes, the exception-dispatch
-//! hook, and the DLL entry point.
+//! layouts, the offset table, the `MinHook` bindings, the Arxan bypass, and the
+//! campaign script fix. Still to port: hooks, protection, Lua symbols, the
+//! exception-dispatch hook, and the DLL entry point.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod arxan;
 pub mod build;
+pub mod campaign;
 pub mod ffi;
 pub mod fnv;
 pub mod gscu_hash;

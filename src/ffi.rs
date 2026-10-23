@@ -95,3 +95,9 @@ pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
     // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
     check(unsafe { MH_RemoveHook(target as *mut u8) })
 }
+
+/// Enables every hook created so far.
+pub fn enable_all_hooks() -> Result<(), MinHookError> {
+    // SAFETY: a null target is MinHook's documented way to address every hook.
+    check(unsafe { MH_EnableHook(std::ptr::null_mut()) })
+}
