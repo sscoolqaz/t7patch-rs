@@ -23,9 +23,9 @@ Status: all C++ modules ported; not yet run inside the game. See the checklist b
 
 ## Build
 
-`MinHook` v1.3.4 is compiled from source by the `minhook` crate, so both the
-MSVC and the mingw targets build. The crate builds only for Windows targets, so
-on Linux the tests run under Wine (below).
+The project is Rust only. Hooking uses `min_hook_rs`, a pure-Rust port of
+MinHook, so no C compiler is needed, only the toolchain's linker. The crate builds
+only for Windows targets, so on Linux the tests run under Wine (below).
 
 On Windows with MSVC:
 
@@ -34,8 +34,8 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-Cross-compiling on Linux with mingw-w64 (for example `pacman -S mingw-w64-gcc`
-or `apt install gcc-mingw-w64-x86-64`):
+Cross-compiling on Linux needs mingw-w64 as the linker (for example
+`pacman -S mingw-w64-gcc` or `apt install gcc-mingw-w64-x86-64`):
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
@@ -43,16 +43,16 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 The DLL is `target/x86_64-pc-windows-gnu/release/t7patch.dll`. It needs no
-mingw runtime DLLs, so it loads under Wine as it does on Windows. Run the tests
+mingw runtime DLLs, so it loads under Wine and Proton as it does on Windows.
+Run the tests
 under Wine with:
 
 ```bash
 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-windows-gnu
 ```
 
-A mingw build does not install the `__report_gsfailure` hook. That hook only
-exists for MSVC's `/GS` stack cookies, which gcc does not emit. In an MSVC build
-it covers only the `MinHook` C code, because Rust emits no stack cookies.
+The C++ hook on `__report_gsfailure` is not ported. It catches MSVC `/GS`
+stack-cookie failures, and a Rust-only DLL has no `/GS` checks.
 
 ## Credits
 

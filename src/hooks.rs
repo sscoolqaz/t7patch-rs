@@ -155,8 +155,6 @@ pub const LEGIT_PACKETS: [&str; 15] = [
 // Function types
 // ---------------------------------------------------------------------------
 
-#[cfg(target_env = "msvc")]
-type GsFailureFn = unsafe extern "system" fn(usize);
 type PrepWriteMsgFn = unsafe extern "system" fn(i64, i64, i32, i32) -> bool;
 type PrepReadMsgFn = unsafe extern "system" fn(i64) -> bool;
 type BuildTitleFn = unsafe extern "system" fn() -> *const c_char;
@@ -875,28 +873,6 @@ pub fn menu_allowed_without_host(verb: MenuVerb, is_campaign: bool) -> bool {
 // ---------------------------------------------------------------------------
 // Detours
 // ---------------------------------------------------------------------------
-
-#[cfg(target_env = "msvc")]
-unsafe extern "system" {
-    /// The MSVC CRT's `/GS` failure reporter. `cl` builds `MinHook` with `/GS` on,
-    /// so its `__security_check_cookie` calls link this into the DLL.
-    fn __report_gsfailure(stack_cookie: usize);
-}
-
-/// Port of `__report_gsfailure_hook`. Replaces the CRT's fast-fail on a `/GS` cookie
-/// mismatch with an access violation, which the exception handler can catch.
-///
-/// The C++ hook covers every `/GS` check in the DLL. Rust emits no stack cookies,
-/// so here it covers only the `MinHook` C code. It is kept for parity.
-///
-/// # Safety
-///
-/// Only `MinHook` calls this, in place of `__report_gsfailure`. It always faults.
-#[cfg(target_env = "msvc")]
-unsafe extern "system" fn report_gsfailure_hook(_stack_cookie: usize) {
-    // SAFETY: intentionally invalid, as in the C++. The write faults at address 0x17.
-    unsafe { write_game::<i64>(0x17, 0) };
-}
 
 unsafe extern "system" fn hk_lobby_msg_rw_prep_write_msg(
     lobby_msg: i64,
@@ -1933,16 +1909,9 @@ pub fn apply_hooks() {
         hk_live_user_get_name as LiveUserGetNameFn,
         None,
     );
-    // `__report_gsfailure` is this DLL's own CRT copy, not a game function, so it is
-    // hooked by absolute address. A mingw build has no `/GS` cookies, so it has no
-    // such function to hook.
-    #[cfg(target_env = "msvc")]
-    {
-        let target = __report_gsfailure as GsFailureFn as usize;
-        let detour = report_gsfailure_hook as GsFailureFn as usize;
-        // SAFETY: both functions have the type `GsFailureFn`.
-        let _ = unsafe { ffi::create_hook(target, detour) };
-    }
+    // Not ported: the C++ hooks its own CRT's `__report_gsfailure` here, so that a
+    // `/GS` stack-cookie failure in T7Patch.dll faults where the exception handler
+    // can catch it. This DLL is Rust only and has no `/GS` checks to fail.
     hook(
         offsets::PTR_DW_INSTANT_DISPATCH_MESSAGE,
         hk_dw_instant_dispatch_message as DispatchMessageFn,

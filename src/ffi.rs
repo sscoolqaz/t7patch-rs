@@ -1,66 +1,26 @@
-//! Bindings to `MinHook`.
+//! Wrappers over `min_hook_rs`, a pure-Rust port of `MinHook`.
 //!
-//! The `minhook` crate compiles `MinHook` v1.3.4 from source with `cc`, so the
-//! library links for the MSVC and mingw targets. Its Rust wrapper is not used:
-//! it panics when initialization fails and can uninitialize only once, and a
-//! panic inside `DllMain` aborts the game. The crate is linked only for its C
-//! library, and the functions the patch uses are declared here. Safe wrappers
-//! return `Result` so callers do not compare raw status codes.
+//! The port keeps `MinHook`'s design: the HDE64 length decoder, trampolines
+//! allocated within 2 GB of the target, and thread suspension while patching.
+//! Its functions are safe to call in Rust's type system, but hooking arbitrary
+//! addresses is not, so the wrappers below keep `unsafe` contracts. They take
+//! addresses as `usize`, as the rest of the port does.
 
 use std::ffi::c_void;
-use std::fmt;
 
-// Links the `MinHook` static library that the crate builds.
-use minhook as _;
+use min_hook_rs::{ALL_HOOKS, HookError};
 
-/// Raw `MH_STATUS` value.
-pub type RawStatus = i32;
+/// Failure reported by the hooking library. The codes match `MH_STATUS`.
+pub type MinHookError = HookError;
 
-const MH_OK: RawStatus = 0;
-
-unsafe extern "system" {
-    fn MH_Initialize() -> RawStatus;
-    fn MH_Uninitialize() -> RawStatus;
-    fn MH_CreateHook(
-        target: *mut c_void,
-        detour: *mut c_void,
-        original: *mut *mut c_void,
-    ) -> RawStatus;
-    fn MH_RemoveHook(target: *mut c_void) -> RawStatus;
-    fn MH_EnableHook(target: *mut c_void) -> RawStatus;
-    fn MH_DisableHook(target: *mut c_void) -> RawStatus;
-}
-
-/// Failure reported by `MinHook`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MinHookError(pub RawStatus);
-
-impl fmt::Display for MinHookError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MinHook status {}", self.0)
-    }
-}
-
-impl std::error::Error for MinHookError {}
-
-fn check(status: RawStatus) -> Result<(), MinHookError> {
-    if status == MH_OK {
-        Ok(())
-    } else {
-        Err(MinHookError(status))
-    }
-}
-
-/// Initializes `MinHook`. Call once before creating hooks.
+/// Initializes the hooking library. Call once before creating hooks.
 pub fn initialize() -> Result<(), MinHookError> {
-    // SAFETY: `MinHook` takes no arguments and is safe to call once at startup.
-    check(unsafe { MH_Initialize() })
+    min_hook_rs::initialize()
 }
 
-/// Tears `MinHook` down, disabling and removing every hook it created.
+/// Tears the hooking library down, disabling and removing every hook it created.
 pub fn uninitialize() -> Result<(), MinHookError> {
-    // SAFETY: `MinHook` takes no arguments; the caller must not call hooked functions afterwards.
-    check(unsafe { MH_Uninitialize() })
+    min_hook_rs::uninitialize()
 }
 
 /// Creates a hook from `target` to `detour` and returns the trampoline that
@@ -71,15 +31,7 @@ pub fn uninitialize() -> Result<(), MinHookError> {
 /// `target` must be the entry point of a function whose signature matches
 /// `detour`. `detour` must stay valid for the lifetime of the hook.
 pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHookError> {
-    let mut original: *mut c_void = std::ptr::null_mut();
-    // SAFETY: the caller guarantees `target` is a valid function and `detour` a matching function.
-    check(unsafe {
-        MH_CreateHook(
-            target as *mut c_void,
-            detour as *mut c_void,
-            &raw mut original,
-        )
-    })?;
+    let original = min_hook_rs::create_hook(target as *mut c_void, detour as *mut c_void)?;
     Ok(original as usize)
 }
 
@@ -89,18 +41,16 @@ pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHook
 ///
 /// `target` must be the address passed to [`create_hook`].
 pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
-    // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_EnableHook(target as *mut c_void) })
+    min_hook_rs::enable_hook(target as *mut c_void)
 }
 
-/// Disables a hook without removing it.
+/// Disables a hook without removing it. A `target` of 0 disables every hook.
 ///
 /// # Safety
 ///
-/// `target` must be the address passed to [`create_hook`].
+/// `target` must be 0 or the address passed to [`create_hook`].
 pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
-    // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_DisableHook(target as *mut c_void) })
+    min_hook_rs::disable_hook(target as *mut c_void)
 }
 
 /// Removes a hook entirely.
@@ -109,12 +59,57 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
 ///
 /// `target` must be the address passed to [`create_hook`].
 pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
-    // SAFETY: the caller guarantees `target` was hooked by [`create_hook`].
-    check(unsafe { MH_RemoveHook(target as *mut c_void) })
+    min_hook_rs::remove_hook(target as *mut c_void)
 }
 
 /// Enables every hook created so far.
 pub fn enable_all_hooks() -> Result<(), MinHookError> {
-    // SAFETY: a null target is MinHook's documented way to address every hook.
-    check(unsafe { MH_EnableHook(std::ptr::null_mut()) })
+    min_hook_rs::enable_hook(ALL_HOOKS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type MixFn = extern "system" fn(u64) -> u64;
+
+    // Long enough for the 5-byte jump the hook writes over its prologue.
+    #[inline(never)]
+    extern "system" fn mix(seed: u64) -> u64 {
+        let mut value = seed;
+        for round in 0..std::hint::black_box(8u64) {
+            value = value.wrapping_mul(31).wrapping_add(round);
+        }
+        value
+    }
+
+    extern "system" fn mix_detour(seed: u64) -> u64 {
+        seed ^ 0xA5A5
+    }
+
+    #[test]
+    fn hook_redirects_and_trampoline_calls_original() {
+        let call: MixFn = std::hint::black_box(mix);
+        let original = call(7);
+        let target = mix as MixFn as usize;
+
+        let _ = initialize();
+        // SAFETY: `mix` and `mix_detour` share the signature `MixFn` and live for the test.
+        let trampoline =
+            unsafe { create_hook(target, mix_detour as MixFn as usize) }.expect("create_hook");
+        // SAFETY: `target` was hooked above.
+        unsafe { enable_hook(target) }.expect("enable_hook");
+        assert_eq!(call(7), 7 ^ 0xA5A5);
+
+        // SAFETY: the trampoline runs the original `mix`, so it has the type `MixFn`.
+        let through: MixFn = unsafe { std::mem::transmute::<usize, MixFn>(trampoline) };
+        assert_eq!(through(7), original);
+
+        // SAFETY: `target` was hooked above.
+        unsafe { disable_hook(target) }.expect("disable_hook");
+        assert_eq!(call(7), original);
+        // SAFETY: `target` was hooked above.
+        unsafe { remove_hook(target) }.expect("remove_hook");
+        uninitialize().expect("uninitialize");
+    }
 }

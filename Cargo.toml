@@ -23,8 +23,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Kernel",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Builds MinHook v1.3.4 from source. Only its C library is used; see `src/ffi.rs`.
-minhook = "0.9.0"
+# Pure-Rust port of MinHook; see `src/ffi.rs`.
+min_hook_rs = "2.2.1"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
