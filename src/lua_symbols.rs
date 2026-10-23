@@ -30,15 +30,10 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::s;
 
 use crate::ffi;
-use crate::offsets;
-
-// TODO(port): these RVAs are used only by LuaSymbols.cpp. They belong in
-// src/offsets.rs; move them there when that table is next extended.
-const LUA_STATE_MANAGER_ERROR_RVA: usize = 0x1F05CE0;
-const HKSI_LUA_GET_INFO_RVA: usize = 0x1D41500;
-const HKS_OBJECT_TO_STRING_RVA: usize = 0x1D3F2F0;
-const LUA_PUSH_LSTRING_RVA: usize = 0x0A18430;
-const ACTIVE_MOD_NAME_RVA: usize = 0x1670DD84;
+use crate::offsets::{
+    self, ACTIVE_MOD_NAME_RVA, HKS_OBJECT_TO_STRING_RVA, HKSI_LUA_GET_INFO_RVA,
+    LUA_PUSH_LSTRING_RVA, LUA_STATE_MANAGER_ERROR_RVA,
+};
 
 /// Slot index of the Lua stack top (`0x48` bytes into the state, 8-byte slots).
 const LUA_STATE_TOP_INDEX: usize = 0x48 / 8;

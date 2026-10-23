@@ -206,3 +206,22 @@ mod tests {
         assert_eq!(MsgType::DemoState as i32, 0x20);
     }
 }
+
+/// `SessionClient` from `structs.h`: a header, then a pointer to the client record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SessionClient {
+    _pad: [u8; 0x8],
+    pub active_client: *const ActiveClient,
+}
+
+/// `ActiveClient` from `structs.h`: the fixed identity of one lobby client.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveClient {
+    _pad: [u8; 0x410],
+    pub fixed_client_info: FixedClientInfo,
+}
+
+const _: () = assert!(std::mem::offset_of!(SessionClient, active_client) == 0x8);
+const _: () = assert!(std::mem::offset_of!(ActiveClient, fixed_client_info) == 0x410);

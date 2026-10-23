@@ -99,3 +99,22 @@ pub const PTR_MSG_READ_BYTE: usize = 0x20FD050;
 pub const PTR_LOBBYMSGPRINTS: usize = 0x156CE8D0;
 pub const PTR_SAVE_LOBBY_MSG_EXCEPT_ADDY: usize = 0x1EEBF74;
 pub const PTR_CMP_TOKENIZE_STRING_INTERNAL: usize = 0x20E2A3E + 0x3;
+
+// Game RVAs used by `protection.rs` and `lua_symbols.rs`, from `offsets.h` and their C++ sources.
+pub const NAME_BUFFER_SHADOW: usize = 0x15E84638;
+pub const CREATE_LOBBY_AGAIN_FN: usize = 0x1EA6010;
+pub const CREATE_LOBBY_AGAIN_ARG: usize = 0x113A4A60;
+pub const DVAR_UI_ERROR_CALLSTACK_PTR: usize = 0x1686ED20;
+pub const DVAR_G_ALLOWVOTE_PTR: usize = 0xA0378B8;
+pub const DVAR_SET_FROM_STRING_BY_NAME: usize = 0x226B0A0;
+pub const COM_SESSION_MODE_GET_MODE_NAME: usize = 0x20EAD00;
+pub const CL_SWITCH_STATE_IDLE_UPDATE: usize = 0x131E350;
+pub const CHARACTER_INDEX_CRASH_A: usize = 0x22C965C;
+pub const CHARACTER_INDEX_CRASH_B: usize = 0x22C9676;
+pub const CHARACTER_INDEX_RESUME: usize = 0x22C9686;
+pub const RANDOM_SEED_GLOBAL: usize = 0x11250898;
+pub const LUA_STATE_MANAGER_ERROR_RVA: usize = 0x1F05CE0;
+pub const HKSI_LUA_GET_INFO_RVA: usize = 0x1D41500;
+pub const HKS_OBJECT_TO_STRING_RVA: usize = 0x1D3F2F0;
+pub const LUA_PUSH_LSTRING_RVA: usize = 0x0A18430;
+pub const ACTIVE_MOD_NAME_RVA: usize = 0x1670DD84;

@@ -6,8 +6,7 @@
 //! chat), the `t7patch.conf` settings watcher, and the exception fixups for the
 //! Lua and character-index crashes.
 //!
-//! Open items are marked `TODO(port)`: the game RVAs in [`rva`] that `offsets.rs`
-//! does not list yet, and a few helpers that belong in `structs.rs`.
+//! Game RVAs live in `offsets.rs` and the shared structs in `structs.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, OsString, c_char, c_void};
@@ -29,8 +28,11 @@ use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{CreateThread, Sleep, THREAD_CREATION_FLAGS};
 
 use crate::fnv::fnv1a;
+use crate::gscu_hash::notify_hash;
 use crate::offsets::{self, address};
-use crate::structs::{JoinPartyMember, LobbyMsg, Msg, MsgInfoResponse, MsgType, NetAdr};
+use crate::structs::{
+    JoinPartyMember, LobbyMsg, Msg, MsgInfoResponse, MsgType, NetAdr, SessionClient,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -91,23 +93,6 @@ pub const STEAMAPI_NETWORKING_READP2PPACKET: usize = steamvto(0x10);
 const STEAM_FRIENDS_GET_COUNT_OFFSET: usize = 0x18;
 const STEAM_FRIENDS_GET_BY_INDEX_OFFSET: usize = 0x20;
 const STEAM_FRIEND_FLAG_IMMEDIATE: i32 = 4;
-
-/// Game RVAs that this module uses but `offsets.rs` does not list yet. Each
-/// comes from `offsets.h`. TODO(port): move them into `offsets.rs`.
-mod rva {
-    pub const NAME_BUFFER_SHADOW: usize = 0x15E84638;
-    pub const CREATE_LOBBY_AGAIN_FN: usize = 0x1EA6010;
-    pub const CREATE_LOBBY_AGAIN_ARG: usize = 0x113A4A60;
-    pub const DVAR_UI_ERROR_CALLSTACK_PTR: usize = 0x1686ED20;
-    pub const DVAR_G_ALLOWVOTE_PTR: usize = 0xA0378B8;
-    pub const DVAR_SET_FROM_STRING_BY_NAME: usize = 0x226B0A0;
-    pub const COM_SESSION_MODE_GET_MODE_NAME: usize = 0x20EAD00;
-    pub const CL_SWITCH_STATE_IDLE_UPDATE: usize = 0x131E350;
-    pub const CHARACTER_INDEX_CRASH_A: usize = 0x22C965C;
-    pub const CHARACTER_INDEX_CRASH_B: usize = 0x22C9676;
-    pub const CHARACTER_INDEX_RESUME: usize = 0x22C9686;
-    pub const RANDOM_SEED_GLOBAL: usize = 0x11250898;
-}
 
 /// `SD`/`SS` string table from Protection.cpp, in the order `install` assigns it.
 /// The call sites below use the same text as C string literals. `dlcBits` is
@@ -309,23 +294,6 @@ type DvarSetFromStringFn = unsafe extern "system" fn(*const c_char, *const c_cha
 type ZwContinueFn = unsafe extern "system" fn(*mut CONTEXT, u8) -> u64;
 type IsProcessorFeaturePresentFn = unsafe extern "system" fn(u32) -> i32;
 type CreateLobbyAgainFn = unsafe extern "system" fn(i64);
-
-/// `SessionClient` from structs.h. TODO(port): move into `structs.rs`.
-#[repr(C)]
-pub struct SessionClient {
-    _pad: [u8; 0x8],
-    pub active_client: *const ActiveClient,
-}
-
-/// `ActiveClient` from structs.h. TODO(port): move into `structs.rs`.
-#[repr(C)]
-pub struct ActiveClient {
-    _pad: [u8; 0x410],
-    pub fixed_client_info: crate::structs::FixedClientInfo,
-}
-
-const _: () = assert!(std::mem::offset_of!(SessionClient, active_client) == 0x8);
-const _: () = assert!(std::mem::offset_of!(ActiveClient, fixed_client_info) == 0x410);
 
 /// Game function table filled by [`install`]. Each field is a game function
 /// the lobby and Steam code calls. The fields are public, as the header made
@@ -729,22 +697,6 @@ pub fn parse_leading_int(text: &[u8]) -> Option<i32> {
     i32::try_from(signed).ok()
 }
 
-/// Lowercases a name as `GSCUHashing::canon_hash64` does. TODO(port): move into
-/// `gscu_hash.rs` as `canon_hash64`. The existing `notify_hash` zero-extends
-/// bytes, while the C++ sign-extends them, so the two differ for non-ASCII input.
-#[must_use]
-fn canon_hash64(input: &[u8]) -> u64 {
-    const OFFSET: u64 = 14695981039346656037;
-    const PRIME: u64 = 1099511628211;
-    let hash = input.iter().fold(OFFSET, |hash, &byte| {
-        let lower = byte.to_ascii_lowercase();
-        // The C `char` is signed, so the value is sign-extended before the XOR.
-        let widened = i64::from(lower.cast_signed()).cast_unsigned();
-        (hash ^ widened).wrapping_mul(PRIME)
-    });
-    0x7FFF_FFFF_FFFF_FFFF & hash
-}
-
 /// The value passed to `SetNetworkPassword` for a typed password. An empty
 /// password maps to 0.
 #[must_use]
@@ -753,7 +705,7 @@ pub fn network_password_key(password: &[u8]) -> i64 {
     if text.is_empty() {
         0
     } else {
-        canon_hash64(text).cast_signed()
+        notify_hash(text).cast_signed()
     }
 }
 
@@ -1454,7 +1406,7 @@ pub unsafe extern "system" fn cl_switch_state_idle_update(sw: i64) -> i32 {
     // SAFETY: the game function takes no arguments and returns a C string.
     let mode_name = unsafe {
         let get_mode_name: ComSessionModeGetModeNameFn =
-            fn_from_addr(address(rva::COM_SESSION_MODE_GET_MODE_NAME));
+            fn_from_addr(address(offsets::COM_SESSION_MODE_GET_MODE_NAME));
         get_mode_name()
     };
     // SAFETY: the game returns a NUL-terminated mode name or null.
@@ -1465,7 +1417,7 @@ pub unsafe extern "system" fn cl_switch_state_idle_update(sw: i64) -> i32 {
     // SAFETY: the original idle update takes the switch pointer and returns an int.
     unsafe {
         let original: ClSwitchStateIdleUpdateFn =
-            fn_from_addr(address(rva::CL_SWITCH_STATE_IDLE_UPDATE));
+            fn_from_addr(address(offsets::CL_SWITCH_STATE_IDLE_UPDATE));
         original(sw)
     }
 }
@@ -1681,7 +1633,7 @@ unsafe extern "system" fn main_thread(_param: *mut c_void) -> u32 {
     let mut seed = unix_time_seed();
     let value = msvc_rand(&mut seed);
     // SAFETY: the random-seed global is an int-sized game variable.
-    unsafe { write_i32(address(rva::RANDOM_SEED_GLOBAL), value) };
+    unsafe { write_i32(address(offsets::RANDOM_SEED_GLOBAL), value) };
     let path = Path::new(PATCH_CONFIG_LOCATION);
     loop {
         arxan_bypass_maintain();
@@ -2581,11 +2533,11 @@ pub unsafe fn except_hook(record: *const EXCEPTION_RECORD, context: *mut CONTEXT
         unsafe { resume(context) };
         return;
     }
-    if fault == address(rva::CHARACTER_INDEX_CRASH_A)
-        || fault == address(rva::CHARACTER_INDEX_CRASH_B)
+    if fault == address(offsets::CHARACTER_INDEX_CRASH_A)
+        || fault == address(offsets::CHARACTER_INDEX_CRASH_B)
     {
         // SAFETY: the faulting thread's context is live.
-        unsafe { (*context).Rip = address(rva::CHARACTER_INDEX_RESUME) as u64 };
+        unsafe { (*context).Rip = address(offsets::CHARACTER_INDEX_RESUME) as u64 };
         // SAFETY: forwarded from the dispatcher.
         unsafe { resume(context) };
         return;
@@ -2677,7 +2629,7 @@ unsafe fn dvar_set_from_string_by_name(name: &CStr, value: &CStr, create_if_miss
     // SAFETY: the game function takes two C strings and a bool.
     unsafe {
         let set_dvar: DvarSetFromStringFn =
-            fn_from_addr(address(rva::DVAR_SET_FROM_STRING_BY_NAME));
+            fn_from_addr(address(offsets::DVAR_SET_FROM_STRING_BY_NAME));
         let _ = set_dvar(name.as_ptr(), value.as_ptr(), create_if_missing);
     }
 }
@@ -2710,7 +2662,7 @@ unsafe fn copy_name_into_game() {
     let with_nul = &name[..=length];
     // SAFETY: the shadow and name buffers are game globals of at least 16 bytes.
     unsafe {
-        copy_bytes(address(rva::NAME_BUFFER_SHADOW) as *mut u8, with_nul);
+        copy_bytes(address(offsets::NAME_BUFFER_SHADOW) as *mut u8, with_nul);
         copy_bytes(address(offsets::PTR_NAME1) as *mut u8, with_nul);
         copy_bytes(address(offsets::PTR_NAME2) as *mut u8, with_nul);
         let player_data_slot = address(offsets::S_PLAYER_DATA_PTR);
@@ -2831,15 +2783,15 @@ pub unsafe fn install() {
     // SAFETY: the create-lobby function takes one pointer-sized argument and has no return value.
     unsafe {
         let create_lobby_again: CreateLobbyAgainFn =
-            fn_from_addr(address(rva::CREATE_LOBBY_AGAIN_FN));
-        create_lobby_again(addr_i64(address(rva::CREATE_LOBBY_AGAIN_ARG)));
+            fn_from_addr(address(offsets::CREATE_LOBBY_AGAIN_FN));
+        create_lobby_again(addr_i64(address(offsets::CREATE_LOBBY_AGAIN_ARG)));
     }
 
     // SAFETY: the dvar globals hold dvar pointers, and the dvar functions run during install.
     unsafe {
-        clear_dvar_flags(address(rva::DVAR_UI_ERROR_CALLSTACK_PTR));
+        clear_dvar_flags(address(offsets::DVAR_UI_ERROR_CALLSTACK_PTR));
         dvar_set_from_string_by_name(c"ui_error_callstack_ship", c"1", true);
-        clear_dvar_flags(address(rva::DVAR_G_ALLOWVOTE_PTR));
+        clear_dvar_flags(address(offsets::DVAR_G_ALLOWVOTE_PTR));
         dvar_set_from_string_by_name(c"g_allowvote", c"0", true);
         dvar_set_from_string_by_name(c"maxvoicepacketsperframe", c"0", true);
     }
@@ -2941,7 +2893,7 @@ pub unsafe fn uninstall() {
     unsafe {
         write_usize(
             address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN),
-            address(rva::CL_SWITCH_STATE_IDLE_UPDATE),
+            address(offsets::CL_SWITCH_STATE_IDLE_UPDATE),
         );
     };
 }
@@ -3070,18 +3022,6 @@ mod tests {
         let mut state = 1;
         assert_eq!(msvc_rand(&mut state), 41);
         assert_eq!(msvc_rand(&mut state), 18467);
-    }
-
-    #[test]
-    fn canon_hash64_matches_notify_hash_for_ascii() {
-        for name in [&b"abc"[..], b"Maps/Mp/Test", b""] {
-            assert_eq!(canon_hash64(name), crate::gscu_hash::notify_hash(name));
-        }
-    }
-
-    #[test]
-    fn canon_hash64_is_case_insensitive() {
-        assert_eq!(canon_hash64(b"Serious"), canon_hash64(b"serious"));
     }
 
     #[test]

@@ -32,9 +32,13 @@ pub fn canon_hash(input: &[u8]) -> u32 {
 }
 
 /// Case-insensitive 64-bit FNV-1a notification hash. The top bit is cleared.
+///
+/// The C++ `char` is signed, so bytes at or above 0x80 are sign-extended before
+/// the XOR. This matches `canon_hash64` in `Protection.cpp`.
 pub fn notify_hash(input: &[u8]) -> u64 {
     let hash = input.iter().fold(NOTIFY_OFFSET, |hash, &byte| {
-        (hash ^ u64::from(to_lower(byte))).wrapping_mul(NOTIFY_PRIME)
+        let widened = i64::from(to_lower(byte).cast_signed()).cast_unsigned();
+        (hash ^ widened).wrapping_mul(NOTIFY_PRIME)
     });
     0x7FFF_FFFF_FFFF_FFFF & hash
 }
@@ -63,6 +67,13 @@ mod tests {
     #[test]
     fn notify_hash_is_case_insensitive() {
         assert_eq!(notify_hash(b"ZBR_Notify"), notify_hash(b"zbr_notify"));
+    }
+
+    #[test]
+    fn notify_hash_sign_extends_high_bytes_like_the_game() {
+        let expected =
+            (NOTIFY_OFFSET ^ u64::MAX).wrapping_mul(NOTIFY_PRIME) & 0x7FFF_FFFF_FFFF_FFFF;
+        assert_eq!(notify_hash(&[0xFF]), expected);
     }
 
     #[test]
