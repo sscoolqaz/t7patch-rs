@@ -166,6 +166,17 @@ pub(crate) unsafe fn write_bytes(address: usize, bytes: &[u8]) -> bool {
     flushed.is_ok() && restored.is_ok()
 }
 
+/// Writes a pointer-sized `value` at `address` through [`write_bytes`]. Nothing is
+/// written when the page cannot be made writable.
+///
+/// # Safety
+///
+/// `address` must be a committed pointer slot (an IAT, vtable or ntdll data entry).
+pub(crate) unsafe fn write_usize(address: usize, value: usize) -> bool {
+    // SAFETY: forwarded from the caller.
+    unsafe { write_bytes(address, &value.to_le_bytes()) }
+}
+
 /// Finds all occurrences of `pattern` in the executable sections of the image.
 ///
 /// # Safety

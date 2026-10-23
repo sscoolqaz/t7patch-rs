@@ -21,8 +21,7 @@ use windows::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD, Rais
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
-    PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
-    PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{CreateThread, Sleep, THREAD_CREATION_FLAGS};
@@ -225,22 +224,23 @@ pub const S_LMGI: &CStr = c"LMgetinfo";
 // Game function types
 // ---------------------------------------------------------------------------
 
-pub type PackageIntFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut i32) -> i32;
-pub type PackageUCharFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> i32;
+pub type PackageIntFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut i32) -> bool;
+pub type PackageUCharFn =
+    unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> bool;
 pub type PackageStringFn =
-    unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char, i32) -> i32;
-pub type PackageXuidFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u64) -> i32;
-pub type PackageBoolFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> i32;
-pub type PackageUIntFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u32) -> i32;
-pub type PackageShortFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut i16) -> i32;
-pub type PackageUShortFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u16) -> i32;
-pub type PackageUInt64Fn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u64) -> i32;
-pub type PackageArrayStartFn = unsafe extern "system" fn(*mut c_void, *const c_char) -> i32;
-pub type PackageElementFn = unsafe extern "system" fn(*mut c_void, i32) -> i32;
+    unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char, i32) -> bool;
+pub type PackageXuidFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u64) -> bool;
+pub type PackageBoolFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> bool;
+pub type PackageUIntFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u32) -> bool;
+pub type PackageShortFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut i16) -> bool;
+pub type PackageUShortFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u16) -> bool;
+pub type PackageUInt64Fn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut u64) -> bool;
+pub type PackageArrayStartFn = unsafe extern "system" fn(*mut c_void, *const c_char) -> bool;
+pub type PackageElementFn = unsafe extern "system" fn(*mut c_void, i32) -> bool;
 pub type PackageGlobFn =
-    unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char, i32) -> i32;
-pub type PackageFloatFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut f32) -> i32;
-pub type PackageCharFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> i32;
+    unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char, i32) -> bool;
+pub type PackageFloatFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut f32) -> bool;
+pub type PackageCharFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> bool;
 
 pub type ProbeLobbyInfoFn = unsafe extern "system" fn(i32, i32, i64) -> i32;
 pub type DwInstantHandleLobbyMessageFn = unsafe extern "system" fn(i64, i32, *mut c_char) -> i32;
@@ -749,18 +749,29 @@ pub fn player_name_fields(name: &[u8]) -> Option<[u8; PLAYER_NAME_LEN]> {
 /// Replaces control and sequence-breaking characters in chat with `.`, as
 /// `GetLobbyChatEntry` does. Bytes at or above 0x80 count as control characters
 /// because the C `char` is signed.
-pub fn sanitize_chat(message: &mut [u8]) {
-    let original = message.to_vec();
-    for (i, (slot, &byte)) in message.iter_mut().zip(original.iter()).enumerate() {
-        let next = original.get(i + 1).copied();
-        let replace = match byte {
+///
+/// `buffer` is every byte Steam copied. A peer's message need not be
+/// NUL-terminated, so the scan stops at the first NUL or the end of `buffer`; a
+/// message that fills the buffer is cut to `len - 1` bytes so the game's own
+/// string reads stop inside it (port of the fork's `ChatSanitize.h`).
+pub fn sanitize_chat(buffer: &mut [u8]) {
+    let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    for i in 0..len {
+        // The lookahead reads the next byte before it is rewritten; past the text it is the NUL.
+        let next = if i + 1 < len { buffer[i + 1] } else { 0 };
+        let replace = match buffer[i] {
             b'^' | b'%' => true,
-            b'$' => next == Some(b'('),
-            b'[' => next == Some(b'{'),
+            b'$' => next == b'(',
+            b'[' => next == b'{',
             byte => !(0x20..=126).contains(&byte),
         };
         if replace {
-            *slot = b'.';
+            buffer[i] = b'.';
+        }
+    }
+    if len == buffer.len() {
+        if let Some(last) = buffer.last_mut() {
+            *last = 0;
         }
     }
 }
@@ -869,7 +880,6 @@ pub mod iat_hook {
     use std::ffi::{CStr, c_char};
 
     use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
-    use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READWRITE, VirtualProtect};
     use windows::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_IMPORT_DESCRIPTOR};
 
     /// Index of the import directory in `DataDirectory`.
@@ -941,26 +951,9 @@ pub mod iat_hook {
         if current == new_function || current == 0 {
             return 0;
         }
-        let mut old_rights = PAGE_PROTECTION_FLAGS(0);
-        // SAFETY: the page holding the IAT entry is made writable before the write.
-        unsafe {
-            let _ = VirtualProtect(
-                slot.cast(),
-                size_of::<usize>(),
-                PAGE_READWRITE,
-                &raw mut old_rights,
-            );
-            slot.write_unaligned(new_function);
-        }
-        let mut scratch = PAGE_PROTECTION_FLAGS(0);
-        // SAFETY: restores the protection saved above on the same page.
-        unsafe {
-            let _ = VirtualProtect(
-                slot.cast(),
-                size_of::<usize>(),
-                old_rights,
-                &raw mut scratch,
-            );
+        // SAFETY: `slot` is an IAT entry; nothing is written if its page cannot be made writable.
+        if !unsafe { crate::arxan::write_usize(slot as usize, new_function) } {
+            return 0;
         }
         current
     }
@@ -989,23 +982,9 @@ pub unsafe fn swap_steam_api_pointer(library: usize, index: usize, replacement: 
         .or_default()
         .insert(index, original);
 
-    let mut old = PAGE_PROTECTION_FLAGS(0);
-    // SAFETY: the vtable page is made writable, the slot is written, and the saved protection is restored.
-    unsafe {
-        let _ = VirtualProtect(
-            slot as *const c_void,
-            size_of::<usize>(),
-            PAGE_EXECUTE_READWRITE,
-            &raw mut old,
-        );
-        write_usize(slot, replacement);
-        let restore = old;
-        let _ = VirtualProtect(
-            slot as *const c_void,
-            size_of::<usize>(),
-            restore,
-            &raw mut old,
-        );
+    // SAFETY: `slot` is a vtable entry; nothing is written if it cannot be made writable.
+    if !unsafe { crate::arxan::write_usize(slot, replacement) } {
+        crate::dllmain::debug_print("T7 Patch: could not write a Steam vtable slot\n");
     }
 }
 
@@ -1327,7 +1306,10 @@ pub unsafe extern "system" fn get_lobby_chat_entry(
             chatentrytype,
         )
     };
-    // SAFETY: `psteamuserid` is the game's out-parameter holding a SteamID.
+    if psteamuserid == 0 {
+        return 0;
+    }
+    // SAFETY: `psteamuserid` is the game's non-null out-parameter holding a SteamID.
     let steam_id = unsafe { read_i64(addr(psteamuserid)) };
     let Some(g) = game() else {
         return 0;
@@ -1361,17 +1343,21 @@ pub unsafe extern "system" fn get_lobby_chat_entry(
         return 0;
     }
 
-    // SAFETY: `chatentrytype` is a game pointer to an `i32` (checked for null by the original's contract).
-    let flag = unsafe { i32_at(ptr_from_i64(chatentrytype)) };
-    if result > 0 && flag != 0 && pvdata != 0 {
-        let message_ptr = addr(pvdata) as *mut u8;
-        // SAFETY: `pvdata` is a NUL-terminated chat buffer; the length excludes the NUL.
-        let length = unsafe { CStr::from_ptr(message_ptr.cast::<c_char>()) }
-            .to_bytes()
-            .len();
-        // SAFETY: `length` bytes of the buffer precede its NUL and are writable.
-        let message = unsafe { std::slice::from_raw_parts_mut(message_ptr, length) };
-        sanitize_chat(message);
+    // `cubdata` is an `int` passed in a 64-bit slot; only its low 32 bits count.
+    let cub = u32::try_from(cubdata & 0xFFFF_FFFF)
+        .unwrap_or(0)
+        .cast_signed();
+    if result > 0 && cub > 0 && pvdata != 0 {
+        // A null entry type means text, as in the fork.
+        // SAFETY: a non-null `chatentrytype` points at the game's `i32` out-parameter.
+        let is_text = chatentrytype == 0 || unsafe { i32_at(ptr_from_i64(chatentrytype)) } != 0;
+        if is_text {
+            // A peer's message need not be NUL-terminated: bound it by the bytes Steam copied.
+            let cap = usize::try_from(result.min(cub)).unwrap_or(0);
+            // SAFETY: Steam wrote `result` bytes into the `cubdata`-byte buffer at `pvdata`.
+            let message = unsafe { std::slice::from_raw_parts_mut(addr(pvdata) as *mut u8, cap) };
+            sanitize_chat(message);
+        }
     }
     result
 }
@@ -1682,7 +1668,7 @@ mod rw {
     /// `lm` must be a live lobby message and `value` a writable `i32`.
     pub unsafe fn int(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_int)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_int)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1690,7 +1676,7 @@ mod rw {
     /// As [`int`], with `value` a writable `c_char`.
     pub unsafe fn uchar(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_uchar)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_uchar)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1698,7 +1684,7 @@ mod rw {
     /// As [`int`], with `value` a writable buffer of `max` bytes.
     pub unsafe fn string(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8, max: i32) -> bool {
         // SAFETY: the caller guarantees both pointers and the buffer length.
-        unsafe { (g.lobby_msg_rw_package_string)(lm, key.as_ptr(), value.cast(), max) != 0 }
+        unsafe { (g.lobby_msg_rw_package_string)(lm, key.as_ptr(), value.cast(), max) }
     }
 
     /// # Safety
@@ -1706,7 +1692,7 @@ mod rw {
     /// As [`int`], with `value` a writable `u64`.
     pub unsafe fn xuid(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_xuid)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_xuid)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1714,7 +1700,7 @@ mod rw {
     /// As [`int`], with `value` a writable `c_char`.
     pub unsafe fn bool_(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_bool)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_bool)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1722,7 +1708,7 @@ mod rw {
     /// As [`int`], with `value` a writable `u32`.
     pub unsafe fn uint(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_uint)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_uint)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1730,7 +1716,7 @@ mod rw {
     /// As [`int`], with `value` a writable `i16`.
     pub unsafe fn short(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_short)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_short)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1738,7 +1724,7 @@ mod rw {
     /// As [`int`], with `value` a writable `u64`.
     pub unsafe fn uint64(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_uint64)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_uint64)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1746,7 +1732,7 @@ mod rw {
     /// As [`int`], with `value` a writable `f32`.
     pub unsafe fn float(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8) -> bool {
         // SAFETY: the caller guarantees both pointers.
-        unsafe { (g.lobby_msg_rw_package_float)(lm, key.as_ptr(), value.cast()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_float)(lm, key.as_ptr(), value.cast()) }
     }
 
     /// # Safety
@@ -1754,7 +1740,7 @@ mod rw {
     /// `lm` must be a live lobby message.
     pub unsafe fn array_start(g: &Game, lm: *mut c_void, key: &CStr) -> bool {
         // SAFETY: the caller guarantees the message pointer.
-        unsafe { (g.lobby_msg_rw_package_array_start)(lm, key.as_ptr()) != 0 }
+        unsafe { (g.lobby_msg_rw_package_array_start)(lm, key.as_ptr()) }
     }
 
     /// # Safety
@@ -1762,7 +1748,7 @@ mod rw {
     /// `lm` must be a live lobby message.
     pub unsafe fn element(g: &Game, lm: *mut c_void, add: bool) -> bool {
         // SAFETY: the caller guarantees the message pointer.
-        unsafe { (g.lobby_msg_rw_package_element)(lm, i32::from(add)) != 0 }
+        unsafe { (g.lobby_msg_rw_package_element)(lm, i32::from(add)) }
     }
 
     /// # Safety
@@ -1770,7 +1756,7 @@ mod rw {
     /// As [`int`], with `value` a writable buffer of `max` bytes.
     pub unsafe fn glob(g: &Game, lm: *mut c_void, key: &CStr, value: *mut u8, max: i32) -> bool {
         // SAFETY: the caller guarantees both pointers and the buffer length.
-        unsafe { (g.lobby_msg_rw_package_glob)(lm, key.as_ptr(), value.cast(), max) != 0 }
+        unsafe { (g.lobby_msg_rw_package_glob)(lm, key.as_ptr(), value.cast(), max) }
     }
 }
 
@@ -2980,23 +2966,51 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_sequences_and_controls() {
-        let mut msg = *b"a^b%c$(d[{e\x01f\x80g~h";
+        let mut msg = *b"a^b%c$(d[{e\x01f\x80g~h\0";
         sanitize_chat(&mut msg);
-        assert_eq!(&msg, b"a.b.c.(d.{e.f.g~h");
+        assert_eq!(&msg, b"a.b.c.(d.{e.f.g~h\0");
     }
 
     #[test]
     fn sanitize_keeps_lone_dollar_and_bracket() {
-        let mut msg = *b"$x[y";
+        let mut msg = *b"$x[y\0";
         sanitize_chat(&mut msg);
-        assert_eq!(&msg, b"$x[y");
+        assert_eq!(&msg, b"$x[y\0");
+    }
+
+    #[test]
+    fn sanitize_cuts_an_unterminated_message() {
+        let mut msg = *b"ab^cd";
+        sanitize_chat(&mut msg);
+        assert_eq!(&msg, b"ab.c\0");
+    }
+
+    #[test]
+    fn sanitize_stops_at_the_first_nul() {
+        let mut msg = *b"a^\0^%";
+        sanitize_chat(&mut msg);
+        assert_eq!(&msg, b"a.\0^%");
+    }
+
+    #[test]
+    fn sanitize_lookahead_stops_at_the_nul() {
+        // `$` then NUL then `(`: the `(` is past the text, so the `$` stays.
+        let mut msg = *b"x$\0(";
+        sanitize_chat(&mut msg);
+        assert_eq!(&msg, b"x$\0(");
+    }
+
+    #[test]
+    fn sanitize_handles_an_empty_buffer() {
+        let mut msg: [u8; 0] = [];
+        sanitize_chat(&mut msg);
     }
 
     #[test]
     fn sanitize_treats_trailing_dollar_as_plain() {
-        let mut msg = *b"cost$";
+        let mut msg = *b"cost$\0";
         sanitize_chat(&mut msg);
-        assert_eq!(&msg, b"cost$");
+        assert_eq!(&msg, b"cost$\0");
     }
 
     #[test]

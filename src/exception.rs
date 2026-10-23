@@ -505,17 +505,21 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` in ntdll.
 unsafe fn install_pointer_hook(dispatcher: usize, handler: usize) {
     // SAFETY: the dispatcher's first word was checked by the caller to match the pattern.
-    let distance = unsafe { ((dispatcher + 4) as *const u32).read_unaligned() } as usize;
-    let slot = (dispatcher + 8) + distance;
+    let displacement = unsafe { ((dispatcher + 4) as *const i32).read_unaligned() };
+    let Some(slot) = rip_relative_target(dispatcher + 8, displacement) else {
+        return;
+    };
     FN_PTR_HOOK.store(slot, Ordering::Release);
 
-    let mut old = PAGE_PROTECTION_FLAGS(0);
-    // SAFETY: the slot is an 8-byte pointer inside ntdll's data.
-    unsafe {
-        let _ = VirtualProtect(slot as *const _, 8, PAGE_EXECUTE_READWRITE, &raw mut old);
-        (slot as *mut usize).write_unaligned(handler);
-        let _ = VirtualProtect(slot as *const _, 8, old, &raw mut old);
-    }
+    // SAFETY: the slot is an 8-byte pointer inside ntdll's data; nothing is written if it
+    // cannot be made writable.
+    unsafe { crate::arxan::write_usize(slot, handler) };
+}
+
+/// The target of a RIP-relative operand: `next_instruction` plus the signed `disp32`
+/// (fork `7f400a9`), or `None` if it leaves the address space.
+fn rip_relative_target(next_instruction: usize, displacement: i32) -> Option<usize> {
+    next_instruction.checked_add_signed(isize::try_from(displacement).ok()?)
 }
 
 /// Machine code that calls the handler through the stub, with the original stub saved.
@@ -626,6 +630,23 @@ unsafe extern "system" fn nullsub() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rip_relative_target_sign_extends() {
+        assert_eq!(
+            rip_relative_target(0x7FF8_0000_1008, 0x10),
+            Some(0x7FF8_0000_1018)
+        );
+        assert_eq!(
+            rip_relative_target(0x7FF8_0000_1008, -0x8),
+            Some(0x7FF8_0000_1000)
+        );
+        assert_eq!(
+            rip_relative_target(0x7FF8_0000_1008, i32::MIN),
+            Some(0x7FF7_8000_1008)
+        );
+        assert_eq!(rip_relative_target(4, -8), None);
+    }
 
     #[test]
     fn wine_stub_embeds_handler_address() {

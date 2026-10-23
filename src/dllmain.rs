@@ -29,7 +29,7 @@ const DEFAULT_PLAYER_NAME: &[u8] = b"Unknown Soldier";
 const PATCH_KEY_PHRASE: &[u8] = b"serious_anticrash_2023";
 
 /// Writes `message` to the debugger output stream.
-fn debug_print(message: &str) {
+pub(crate) fn debug_print(message: &str) {
     let Ok(text) = CString::new(message) else {
         return;
     };

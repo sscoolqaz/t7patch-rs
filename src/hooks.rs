@@ -1122,10 +1122,15 @@ unsafe fn read_menu_args(mres: &mut MenuBuf, menu_name: &mut MenuBuf, cached: bo
     unsafe { sv_cmd_argv_buffer(3, mres.as_mut_ptr().cast(), 1024) };
     if cached {
         let event_index = c_atoi(until_nul(mres)).cast_unsigned();
-        // SAFETY: `BG_Cache_GetEventStringNameForIndex` is not hooked, so this is the game function.
-        let name = unsafe { bg_event_string_name(0, event_index.cast_signed()) };
-        // SAFETY: the game returns a NUL-terminated string, or null.
-        strcpy_s(mres, unsafe { c_slice(name) });
+        // The index comes from the client: bound it as the C++ command does (fork `629f4b4`).
+        // SAFETY: the bounded wrapper returns `"bad"` for an index outside the cache.
+        let name = unsafe { bg_cache_get_event_string_name_for_index(0, event_index) };
+        if name.is_null() {
+            strcpy_s(mres, b"bad");
+        } else {
+            // SAFETY: the game returns a NUL-terminated string.
+            strcpy_s(mres, unsafe { c_slice(name) });
+        }
     }
     true
 }
@@ -1377,31 +1382,27 @@ unsafe extern "system" fn hk_dw_instant_dispatch_message(
         packet_type = unsafe { msg_read_byte((&raw mut msg).cast()) };
     }
 
-    // SAFETY: `message` is the game's `msg_t`, so its header fields are readable.
-    let header = unsafe { message.cast::<Msg>().read_unaligned() };
-    let msg_data = header.data as usize;
-    let msg_size = header.cursize.cast_signed();
-    let msg_read = header.readcount.cast_signed();
+    // `message` is the raw payload, not a `msg_t`: the C++ reads a header out of
+    // it, which is peer-controlled data. The header is the local `msg` read from it.
+    let remaining = msg.cursize.wrapping_sub(msg.readcount);
 
     if packet_type == PACKET_TYPE_CBUF_A || packet_type == PACKET_TYPE_CBUF_B {
         is_valid = false;
     } else if packet_type == PACKET_TYPE_JOIN_REQUEST {
-        if msg_size.wrapping_sub(msg_read) != 0x64 {
+        if msg.overflowed || msg.readcount > msg.cursize || remaining != 0x64 {
             is_valid = false;
         }
-        let packet_data = add_signed(msg_data, i64::from(msg_read));
-        // SAFETY: the packet data lies inside the message, as the C++ assumes.
+        let packet_data = add_signed(msg.data as usize, i64::from(msg.readcount));
+        // SAFETY: `cursize - readcount == 0x64`, so at least four payload bytes follow the cursor.
         if is_valid && unsafe { read_game::<i32>(packet_data) } == 0 {
             is_valid = false;
         }
     }
 
-    // SAFETY: `message` is the game's `msg_t`, which `CheckPendingInfoRequests` reads.
+    // SAFETY: `msg` is the local message over the payload; the callee reads a copy of it.
     if is_valid
         && packet_type == PACKET_TYPE_INFO_REQUEST_PENDING
-        && unsafe {
-            protection::check_pending_info_requests(sender_xuid, message.cast_mut().cast())
-        }
+        && unsafe { protection::check_pending_info_requests(sender_xuid, &raw mut msg) }
     {
         return 0;
     }
