@@ -10,6 +10,7 @@
 pub mod arxan;
 pub mod build;
 pub mod campaign;
+pub mod dllmain;
 pub mod exception;
 pub mod ffi;
 pub mod fnv;
