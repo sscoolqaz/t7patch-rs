@@ -100,7 +100,7 @@ const MENU_SV_ID: usize = 0x17679580;
 const MENU_SCR_THREAD_FN: usize = 0xA5A6810;
 const MODEL_PATHS_FREE: usize = 0x16293150;
 
-const ZBR_WINDOW_TEXT: &CStr = c"Call of Duty: Black Ops III (community patch by serious)";
+const ZBR_WINDOW_TEXT: &CStr = c"Call of Duty: Black Ops III (community patch by serious) (Rust)";
 const ZBR_VERSION_FULL: &str = "Patch 3.09 - by serious <3";
 const BAD_STR: &CStr = c"bad";
 
