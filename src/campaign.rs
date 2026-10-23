@@ -202,6 +202,9 @@ unsafe fn patch_compiled_script(script: *mut u8) {
         return;
     };
 
+    // The script is bytecode read by the GSC VM, not executable instructions, so the
+    // RIP-based freeze used for code writes does not apply. This runs in the linker
+    // detour after the linker finished writing the script and before the VM runs it.
     // SAFETY: `find_damage_patch` checked the site lies inside the declared script.
     if unsafe { write_bytes(script as usize + found.offset, found.replacement) } {
         // SAFETY: the debug string is a static, NUL-terminated literal.

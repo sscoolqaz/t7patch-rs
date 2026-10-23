@@ -14,7 +14,7 @@ use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -468,8 +468,23 @@ impl Game {
 // Statics
 // ---------------------------------------------------------------------------
 
-/// The player name, NUL-padded to 16 bytes. Read by the game through pointers.
-pub static CUSTOM_NAME: [AtomicU8; PLAYER_NAME_LEN] = [const { AtomicU8::new(0) }; PLAYER_NAME_LEN];
+/// One immutable player-name snapshot, NUL-padded to 16 bytes.
+type NameBytes = [u8; PLAYER_NAME_LEN];
+
+/// Empty name used before the first snapshot is published.
+static NAME_DEFAULT: NameBytes = [0; PLAYER_NAME_LEN];
+/// The snapshot the game currently sees.
+static NAME_CURRENT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+/// Every snapshot ever published. A game thread may keep the pointer returned by
+/// `get_username_ptr` indefinitely, so a replaced snapshot is transferred here
+/// instead of being freed.
+#[allow(
+    clippy::vec_box,
+    reason = "each published name keeps a stable address because the game retains the pointer"
+)]
+static NAME_RETAINED: Mutex<Vec<Box<NameBytes>>> = Mutex::new(Vec::new());
+/// Set when the local snapshot changed and the game buffers still need updating.
+static NAME_PENDING: AtomicBool = AtomicBool::new(false);
 pub static OLD_LOBBYMSG_PRINTS: AtomicI64 = AtomicI64::new(0);
 pub static CACHED_RETN_ADDY: AtomicI64 = AtomicI64::new(0);
 pub static CACHED_XUID: AtomicI64 = AtomicI64::new(0);
@@ -822,17 +837,30 @@ fn unix_time_seed() -> u32 {
     u32::try_from(secs).unwrap_or_default()
 }
 
-/// The player name as the game stores it, up to the NUL.
-fn custom_name_snapshot() -> [u8; PLAYER_NAME_LEN] {
-    let mut out = [0u8; PLAYER_NAME_LEN];
-    for (byte, cell) in out.iter_mut().zip(CUSTOM_NAME.iter()) {
-        *byte = cell.load(Ordering::Relaxed);
+fn current_name_pointer() -> *const u8 {
+    let pointer = NAME_CURRENT.load(Ordering::Acquire);
+    if pointer.is_null() {
+        NAME_DEFAULT.as_ptr()
+    } else {
+        pointer
     }
-    out
+}
+
+/// The player name as the game stores it, up to the NUL.
+fn custom_name_snapshot() -> NameBytes {
+    let pointer = current_name_pointer();
+    // SAFETY: every pointer published to `NAME_CURRENT` comes from a Box<NameBytes>
+    // retained for the process lifetime, so the read is of immutable memory.
+    unsafe { std::ptr::read(pointer.cast::<NameBytes>()) }
 }
 
 fn custom_name_ptr() -> *const c_char {
-    CUSTOM_NAME.as_ptr().cast()
+    current_name_pointer().cast()
+}
+
+/// True when no custom name has been set.
+pub(crate) fn custom_name_is_empty() -> bool {
+    custom_name_snapshot()[0] == 0
 }
 
 /// # Safety
@@ -1031,6 +1059,7 @@ fn steam_slots() -> [(usize, usize); 9] {
 ///
 /// Called by the game through the Steam vtable.
 pub unsafe extern "system" fn get_username_ptr(_this: i64) -> *const c_char {
+    drain_pending_name();
     custom_name_ptr()
 }
 
@@ -1040,6 +1069,7 @@ pub unsafe extern "system" fn get_username_ptr(_this: i64) -> *const c_char {
 ///
 /// Called by the game through the Steam vtable. `this` is the Steam user object.
 pub unsafe extern "system" fn get_username_xuid_ptr(this: i64, xuid: i64) -> *const c_char {
+    drain_pending_name();
     // SAFETY: reads the local player's XUID from the game's player data.
     if xuid == unsafe { local_player_xuid() } {
         return custom_name_ptr();
@@ -1461,25 +1491,46 @@ pub fn set_auto_install_mods(enabled: bool) {
 
 /// Stores `name` as the local custom name without touching the game's buffers.
 /// Returns the stored fields, or `None` when the name is longer than 15 bytes.
-pub fn set_custom_name(name: &[u8]) -> Option<[u8; PLAYER_NAME_LEN]> {
+pub fn set_custom_name(name: &[u8]) -> Option<NameBytes> {
     let fields = player_name_fields(name)?;
-    for (cell, byte) in CUSTOM_NAME.iter().zip(fields) {
-        cell.store(byte, Ordering::Relaxed);
+    let snapshot = Box::new(fields);
+    let pointer = Box::into_raw(snapshot);
+    // Serialize publishers so an older pointer is transferred to the retention list
+    // exactly once.
+    let mut retained = lock(&NAME_RETAINED);
+    let previous = NAME_CURRENT.swap(pointer.cast::<u8>(), Ordering::AcqRel);
+    if !previous.is_null() {
+        // SAFETY: every non-null value in `NAME_CURRENT` was created by `Box::into_raw`
+        // in this function and has not been freed.
+        retained.push(unsafe { Box::from_raw(previous.cast::<NameBytes>()) });
     }
     Some(fields)
 }
 
-/// Port of `SetPlayerName`. Writes the name into the game's name buffers and
-/// keeps the local copy. Names longer than 15 bytes are ignored.
+/// Port of `SetPlayerName`. Publishes the name and queues the copy into the game's
+/// name buffers, which happens on the next game-thread username lookup. Names longer
+/// than 15 bytes are ignored.
 ///
 /// # Safety
 ///
 /// The game's name buffers and player data must be mapped (the game is running).
 pub unsafe fn set_player_name(name: &[u8]) {
-    let Some(fields) = set_custom_name(name) else {
+    let Some(_fields) = set_custom_name(name) else {
         return;
     };
-    // SAFETY: `P_USER_DATA` and `P_NAME_BUFFER` are game name buffers of at least 16 bytes.
+    // The caller may be the config worker. Publish the snapshot now and let the next
+    // game-thread name lookup copy it into the game's buffers.
+    NAME_PENDING.store(true, Ordering::Release);
+}
+
+/// Copies a pending name snapshot into the game buffers. Runs on a game thread from
+/// the username hooks, where the game itself is reading the player name.
+fn drain_pending_name() {
+    if !NAME_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let fields = custom_name_snapshot();
+    // SAFETY: the username hooks run inside the game process, whose name buffers are mapped.
     unsafe {
         copy_bytes((address(offsets::P_USER_DATA) + 8) as *mut u8, &fields);
         copy_bytes(address(offsets::P_NAME_BUFFER) as *mut u8, &fields);
@@ -2832,6 +2883,9 @@ static LOBBY_MARKER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static PRELOAD_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// The update-preload pointer captured before it was replaced.
 static ORIGINAL_PRELOAD: AtomicUsize = AtomicUsize::new(0);
+/// Set once the dvar flags/values were changed. Upstream has no way to read the
+/// original values back without a `Dvar_FindVarByName` address, so they are kept.
+static DVAR_SETTINGS_APPLIED: AtomicBool = AtomicBool::new(false);
 
 /// Port of the fork's `Protection::initialize`. Runs once: resolves the game function table,
 /// caches the local XUID, clears the network password, registers the lobby packet
@@ -2886,19 +2940,20 @@ pub unsafe fn install() -> Result<(), String> {
     // SAFETY: `iat` is an IAT entry inside the mapped image.
     let original = unsafe { iat.read_unaligned() };
     O_IS_PROCESSOR_FEATURE_PRESENT.store(original, Ordering::Release);
-    IAT_INSTALLED.store(true, Ordering::Release);
 
     // SAFETY: reads the game's networking global at +0x10, as the original does.
     let networking_slot = unsafe { read_usize(steam_networking() + 0x10) };
     O_READ_P2P_PACKET.store(networking_slot, Ordering::Relaxed);
 
-    // SAFETY: `iat` is an IAT entry; nothing is written if its page cannot be made writable.
-    if !unsafe {
-        crate::arxan::write_usize(
-            iat as usize,
-            is_processor_feature_present as *const () as usize,
-        )
-    } {
+    let detour = is_processor_feature_present as *const () as usize;
+    // SAFETY: `iat` is an IAT entry inside the mapped image.
+    let report = unsafe { crate::arxan::write_bytes_reported(iat as usize, &detour.to_le_bytes()) };
+    if report.bytes_written {
+        IAT_INSTALLED.store(true, Ordering::Release);
+        // The detour can raise the induced 0x17 exception from now on.
+        crate::exception::note_exception_producer();
+    }
+    if !report.complete() {
         return Err("T7 Patch: cannot write the IsProcessorFeaturePresent import".to_owned());
     }
 
@@ -2937,9 +2992,15 @@ pub unsafe fn install() -> Result<(), String> {
         addr_i64(address(offsets::PTR_SAVE_LOBBY_MSG_EXCEPT_ADDY)),
         Ordering::Release,
     );
-    LOBBY_MARKER_INSTALLED.store(true, Ordering::Release);
-    // SAFETY: as above; nothing is written if it cannot be made writable.
-    if !unsafe { crate::arxan::write_bytes(prints, &LOBBY_MSG_MARKER.to_le_bytes()) } {
+    // SAFETY: as above; the marker global is a game variable.
+    let report =
+        unsafe { crate::arxan::write_bytes_reported(prints, &LOBBY_MSG_MARKER.to_le_bytes()) };
+    if report.bytes_written {
+        LOBBY_MARKER_INSTALLED.store(true, Ordering::Release);
+        // The invalid marker can raise the induced lobby-print exception from now on.
+        crate::exception::note_exception_producer();
+    }
+    if !report.complete() {
         return Err("T7 Patch: cannot write the lobby-message marker".to_owned());
     }
 
@@ -2958,12 +3019,25 @@ pub unsafe fn install() -> Result<(), String> {
         dvar_set_from_string_by_name(c"g_allowvote", c"0", true);
         dvar_set_from_string_by_name(c"maxvoicepacketsperframe", c"0", true);
     }
+    DVAR_SETTINGS_APPLIED.store(true, Ordering::Release);
     Ok(())
+}
+
+/// True while a patch that can induce an exception is still applied.
+///
+/// Once either is set, the dispatcher must not be removed: a thread that already
+/// loaded the lobby marker or the IAT detour can still fault.
+pub(crate) fn exception_producers_remaining() -> bool {
+    LOBBY_MARKER_INSTALLED.load(Ordering::Acquire) || IAT_INSTALLED.load(Ordering::Acquire)
 }
 
 /// Port of `Protection::uninstall`. Restores the Steam vtable snapshot and every game entry
 /// [`install`] recorded, trying all of them, then reports any failure. The snapshot and the
 /// trampolines stay alive for callbacks already in flight.
+///
+/// The dvar changes are not restored: doing so needs a `Dvar_FindVarByName` address, and
+/// guessing one is worse than leaving them. `DVAR_SETTINGS_APPLIED` records that they were
+/// applied so unload can report the residual.
 ///
 /// # Safety
 ///
@@ -3034,6 +3108,11 @@ pub unsafe fn uninstall() -> Result<(), String> {
     }
 
     set_network_password(0);
+    if DVAR_SETTINGS_APPLIED.load(Ordering::Acquire) {
+        crate::dllmain::debug_print(
+            "T7 Patch: dvar settings are retained after unload; there is no dvar finder address.\n",
+        );
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -3220,6 +3299,25 @@ mod tests {
         assert_eq!(byte_at(0x0102_0304_0000_0000, 24), 0x00);
         assert_eq!(byte_at(0x0102_0304_0000_0000, 32), 0x04);
         assert_eq!(byte_at(0x7F00_0000_0000_0000, 56), 0x7F);
+    }
+
+    #[test]
+    fn published_name_snapshots_are_immutable() {
+        static NAME_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = NAME_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let first = set_custom_name(b"Alice").expect("first name");
+        let first_ptr = custom_name_ptr();
+        let second = set_custom_name(b"Bob").expect("second name");
+        let second_ptr = custom_name_ptr();
+
+        assert_ne!(first_ptr, second_ptr);
+        assert_eq!(custom_name_snapshot(), second);
+        assert!(!custom_name_is_empty());
+        // A game thread may still hold the old pointer; its bytes must not change.
+        // SAFETY: every published pointer addresses a retained Box<NameBytes>.
+        let old = unsafe { std::ptr::read(first_ptr.cast::<NameBytes>()) };
+        assert_eq!(old, first);
     }
 
     #[test]

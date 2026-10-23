@@ -13,7 +13,6 @@ use std::ffi::{CStr, c_void};
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Storage::FileSystem::{
@@ -58,8 +57,16 @@ static FN_PTR_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_DISPATCH_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 /// Set just before the dispatcher is patched, so a write that fails partway is still restored.
 static DISPATCHER_INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Original stub bytes saved before the Wine-style patch.
-static WINE_OLD_DATA: Mutex<Option<[u8; WINE_HOOK_SIZE]>> = Mutex::new(None);
+/// Set while the handler should process faults. Cleared when a retained dispatcher is
+/// logically deactivated, so the native pointer layout forwards to the saved callback.
+static HANDLER_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set once a patch that can raise an induced exception is live. After that the
+/// dispatcher is kept for the life of the process: an in-flight thread can still hold
+/// a marker or a detour address that a scan cannot rule out.
+static PRODUCERS_EXPOSED: AtomicBool = AtomicBool::new(false);
+// The Wine stub is never rewritten back: a thread can return into it from the
+// handler, so the saved original bytes would not make removal safe. Unload keeps
+// the stub and the handler for the life of the process on that layout.
 
 /// Maximum number of fatal faults logged in full in one session (fork `MAX_SAVED_EXCEPTIONS`).
 const MAX_SAVED_EXCEPTIONS: usize = 16;
@@ -389,6 +396,25 @@ fn write_crash_session(address: i64, code: u32) {
     let _ = log.flush();
 }
 
+/// Forwards a fault to the dispatcher callback the hook replaced.
+///
+/// # Safety
+///
+/// `record` and `context` must be valid for the duration of the call.
+unsafe fn forward_to_original(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) {
+    let original = ORIGINAL_DISPATCH_CALLBACK.load(Ordering::Acquire);
+    if original == 0 {
+        // Wine's stub layout has no callable original callback. The handler stays
+        // installed and keeps handling faults there; the Wine path is test-only.
+        return;
+    }
+    // SAFETY: the slot held this function pointer before the hook was written.
+    let callback: unsafe extern "system" fn(*mut EXCEPTION_RECORD, *mut CONTEXT) =
+        unsafe { std::mem::transmute(original) };
+    // SAFETY: forwards the dispatcher's own arguments to its original callback.
+    unsafe { callback(record, context) };
+}
+
 /// Writes a crash log entry and handles the fault, following the original dispatch order.
 ///
 /// # Safety
@@ -396,6 +422,13 @@ fn write_crash_session(address: i64, code: u32) {
 /// Called by the process's exception dispatcher with a valid record and context.
 unsafe extern "system" fn exception_hook(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) {
     if record.is_null() || context.is_null() {
+        return;
+    }
+    if !HANDLER_ACTIVE.load(Ordering::Acquire)
+        && ORIGINAL_DISPATCH_CALLBACK.load(Ordering::Acquire) != 0
+    {
+        // SAFETY: `record` and `context` are valid for the duration of the call.
+        unsafe { forward_to_original(record, context) };
         return;
     }
 
@@ -675,36 +708,30 @@ fn wine_stub(handler: usize) -> [u8; WINE_HOOK_SIZE] {
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` with the Wine stub.
 unsafe fn install_wine_hook(dispatcher: usize, handler: usize) -> Result<(), String> {
     let begin = dispatcher + WINE_KI_DISPATCH_OFFSET;
-    let mut old_data = [0u8; WINE_HOOK_SIZE];
-    // SAFETY: the stub is WINE_HOOK_SIZE bytes inside ntdll's code.
-    unsafe {
-        std::ptr::copy_nonoverlapping(begin as *const u8, old_data.as_mut_ptr(), WINE_HOOK_SIZE);
-    };
-    *WINE_OLD_DATA.lock().unwrap_or_else(PoisonError::into_inner) = Some(old_data);
     DISPATCHER_INSTALLED.store(true, Ordering::Release);
 
-    // SAFETY: `begin` is the stub described above; it is rewritten with the new bytes.
-    if !unsafe { crate::arxan::write_bytes(begin, &wine_stub(handler)) } {
-        return Err("T7 Patch: cannot write the Wine exception dispatcher stub".to_owned());
+    // SAFETY: `begin` is the stub described above; it is rewritten with the new
+    // bytes and `write_code` freezes every other thread first.
+    match unsafe { crate::threads::write_code(begin, &wine_stub(handler)) } {
+        Ok(report) if report.complete() => Ok(()),
+        Ok(report) => {
+            if !report.bytes_written {
+                DISPATCHER_INSTALLED.store(false, Ordering::Release);
+            }
+            Err("T7 Patch: cannot write the Wine exception dispatcher stub".to_owned())
+        }
+        Err(error) => {
+            if matches!(
+                error,
+                crate::threads::CodeWriteError::Busy | crate::threads::CodeWriteError::Freeze(_)
+            ) {
+                DISPATCHER_INSTALLED.store(false, Ordering::Release);
+            }
+            Err(format!(
+                "T7 Patch: cannot write the Wine exception dispatcher stub: {error}"
+            ))
+        }
     }
-    Ok(())
-}
-
-/// Restores the Wine-style dispatcher stub.
-///
-/// # Safety
-///
-/// `dispatcher` must be the address of `KiUserExceptionDispatcher` with the patched stub.
-unsafe fn uninstall_wine_hook(dispatcher: usize) -> Result<(), String> {
-    let saved = *WINE_OLD_DATA.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(old_data) = saved else {
-        return Ok(());
-    };
-    // SAFETY: restores the bytes saved by `install_wine_hook` at the same address.
-    if !unsafe { crate::arxan::write_bytes(dispatcher + WINE_KI_DISPATCH_OFFSET, &old_data) } {
-        return Err("T7 Patch: cannot restore the Wine exception dispatcher stub".to_owned());
-    }
-    Ok(())
 }
 
 /// Address of `ntdll!KiUserExceptionDispatcher` and the first word of its code, which
@@ -727,9 +754,15 @@ fn dispatcher_layout() -> Result<(usize, i32), String> {
 ///
 /// Must run inside the game process, after ntdll is loaded.
 pub unsafe fn install() -> Result<(), String> {
+    if DISPATCHER_INSTALLED.load(Ordering::Acquire) {
+        // A retained dispatcher is reused; its saved original callback must not be
+        // overwritten with our own handler.
+        HANDLER_ACTIVE.store(true, Ordering::Release);
+        return Ok(());
+    }
     let (dispatcher, first_word) = dispatcher_layout()?;
     let handler = exception_hook as *const () as usize;
-    if first_word == KI_DISPATCH_PTR_PATTERN {
+    let result = if first_word == KI_DISPATCH_PTR_PATTERN {
         // SAFETY: the pattern matches the pointer layout handled by `install_pointer_hook`.
         unsafe { install_pointer_hook(dispatcher, handler) }
     } else if first_word == WINE_STUB_PATTERN {
@@ -737,20 +770,57 @@ pub unsafe fn install() -> Result<(), String> {
         unsafe { install_wine_hook(dispatcher, handler) }
     } else {
         Err("T7 Patch: unsupported exception dispatcher".to_owned())
+    };
+    if result.is_ok() {
+        HANDLER_ACTIVE.store(true, Ordering::Release);
     }
+    result
 }
 
-/// Port of the fork's `UninstallHook`: restores the dispatcher's original callback, or the
-/// original Wine stub. Does nothing if the hook was never installed.
+/// Records that a patch which can raise an induced exception is live.
+///
+/// Once this is set, [`uninstall`] retains the dispatcher for the life of the
+/// process: a thread may already hold the lobby marker or a detour address.
+pub(crate) fn note_exception_producer() {
+    PRODUCERS_EXPOSED.store(true, Ordering::Release);
+}
+
+/// Port of the fork's `UninstallHook`: restores the dispatcher's original callback when no
+/// exception producer was ever exposed. Once the lobby marker or the IAT detour has been
+/// written, or on the Wine stub layout, the hook is retained for the process lifetime.
+/// Does nothing if the hook was never installed.
 ///
 /// # Safety
 ///
 /// Must run inside the game process.
-pub unsafe fn uninstall() -> Result<(), String> {
+pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
     if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         return Ok(());
     }
-    let (dispatcher, first_word) = dispatcher_layout()?;
+    let (_dispatcher, first_word) = dispatcher_layout()?;
+    if first_word == WINE_STUB_PATTERN {
+        // The stub is executable code and a handler invocation returns into it.
+        // RIP-only freezing cannot prove that no thread will return there, so keep
+        // the stub and the handler. Wine is the test layout; native Windows uses
+        // the pointer layout below.
+        HANDLER_ACTIVE.store(true, Ordering::Release);
+        crate::dllmain::debug_print(
+            "T7 Patch: Wine exception stub retained for the process lifetime.\n",
+        );
+        return Ok(());
+    }
+    if PRODUCERS_EXPOSED.load(Ordering::Acquire) {
+        // Keep the trampolines and the dispatcher alive. If a producer could not be
+        // restored, keep handling faults too: the induced marker and detour paths
+        // are still reachable. Otherwise Unload is a logical deactivation.
+        HANDLER_ACTIVE.store(producers_remaining, Ordering::Release);
+        crate::dllmain::debug_print(if producers_remaining {
+            "T7 Patch: exception dispatcher retained; a producer is still installed.\n"
+        } else {
+            "T7 Patch: exception dispatcher retained; Unload is logical deactivation.\n"
+        });
+        return Ok(());
+    }
     if first_word == KI_DISPATCH_PTR_PATTERN {
         let slot = FN_PTR_HOOK.load(Ordering::Acquire);
         if slot != 0 {
@@ -761,12 +831,11 @@ pub unsafe fn uninstall() -> Result<(), String> {
                 return Err("T7 Patch: cannot restore the exception dispatcher slot".to_owned());
             }
         }
-    } else if first_word == WINE_STUB_PATTERN {
-        // SAFETY: the stub was patched by `install_wine_hook`.
-        unsafe { uninstall_wine_hook(dispatcher) }?;
     } else {
         return Err("T7 Patch: dispatcher changed before restoration".to_owned());
     }
+    HANDLER_ACTIVE.store(false, Ordering::Release);
+    PRODUCERS_EXPOSED.store(false, Ordering::Release);
     DISPATCHER_INSTALLED.store(false, Ordering::Release);
     Ok(())
 }

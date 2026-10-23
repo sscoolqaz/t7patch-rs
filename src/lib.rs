@@ -3,8 +3,9 @@
 //! Ported: name hashing, the FNV variant, build detection, game struct layouts,
 //! the offset table, the `MinHook` bindings, the Arxan bypass, the campaign
 //! script fix, the protection module, the Lua symbol tables, the hooks, the
-//! exception-dispatch hook, the staged patch lifecycle, and the DLL entry
-//! point. None of it has run in the game yet.
+//! exception-dispatch hook, the staged patch lifecycle, thread freezing for
+//! executable code writes, and the DLL entry point. None of it has run in the
+//! game yet.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -23,3 +24,4 @@ pub mod lua_symbols;
 pub mod offsets;
 pub mod protection;
 pub mod structs;
+mod threads;

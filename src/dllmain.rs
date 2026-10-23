@@ -57,7 +57,7 @@ impl Operations for PatchOps {
         arxan::install()?;
         // SAFETY: runs inside the game process once its executable is mapped.
         unsafe { protection::initialize() }?;
-        if protection::CUSTOM_NAME[0].load(Ordering::Relaxed) == 0 {
+        if protection::custom_name_is_empty() {
             // As in the C++, only the local copy is set here, not the game's name buffers.
             let _ = protection::set_custom_name(DEFAULT_PLAYER_NAME);
         }
@@ -129,9 +129,14 @@ impl Operations for PatchOps {
         if let Err(error) = hooks::restore_memory_patches() {
             failures.push(error);
         }
-        // SAFETY: as above.
-        if let Err(error) = unsafe { exception::uninstall() } {
+        // SAFETY: as above. The dispatcher is retained after any producer was exposed.
+        if let Err(error) =
+            unsafe { exception::uninstall(protection::exception_producers_remaining()) }
+        {
             failures.push(error);
+        }
+        if arxan::partial() {
+            failures.push("T7 Patch: Arxan restoration is incomplete".to_owned());
         }
         let priority = ORIGINAL_PRIORITY.load(Ordering::Acquire);
         if priority != 0 {
@@ -182,6 +187,7 @@ pub extern "C" fn SetAutoInstallMods(is_enabled: u8) {
 }
 
 /// Port of the exported `SetPlayerName`. Names longer than 15 bytes are ignored.
+/// The game buffers are updated on the next game-thread username lookup.
 ///
 /// # Safety
 ///
@@ -236,8 +242,10 @@ pub unsafe extern "C" fn zbr_run_gamemode_lui(input: *const c_char) {
     }
 }
 
-/// Port of the fork's `Unload`: a logical deactivation that restores everything the patch
-/// changed. Callers must not `FreeLibrary` while game callbacks are in flight.
+/// Port of the fork's `Unload`: a logical deactivation. Hooks, Steam vtable slots, the lobby
+/// marker and the update-preload pointer are restored. The exception dispatcher stays
+/// installed once an induced-exception patch has been live, and the dvar settings changed at
+/// install stay applied. Callers must not `FreeLibrary` while game callbacks are in flight.
 #[unsafe(no_mangle)]
 pub extern "C" fn Unload() {
     if !LIFECYCLE.unload(&mut PatchOps) {

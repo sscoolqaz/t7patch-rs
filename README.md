@@ -4,8 +4,12 @@ A Rust port of [shiversoftdev's T7Patch](https://github.com/Scroptss/T7Patch-src
 
 Status: ports upstream T7Patch plus the C++ fork's safety fixes: bounded chat, IM and
 event-index handling, a staged lifecycle with rollback, a managed config worker, restore on
-unload, and a fixed crash queue with a safe stack probe. The tests pass under Wine. It has
-not yet been run in the game.
+unload of hooks, Steam vtable slots, the lobby marker and the update-preload pointer, and a
+fixed crash queue with a safe stack probe. Two states are deliberately retained after
+unload: the exception dispatcher once an induced-exception patch (the lobby marker or the
+`IsProcessorFeaturePresent` detour) has been live, or always on the Wine stub layout, and
+the three dvar settings changed at install, because there is no verified dvar finder address to restore them. The tests pass
+under Wine. It has not yet been run in the game.
 
 ## Port checklist
 

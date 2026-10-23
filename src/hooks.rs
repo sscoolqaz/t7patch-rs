@@ -1786,7 +1786,11 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
     // reused it, the slot is no longer a vtable pointer and must not be written.
     let mut current = [0usize; 1];
     let ours = LOBBY_VTABLE.as_ptr().addr();
-    if read_memory(slot, &mut current) && current[0] == ours {
+    if !read_memory(slot, &mut current) {
+        // Keep the ownership records: a later attempt must not lose the snapshot.
+        return Err("T7 Patch: cannot read the lobby VMT slot".to_owned());
+    }
+    if current[0] == ours {
         // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
         if !unsafe { arxan::write_usize(slot, original) } {
             return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
@@ -1798,6 +1802,7 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
 }
 
 /// Bytes a memory patch replaced, so the patch can be undone.
+#[derive(Clone)]
 struct MemoryPatch {
     address: usize,
     original: Vec<u8>,
@@ -1835,13 +1840,44 @@ fn patch(address: usize, bytes: &[u8]) -> Result<(), String> {
     MEMORY_PATCHES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(MemoryPatch { address, original });
+        .push(MemoryPatch {
+            address,
+            original: original.clone(),
+        });
 
-    // SAFETY: the callers pass addresses inside the game image, which is committed executable memory.
-    if !unsafe { arxan::write_bytes(address, bytes) } {
-        return Err("T7 Patch: cannot write a memory patch".to_owned());
+    // SAFETY: the callers pass addresses inside the game image, which is committed
+    // executable memory, and `write_code` freezes every other thread first.
+    match unsafe { crate::threads::write_code(address, bytes) } {
+        Ok(report) if report.complete() => Ok(()),
+        Ok(report) => {
+            if !report.bytes_written {
+                pop_unjournaled_patch(address, &original);
+            }
+            Err("T7 Patch: cannot write a memory patch".to_owned())
+        }
+        Err(error) => {
+            if matches!(
+                error,
+                crate::threads::CodeWriteError::Busy | crate::threads::CodeWriteError::Freeze(_)
+            ) {
+                pop_unjournaled_patch(address, &original);
+            }
+            Err(format!("T7 Patch: cannot write a memory patch: {error}"))
+        }
     }
-    Ok(())
+}
+
+/// Removes the record `patch` pushed when no bytes were written.
+fn pop_unjournaled_patch(address: usize, original: &[u8]) {
+    let mut patches = MEMORY_PATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if patches
+        .last()
+        .is_some_and(|saved| saved.address == address && saved.original == original)
+    {
+        patches.pop();
+    }
 }
 
 /// Port of `hooks::ApplyMemoryPatches`. Applies the SL, movsx, process-priority and
@@ -1872,20 +1908,33 @@ pub fn apply_memory_patches() -> Result<(), String> {
 /// Port of `hooks::RestoreMemoryPatches`. Restores every saved patch in reverse order,
 /// trying all of them. The saved list is cleared only when every restore succeeds.
 pub fn restore_memory_patches() -> Result<(), String> {
+    let saved = MEMORY_PATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let mut failed = false;
+    let mut restored: Vec<(usize, Vec<u8>)> = Vec::new();
+    for record in saved.iter().rev() {
+        // SAFETY: each address was patched by `patch`, which read the same range first.
+        match unsafe { crate::threads::write_code(record.address, &record.original) } {
+            Ok(report) if report.complete() => {
+                restored.push((record.address, record.original.clone()));
+            }
+            Ok(_) | Err(_) => failed = true,
+        }
+    }
+
     let mut patches = MEMORY_PATCHES
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let mut failed = false;
-    for saved in patches.iter().rev() {
-        // SAFETY: each address was patched by `patch`, which read the same range first.
-        if !unsafe { arxan::write_bytes(saved.address, &saved.original) } {
-            failed = true;
-        }
-    }
+    patches.retain(|patch| {
+        !restored
+            .iter()
+            .any(|(address, original)| *address == patch.address && *original == patch.original)
+    });
     if failed {
         return Err("T7 Patch: memory restoration failed".to_owned());
     }
-    patches.clear();
     Ok(())
 }
 

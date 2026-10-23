@@ -38,6 +38,41 @@ const PAGE_GUARD: u32 = 0x100;
 const MEM_COMMIT: u32 = 0x1000;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
+/// Result of one guarded memory write.
+///
+/// A write can succeed, partially succeed, or fail. `bytes_written` is set as soon
+/// as the copy happens, so a caller that sees `false` from [`write_bytes`] still has
+/// to treat the bytes as changed when `bytes_written` is true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WriteReport {
+    pub(crate) bytes_written: bool,
+    pub(crate) cache_flushed: bool,
+    pub(crate) protection_restored: bool,
+}
+
+impl WriteReport {
+    /// True only when every stage succeeded.
+    pub(crate) const fn complete(self) -> bool {
+        self.bytes_written && self.cache_flushed && self.protection_restored
+    }
+
+    /// True when the bytes changed but a later stage failed.
+    pub(crate) const fn uncertain(self) -> bool {
+        self.bytes_written && !self.complete()
+    }
+}
+
+/// Where one saved patch is in its write/restore lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchState {
+    /// Collected, but no replacement bytes have been written.
+    Pending,
+    /// Replacement bytes are in the image.
+    Written,
+    /// A restore attempt failed; the original bytes may not be back.
+    RestoreFailed,
+}
+
 /// One byte range rewritten by the bypass, with the bytes needed to undo it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedPatch {
@@ -45,10 +80,13 @@ struct SavedPatch {
     size: usize,
     original: [u8; 8],
     replacement: [u8; 8],
+    state: PatchState,
 }
 
 struct State {
     patches: Vec<SavedPatch>,
+    /// A restore failed, so the image may contain a partial bypass.
+    partial: bool,
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -56,6 +94,7 @@ static EXTERNAL: AtomicBool = AtomicBool::new(false);
 static WAITING_FOR_READY_SIGNAL: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
     patches: Vec::new(),
+    partial: false,
 });
 
 fn lock_state() -> MutexGuard<'static, State> {
@@ -132,38 +171,107 @@ fn ready_signal_set() -> bool {
     }
 }
 
-/// Writes `bytes` over `address`, temporarily making the page writable.
+/// Maximum number of pages one write may span. Every patch in this crate is at most
+/// a pointer wide, so a range that crosses more pages is a caller bug and is refused.
+const MAX_WRITE_PAGES: usize = 4;
+const PAGE_SIZE: usize = 0x1000;
+
+/// Writes `bytes` over `address`, temporarily making every touched page writable and
+/// reporting which stages completed.
+///
+/// A caller must journal the original bytes before calling this: when
+/// [`WriteReport::bytes_written`] is true the image already contains the new bytes,
+/// even if the cache flush or the protection restore failed.
 ///
 /// # Safety
 ///
-/// `[address, address + bytes.len())` must lie inside committed executable memory.
-pub(crate) unsafe fn write_bytes(address: usize, bytes: &[u8]) -> bool {
-    let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-    // SAFETY: the caller guarantees the range is committed executable memory.
-    let changed = unsafe {
-        VirtualProtect(
-            address as *const _,
-            bytes.len(),
-            windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
-            &raw mut old,
-        )
+/// `[address, address + bytes.len())` must lie inside committed memory.
+pub(crate) unsafe fn write_bytes_reported(address: usize, bytes: &[u8]) -> WriteReport {
+    let mut report = WriteReport::default();
+    if bytes.is_empty() {
+        report.bytes_written = true;
+        report.cache_flushed = true;
+        report.protection_restored = true;
+        return report;
+    }
+    let Some(end) = address.checked_add(bytes.len()) else {
+        return report;
     };
-    if changed.is_err() {
-        return false;
+    let first_page = address & !(PAGE_SIZE - 1);
+    let last_page = (end - 1) & !(PAGE_SIZE - 1);
+    let page_count = (last_page - first_page) / PAGE_SIZE + 1;
+    if page_count > MAX_WRITE_PAGES {
+        return report;
     }
 
-    // SAFETY: the range was made writable above and `bytes` does not overlap the target.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
-    // SAFETY: the current process handle is a pseudo-handle that is always valid.
-    let flushed = unsafe {
-        FlushInstructionCache(GetCurrentProcess(), Some(address as *const _), bytes.len())
-    };
+    let mut saved = [(
+        0usize,
+        0usize,
+        windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0),
+    ); MAX_WRITE_PAGES];
+    let mut protected = 0;
+    for (index, slot) in saved.iter_mut().take(page_count).enumerate() {
+        let page = first_page + index * PAGE_SIZE;
+        let start = address.max(page);
+        let stop = end.min(page + PAGE_SIZE);
+        let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
+        // SAFETY: the caller guarantees the whole range is committed memory.
+        let changed = unsafe {
+            VirtualProtect(
+                start as *const _,
+                stop - start,
+                windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+                &raw mut old,
+            )
+        };
+        if changed.is_err() {
+            // Restore the pages already made writable before reporting failure.
+            for (start, size, old) in saved[..protected].iter().rev() {
+                let mut ignored = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
+                // SAFETY: these pages were made writable above.
+                let _ =
+                    unsafe { VirtualProtect(*start as *const _, *size, *old, &raw mut ignored) };
+            }
+            return report;
+        }
+        *slot = (start, stop - start, old);
+        protected = index + 1;
+    }
 
-    let mut ignored = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-    // SAFETY: restores the protection captured above for the same range.
-    let restored =
-        unsafe { VirtualProtect(address as *const _, bytes.len(), old, &raw mut ignored) };
-    flushed.is_ok() && restored.is_ok()
+    // SAFETY: every touched page was made writable above, and `bytes` does not
+    // overlap the target.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+    report.bytes_written = true;
+
+    // SAFETY: the current process handle is a pseudo-handle that is always valid.
+    report.cache_flushed = unsafe {
+        FlushInstructionCache(GetCurrentProcess(), Some(address as *const _), bytes.len())
+    }
+    .is_ok();
+
+    let mut protection_restored = true;
+    for (start, size, old) in saved[..protected].iter().rev() {
+        let mut ignored = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
+        // SAFETY: restores the protection captured above for the same page.
+        if unsafe { VirtualProtect(*start as *const _, *size, *old, &raw mut ignored) }.is_err() {
+            protection_restored = false;
+        }
+    }
+    report.protection_restored = protection_restored;
+    report
+}
+
+/// Writes `bytes` over `address`, temporarily making the page writable.
+///
+/// Returns false when any stage failed; callers that must know whether the bytes
+/// changed use [`write_bytes_reported`] instead.
+///
+/// # Safety
+///
+/// `[address, address + bytes.len())` must lie inside committed memory.
+pub(crate) unsafe fn write_bytes(address: usize, bytes: &[u8]) -> bool {
+    // SAFETY: forwarded from the caller.
+    unsafe { write_bytes_reported(address, bytes).complete() }
 }
 
 /// Writes a pointer-sized `value` at `address` through [`write_bytes`]. Nothing is
@@ -306,18 +414,77 @@ unsafe fn collect_pattern_patches(
             size: replacement.len(),
             original,
             replacement: new,
+            state: PatchState::Pending,
         });
     }
     Ok(patches)
 }
 
-/// Undoes the first `applied` patches in reverse order and forgets them all.
-fn rollback_applied(state: &mut State, applied: usize) {
-    for patch in state.patches[..applied].iter().rev() {
-        // SAFETY: the address was validated as executable memory when the patch was collected.
-        unsafe { write_bytes(patch.address, &patch.original[..patch.size]) };
+/// Restores the first `applied` patches in reverse order.
+///
+/// Records whose restore could not be completed stay in [`State`] and mark the
+/// bypass as partial; the lifecycle must not return to `Idle` in that case.
+/// Returns true only when every recorded patch is back to its original bytes.
+fn restore_applied(state: &mut State, applied: usize) -> bool {
+    let batch: Vec<crate::threads::CodePatch<'_>> = state.patches[..applied]
+        .iter()
+        .rev()
+        .filter(|patch| patch.state == PatchState::Written)
+        .map(|patch| crate::threads::CodePatch {
+            address: patch.address,
+            bytes: &patch.original[..patch.size],
+        })
+        .collect();
+    if batch.is_empty() {
+        state.patches.clear();
+        return true;
     }
-    state.patches.clear();
+
+    let result = unsafe { crate::threads::write_code_batch(&batch) };
+    drop(batch);
+    match result {
+        Ok(reports) => {
+            let mut failed = false;
+            let mut report_index = 0usize;
+            for patch in state.patches[..applied].iter_mut().rev() {
+                if patch.state != PatchState::Written {
+                    continue;
+                }
+                let report = reports.get(report_index).copied().unwrap_or_default();
+                report_index += 1;
+                if report.complete() {
+                    patch.state = PatchState::Pending;
+                } else {
+                    patch.state = PatchState::RestoreFailed;
+                    failed = true;
+                }
+            }
+            if failed {
+                state.partial = true;
+                false
+            } else {
+                state.patches.clear();
+                true
+            }
+        }
+        Err(error) => {
+            for patch in state.patches[..applied].iter_mut().rev() {
+                if patch.state == PatchState::Written {
+                    patch.state = PatchState::RestoreFailed;
+                }
+            }
+            state.partial = true;
+            crate::dllmain::debug_print(&format!(
+                "T7 Patch: cannot restore the Arxan bypass: {error}\n"
+            ));
+            false
+        }
+    }
+}
+
+/// Reports whether an earlier restore left the image partially bypassed.
+pub fn partial() -> bool {
+    lock_state().partial
 }
 
 /// Installs the bypass, or detects one that another module already installed.
@@ -327,6 +494,11 @@ pub fn install() -> Result<String, String> {
     let mut state = lock_state();
     if ACTIVE.load(Ordering::Acquire) {
         return Ok("Arxan integrity bypass is active".to_owned());
+    }
+    if state.partial {
+        return Err(
+            "T7 Patch: a previous Arxan restore is incomplete; refusing to reinstall".to_owned(),
+        );
     }
 
     let image_base = build::image_base();
@@ -345,16 +517,59 @@ pub fn install() -> Result<String, String> {
     // SAFETY: the game process has its main module mapped at `image_base`.
     state.patches = unsafe { collect_all_patches(image_base)? };
 
-    for applied in 0..state.patches.len() {
-        let patch = state.patches[applied];
-        // SAFETY: the address was validated as executable memory when it was collected.
-        if unsafe { write_bytes(patch.address, &patch.replacement[..patch.size]) } {
-            continue;
+    let batch: Vec<crate::threads::CodePatch<'_>> = state
+        .patches
+        .iter()
+        .map(|patch| crate::threads::CodePatch {
+            address: patch.address,
+            bytes: &patch.replacement[..patch.size],
+        })
+        .collect();
+    let result = unsafe { crate::threads::write_code_batch(&batch) };
+    drop(batch);
+
+    let reports = match result {
+        Ok(reports) => reports,
+        Err(error) => {
+            let attempted = match &error {
+                crate::threads::CodeWriteError::Thaw { reports, .. } => reports.as_slice(),
+                crate::threads::CodeWriteError::Busy
+                | crate::threads::CodeWriteError::Freeze(_) => &[],
+            };
+            for (applied, report) in attempted.iter().copied().enumerate() {
+                if report.bytes_written {
+                    state.patches[applied].state = PatchState::Written;
+                }
+            }
+            if attempted.is_empty() {
+                state.patches.clear();
+            } else {
+                let _ = restore_applied(&mut state, attempted.len());
+            }
+            return Err(format!("T7 Patch: cannot apply the Arxan bypass: {error}"));
         }
-        // SAFETY: as above; restores the bytes already rewritten in this pass.
-        unsafe { write_bytes(patch.address, &patch.original[..patch.size]) };
-        rollback_applied(&mut state, applied);
-        return Err("Could not apply the complete Arxan integrity bypass".to_owned());
+    };
+
+    let mut failure = None;
+    for (applied, report) in reports.iter().copied().enumerate() {
+        if report.bytes_written {
+            state.patches[applied].state = PatchState::Written;
+        }
+        if !report.complete() {
+            failure = Some(applied);
+            break;
+        }
+    }
+    if reports.len() < state.patches.len() && failure.is_none() {
+        failure = Some(reports.len());
+    }
+    if let Some(failure) = failure {
+        let restored = restore_applied(&mut state, failure + 1);
+        return Err(if restored {
+            "T7 Patch: could not apply the complete Arxan integrity bypass".to_owned()
+        } else {
+            "T7 Patch: could not apply the Arxan bypass and its rollback is incomplete".to_owned()
+        });
     }
 
     EXTERNAL.store(false, Ordering::Release);
@@ -425,20 +640,50 @@ pub fn maintain() {
         return;
     }
 
-    let state = lock_state();
+    let mut state = lock_state();
+    if state.partial {
+        return;
+    }
     if !ACTIVE.load(Ordering::Acquire) || !WAITING_FOR_READY_SIGNAL.load(Ordering::Acquire) {
         return;
     }
 
-    for patch in &state.patches {
+    for index in 0..state.patches.len() {
+        let patch = state.patches[index];
         // SAFETY: the address was validated as executable memory when it was collected.
         let current = unsafe { std::slice::from_raw_parts(patch.address as *const u8, patch.size) };
         if current == &patch.replacement[..patch.size] {
+            state.patches[index].state = PatchState::Written;
             continue;
         }
-        // SAFETY: as above.
-        if !unsafe { write_bytes(patch.address, &patch.replacement[..patch.size]) } {
-            return;
+        // SAFETY: as above; the freeze checks that no thread is executing the site.
+        match unsafe { crate::threads::write_code(patch.address, &patch.replacement[..patch.size]) }
+        {
+            Ok(report) if report.complete() => state.patches[index].state = PatchState::Written,
+            Ok(report) => {
+                if report.bytes_written {
+                    state.patches[index].state = PatchState::Written;
+                }
+                if report.uncertain() {
+                    state.partial = true;
+                    ACTIVE.store(false, Ordering::Release);
+                }
+                return;
+            }
+            Err(error) => {
+                if let crate::threads::CodeWriteError::Thaw { reports, .. } = &error {
+                    if reports.first().is_some_and(|report| report.bytes_written) {
+                        state.patches[index].state = PatchState::Written;
+                    }
+                    state.partial = true;
+                    ACTIVE.store(false, Ordering::Release);
+                    crate::dllmain::debug_print(&format!(
+                        "T7 Patch: Arxan maintenance could not resume every thread: {error}\n"
+                    ));
+                }
+                // Busy or a failed freeze: retry on the next worker tick.
+                return;
+            }
         }
     }
     WAITING_FOR_READY_SIGNAL.store(false, Ordering::Release);
@@ -472,6 +717,28 @@ mod tests {
         assert_eq!(find_all(b"aaaa", b"aa"), vec![0, 1, 2]);
         assert_eq!(find_all(b"abc", b"abcd"), Vec::<usize>::new());
         assert_eq!(find_all(b"", b"a"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn write_report_distinguishes_partial_writes() {
+        let complete = WriteReport {
+            bytes_written: true,
+            cache_flushed: true,
+            protection_restored: true,
+        };
+        assert!(complete.complete());
+        assert!(!complete.uncertain());
+
+        let partial = WriteReport {
+            bytes_written: true,
+            cache_flushed: false,
+            protection_restored: true,
+        };
+        assert!(!partial.complete());
+        assert!(partial.uncertain());
+
+        assert!(!WriteReport::default().complete());
+        assert!(!WriteReport::default().uncertain());
     }
 
     #[test]
