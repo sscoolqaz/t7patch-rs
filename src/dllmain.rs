@@ -2,29 +2,25 @@
 //!
 //! Port of the entry points in `dllmain.cpp`: `RunPatching`, the exported
 //! `zbr_run_gamemode_lui` / `EnableInjectorlessInstall` / `Unload`, and `DllMain`.
+//! The staged install and the rollback follow the fork's `PatchOperations`
+//! (`2aa0d3e`); the state machine itself is [`crate::lifecycle`].
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
-use windows::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_FLAGS, GetThreadContext, OutputDebugStringA, SetThreadContext,
-};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-    OpenThread, ResumeThread, SetPriorityClass, SuspendThread, THREAD_ALL_ACCESS,
+    ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, PROCESS_CREATION_FLAGS,
+    SetPriorityClass,
 };
 use windows::core::{BOOL, PCSTR};
 
+use crate::lifecycle::{Lifecycle, Operations};
 use crate::{arxan, exception, ffi, gscu_hash, hooks, protection};
 
-/// `CONTEXT_DEBUG_REGISTERS` for x64: the flag set that covers Dr0 through Dr7.
-const CONTEXT_DEBUG_REGISTERS: u32 = 0x0010_0010;
 const DEFAULT_PLAYER_NAME: &[u8] = b"Unknown Soldier";
 const PATCH_KEY_PHRASE: &[u8] = b"serious_anticrash_2023";
 
@@ -37,71 +33,140 @@ pub(crate) fn debug_print(message: &str) {
     unsafe { OutputDebugStringA(PCSTR(text.as_ptr().cast())) };
 }
 
-/// Thread ids of every thread in this process except the calling one.
-fn other_thread_ids() -> Vec<u32> {
-    let mut ids = Vec::new();
-    // SAFETY: a thread snapshot has no preconditions; it is closed below.
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
-        return ids;
-    };
+static LIFECYCLE: Lifecycle = Lifecycle::new();
+/// Set once every hook has been created. Created hooks are kept for the life of the
+/// process, because in-flight callbacks may still hold their trampolines.
+static HOOKS_PREPARED: AtomicBool = AtomicBool::new(false);
+/// Set while this module holds an initialized hooking library.
+static HOOK_LIB_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Set before the hooks are enabled, since enabling can fail after a subset is live.
+static HOOKS_MAY_BE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Process priority class before `activate`, or 0 when there is nothing to restore.
+static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
-    // SAFETY: the process and thread id queries have no preconditions.
-    let (process, current) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
-    let mut entry = THREADENTRY32 {
-        dwSize: u32::try_from(size_of::<THREADENTRY32>()).unwrap_or_default(),
-        ..Default::default()
-    };
-    // SAFETY: `entry` is sized as the API requires.
-    if unsafe { Thread32First(snapshot, &raw mut entry) }.is_ok() {
-        loop {
-            if entry.th32OwnerProcessID == process && entry.th32ThreadID != current {
-                ids.push(entry.th32ThreadID);
+/// Port of the fork's `PatchOperations`. Its state lives in the statics above, so every
+/// transition sees what earlier ones did.
+struct PatchOps;
+
+impl Operations for PatchOps {
+    fn report_failure(&mut self, message: &str) {
+        debug_print(&format!("T7 Patch installation failure: {message}\n"));
+    }
+
+    fn prepare(&mut self) -> Result<(), String> {
+        arxan::install()?;
+        // SAFETY: runs inside the game process once its executable is mapped.
+        unsafe { protection::initialize() }?;
+        if protection::CUSTOM_NAME[0].load(Ordering::Relaxed) == 0 {
+            // As in the C++, only the local copy is set here, not the game's name buffers.
+            let _ = protection::set_custom_name(DEFAULT_PLAYER_NAME);
+        }
+        protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
+
+        if !HOOKS_PREPARED.load(Ordering::Acquire) {
+            if !HOOK_LIB_INITIALIZED.load(Ordering::Acquire) {
+                ffi::initialize()
+                    .map_err(|error| format!("T7 Patch: MinHook initialize failed: {error}"))?;
+                HOOK_LIB_INITIALIZED.store(true, Ordering::Release);
             }
-            // SAFETY: as above.
-            if unsafe { Thread32Next(snapshot, &raw mut entry) }.is_err() {
-                break;
+            hooks::create_hooks()?;
+            HOOKS_PREPARED.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn install_dispatcher(&mut self) -> Result<(), String> {
+        // SAFETY: runs inside the game process, after ntdll is loaded.
+        unsafe { exception::install() }
+    }
+
+    fn install_protection(&mut self) -> Result<(), String> {
+        // SAFETY: `prepare` ran `protection::initialize` in this process.
+        unsafe { protection::install() }?;
+        hooks::apply_memory_patches()
+    }
+
+    fn activate(&mut self) -> Result<(), String> {
+        // SAFETY: the current process handle is a pseudo-handle.
+        let priority = unsafe { GetPriorityClass(GetCurrentProcess()) };
+        if priority == 0 {
+            return Err("T7 Patch: cannot set process priority".to_owned());
+        }
+        ORIGINAL_PRIORITY.store(priority, Ordering::Release);
+        // SAFETY: as above.
+        unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) }
+            .map_err(|_| "T7 Patch: cannot set process priority".to_owned())?;
+
+        hooks::apply_vmt_hooks()?;
+        // Enabling can fail after a subset of hooks is live, so mark them first.
+        HOOKS_MAY_BE_ENABLED.store(true, Ordering::Release);
+        ffi::enable_all_hooks().map_err(|error| format!("T7 Patch: MinHook enable failed: {error}"))
+    }
+
+    fn start_worker(&mut self) -> Result<(), String> {
+        protection::start_worker()
+    }
+
+    fn rollback(&mut self) -> Result<(), String> {
+        // A stopped worker cannot race with restoring config and password state. If it
+        // cannot be joined, leave all code and data it can use intact.
+        protection::stop_worker()?;
+
+        let mut failures = Vec::new();
+        if HOOKS_MAY_BE_ENABLED.load(Ordering::Acquire) {
+            match hooks::destroy_hooks() {
+                Ok(()) => HOOKS_MAY_BE_ENABLED.store(false, Ordering::Release),
+                Err(error) => failures.push(error),
             }
         }
+        if let Err(error) = hooks::restore_vmt_hooks() {
+            failures.push(error);
+        }
+        // SAFETY: runs inside the game process; uninstall undoes only what install recorded.
+        if let Err(error) = unsafe { protection::uninstall() } {
+            failures.push(error);
+        }
+        if let Err(error) = hooks::restore_memory_patches() {
+            failures.push(error);
+        }
+        // SAFETY: as above.
+        if let Err(error) = unsafe { exception::uninstall() } {
+            failures.push(error);
+        }
+        let priority = ORIGINAL_PRIORITY.load(Ordering::Acquire);
+        if priority != 0 {
+            // SAFETY: the current process handle is a pseudo-handle.
+            match unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_CREATION_FLAGS(priority)) }
+            {
+                Ok(()) => ORIGINAL_PRIORITY.store(0, Ordering::Release),
+                Err(_) => failures.push("T7 Patch: cannot restore process priority".to_owned()),
+            }
+        }
+        // In-flight callbacks may still hold trampolines, so completed hook tables are kept.
+        // A partial creation never enabled any hook and can safely release its trampolines.
+        if HOOK_LIB_INITIALIZED.load(Ordering::Acquire) && !HOOKS_PREPARED.load(Ordering::Acquire) {
+            match ffi::uninitialize() {
+                Ok(()) => HOOK_LIB_INITIALIZED.store(false, Ordering::Release),
+                Err(error) => {
+                    failures.push(format!("T7 Patch: MinHook uninitialize failed: {error}"));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            debug_print("T7 Patch: restoration failed; further lifecycle transitions disabled.\n");
+            Err(failures.join("; "))
+        }
     }
-
-    // SAFETY: `snapshot` was opened above and is not used afterwards.
-    let _ = unsafe { CloseHandle(snapshot) };
-    ids
 }
 
-/// Opens a thread with full access, or `None` if it has already exited.
-fn open_thread(id: u32) -> Option<HANDLE> {
-    // SAFETY: opening a thread has no memory preconditions.
-    unsafe { OpenThread(THREAD_ALL_ACCESS, false, id) }.ok()
-}
-
-/// Installs every patch in the order the original uses.
+/// Port of `RunPatching`: installs every patch through the lifecycle.
 fn run_patching() {
-    // SAFETY: the current process handle is a pseudo-handle.
-    let _ = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) };
-
-    if let Err(message) = arxan::install() {
-        debug_print(&format!("T7 Patch: {message}\n"));
-        return;
+    if !LIFECYCLE.install(&mut PatchOps) {
+        debug_print("T7 Patch: install failed or another lifecycle transition is active.\n");
     }
-
-    let _ = ffi::initialize();
-
-    if protection::CUSTOM_NAME[0].load(Ordering::Relaxed) == 0 {
-        // As in the C++, only the local copy is set here, not the game's name buffers.
-        let _ = protection::set_custom_name(DEFAULT_PLAYER_NAME);
-    }
-
-    protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
-
-    hooks::apply_vmt_hooks();
-    hooks::apply_hooks();
-    hooks::apply_memory_patches();
-
-    // SAFETY: called once from inside the game process, after its patches are in place.
-    unsafe { exception::install() };
-    // SAFETY: as above.
-    unsafe { protection::install() };
 }
 
 /// Port of the exported `SetFriendsOnly`.
@@ -171,45 +236,12 @@ pub unsafe extern "C" fn zbr_run_gamemode_lui(input: *const c_char) {
     }
 }
 
-/// Removes the patch: clears debug registers, unhooks, and resumes the other threads.
+/// Port of the fork's `Unload`: a logical deactivation that restores everything the patch
+/// changed. Callers must not `FreeLibrary` while game callbacks are in flight.
 #[unsafe(no_mangle)]
 pub extern "C" fn Unload() {
-    for id in other_thread_ids() {
-        let Some(thread) = open_thread(id) else {
-            continue;
-        };
-        // SAFETY: `thread` is a valid handle; it is closed after use.
-        unsafe {
-            SuspendThread(thread);
-            let mut context = CONTEXT {
-                ContextFlags: CONTEXT_FLAGS(CONTEXT_DEBUG_REGISTERS),
-                ..Default::default()
-            };
-            if GetThreadContext(thread, &raw mut context).is_ok() {
-                context.Dr7 = 0;
-                context.ContextFlags = CONTEXT_FLAGS(CONTEXT_DEBUG_REGISTERS);
-                let _ = SetThreadContext(thread, &raw const context);
-            }
-            let _ = CloseHandle(thread);
-        }
-    }
-
-    // SAFETY: the protection hooks were installed by `run_patching`.
-    unsafe { protection::uninstall() };
-    exception::IS_UNHOOKING.store(true, Ordering::Release);
-    // SAFETY: the exception hook was installed by `run_patching`.
-    unsafe { exception::uninstall() };
-    // Not in the C++: disable the detours so none jumps into this DLL after it is freed.
-    hooks::destroy_hooks();
-
-    for id in other_thread_ids() {
-        if let Some(thread) = open_thread(id) {
-            // SAFETY: `thread` is a valid handle; it is closed after use.
-            unsafe {
-                ResumeThread(thread);
-                let _ = CloseHandle(thread);
-            }
-        }
+    if !LIFECYCLE.unload(&mut PatchOps) {
+        debug_print("T7 Patch: unload failed or the patch is not active.\n");
     }
 }
 

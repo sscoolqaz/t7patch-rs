@@ -22,6 +22,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use windows::Win32::System::Diagnostics::Debug::{OutputDebugStringA, ReadProcessMemory};
@@ -123,8 +124,10 @@ type HksObjectToStringFn = unsafe extern "system" fn(
 type LuaPushLStringFn =
     unsafe extern "system" fn(lua_state: *mut i64, value: *const c_char, length: usize);
 
-static ORIGINAL_LUA_STATE_MANAGER_ERROR: OnceLock<LuaStateManagerErrorFn> = OnceLock::new();
-static ORIGINAL_HKSI_LUA_GET_INFO: OnceLock<HksiLuaGetInfoFn> = OnceLock::new();
+/// Trampolines of the two hooks, or 0 before they are created. Atomics rather than
+/// `OnceLock`s, so a retry after a rolled-back partial creation stores its new trampolines.
+static ORIGINAL_LUA_STATE_MANAGER_ERROR: AtomicUsize = AtomicUsize::new(0);
+static ORIGINAL_HKSI_LUA_GET_INFO: AtomicUsize = AtomicUsize::new(0);
 /// Serialises symbol loading and stack rewriting, as the C++ `SRWLOCK` does.
 ///
 /// `std::sync::Mutex` is exclusive and non-reentrant, like the exclusive
@@ -971,9 +974,12 @@ unsafe extern "system" fn hksi_lua_get_info_hook(
     what: *const c_char,
     debug_record: *mut c_void,
 ) -> i32 {
-    let Some(original) = ORIGINAL_HKSI_LUA_GET_INFO.get().copied() else {
+    let address = ORIGINAL_HKSI_LUA_GET_INFO.load(Ordering::Acquire);
+    if address == 0 {
         return 0;
-    };
+    }
+    // SAFETY: the slot holds the MinHook trampoline for HksiLuaGetInfo.
+    let original: HksiLuaGetInfoFn = unsafe { trampoline(address) };
     // SAFETY: forwards the game's own arguments to the original function.
     let result = unsafe { original(lua_state, what, debug_record) };
     if result == 0 || debug_record.is_null() {
@@ -1023,7 +1029,10 @@ unsafe extern "system" fn lua_state_manager_error_hook(error: *const c_char, lua
             ));
         }
     }
-    if let Some(original) = ORIGINAL_LUA_STATE_MANAGER_ERROR.get() {
+    let address = ORIGINAL_LUA_STATE_MANAGER_ERROR.load(Ordering::Acquire);
+    if address != 0 {
+        // SAFETY: the slot holds the MinHook trampoline for LuaStateManagerError.
+        let original: LuaStateManagerErrorFn = unsafe { trampoline(address) };
         // SAFETY: forwards the game's own arguments to the original function.
         unsafe { original(error, lua_state) };
     }
@@ -1032,34 +1041,30 @@ unsafe extern "system" fn lua_state_manager_error_hook(error: *const c_char, lua
 /// Creates the `HksiLuaGetInfo` and `LuaStateManagerError` hooks.
 ///
 /// Port of `lua_symbols::InstallHooks`. As in the C++ source, the hooks are
-/// created but not enabled here, and a failed create is ignored. In that case the
-/// original stays unset and the detour is never reached.
-pub fn install_hooks() {
+/// created but not enabled here. As in the fork, a failed create is an error.
+pub fn install_hooks() -> Result<(), String> {
     // SAFETY: the target is the HksiLuaGetInfo entry point of the running build. The
     // detour has the same signature.
-    if let Ok(original) = unsafe {
+    let original = unsafe {
         ffi::create_hook(
             offsets::address(HKSI_LUA_GET_INFO_RVA),
             hksi_lua_get_info_hook as HksiLuaGetInfoFn as usize,
         )
-    } {
-        // SAFETY: `original` is the MinHook trampoline for HksiLuaGetInfo, which has
-        // the `HksiLuaGetInfoFn` signature.
-        let _ = ORIGINAL_HKSI_LUA_GET_INFO.set(unsafe { trampoline(original) });
     }
+    .map_err(|error| format!("T7 Patch: MH_CreateHook failed for HksiLuaGetInfo: {error}"))?;
+    ORIGINAL_HKSI_LUA_GET_INFO.store(original, Ordering::Release);
 
     // SAFETY: the target is the LuaStateManagerError entry point of the running build. The
     // detour has the same signature.
-    if let Ok(original) = unsafe {
+    let original = unsafe {
         ffi::create_hook(
             offsets::address(LUA_STATE_MANAGER_ERROR_RVA),
             lua_state_manager_error_hook as LuaStateManagerErrorFn as usize,
         )
-    } {
-        // SAFETY: `original` is the MinHook trampoline for LuaStateManagerError, which has
-        // the `LuaStateManagerErrorFn` signature.
-        let _ = ORIGINAL_LUA_STATE_MANAGER_ERROR.set(unsafe { trampoline(original) });
     }
+    .map_err(|error| format!("T7 Patch: MH_CreateHook failed for LuaStateManagerError: {error}"))?;
+    ORIGINAL_LUA_STATE_MANAGER_ERROR.store(original, Ordering::Release);
+    Ok(())
 }
 
 #[cfg(test)]

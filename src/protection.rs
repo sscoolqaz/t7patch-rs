@@ -12,11 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, OsString, c_char, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStringExt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD, RaiseException};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Memory::{
@@ -24,7 +26,11 @@ use windows::Win32::System::Memory::{
     PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::{CreateThread, Sleep, THREAD_CREATION_FLAGS};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateThread, GetCurrentThreadId, GetThreadId, INFINITE, SetEvent,
+    THREAD_CREATION_FLAGS, WaitForSingleObject,
+};
+use windows::core::PCWSTR;
 
 use crate::fnv::fnv1a;
 use crate::gscu_hash::notify_hash;
@@ -479,6 +485,7 @@ pub static O_IS_PROCESSOR_FEATURE_PRESENT: AtomicUsize = AtomicUsize::new(0);
 /// `PrivatePassword[3]`: previous password hash, current hash, and tick count.
 pub static PRIVATE_PASSWORD: Mutex<[i64; 3]> = Mutex::new([0; 3]);
 /// Originals of hooked Steam vtable slots, keyed by interface address then slot index.
+/// Filled once by [`initialize`] and never changed afterwards.
 pub static STEAM_API_HOOKS: Mutex<BTreeMap<usize, BTreeMap<usize, usize>>> =
     Mutex::new(BTreeMap::new());
 /// Lobby message handlers keyed by message type (a `BYTE` in the original).
@@ -567,22 +574,6 @@ unsafe fn read_usize(address: usize) -> usize {
 unsafe fn read_i64(address: usize) -> i64 {
     // SAFETY: the caller guarantees eight readable bytes at `address`.
     unsafe { (address as *const i64).read_unaligned() }
-}
-
-/// # Safety
-///
-/// `address` must be writable for eight bytes.
-unsafe fn write_usize(address: usize, value: usize) {
-    // SAFETY: the caller guarantees eight writable bytes at `address`.
-    unsafe { (address as *mut usize).write_unaligned(value) }
-}
-
-/// # Safety
-///
-/// `address` must be writable for eight bytes.
-unsafe fn write_i64(address: usize, value: i64) {
-    // SAFETY: the caller guarantees eight writable bytes at `address`.
-    unsafe { (address as *mut i64).write_unaligned(value) }
 }
 
 /// # Safety
@@ -964,28 +955,69 @@ pub mod iat_hook {
 // ---------------------------------------------------------------------------
 
 /// Port of `Protection::SwapSteamAPIPointer`. Replaces vtable slot `index` of the
-/// Steam interface whose global lives at `library`, and records the original.
+/// Steam interface whose global lives at `library`. The original must already be in the
+/// snapshot [`initialize`] takes; this function never records anything.
 ///
 /// # Safety
 ///
 /// `library` must be the address of a loaded Steam interface global and `index`
 /// a valid slot of its vtable. `replacement` must match that slot's signature.
-pub unsafe fn swap_steam_api_pointer(library: usize, index: usize, replacement: usize) {
-    // SAFETY: the Steam interface global and its vtable are mapped while Steam is loaded.
-    let steam_library = unsafe { read_usize(library) };
-    let vtable = unsafe { read_usize(steam_library) };
-    let slot = vtable + index * 8;
-    // SAFETY: `slot` is a vtable entry.
-    let original = unsafe { read_usize(slot) };
-    lock(&STEAM_API_HOOKS)
-        .entry(library)
-        .or_default()
-        .insert(index, original);
-
-    // SAFETY: `slot` is a vtable entry; nothing is written if it cannot be made writable.
-    if !unsafe { crate::arxan::write_usize(slot, replacement) } {
-        crate::dllmain::debug_print("T7 Patch: could not write a Steam vtable slot\n");
+pub unsafe fn swap_steam_api_pointer(
+    library: usize,
+    index: usize,
+    replacement: usize,
+) -> Result<(), String> {
+    let prepared = lock(&STEAM_API_HOOKS)
+        .get(&library)
+        .is_some_and(|slots| slots.contains_key(&index));
+    if !prepared {
+        return Err("T7 Patch: Steam originals were not prepared".to_owned());
     }
+    // SAFETY: the Steam interface global and its vtable are mapped while Steam is loaded.
+    let vtable = unsafe { steam_vtable(library) }?;
+    // SAFETY: `vtable + index * 8` is a vtable entry; nothing is written if it cannot be
+    // made writable.
+    if !unsafe { crate::arxan::write_usize(vtable + index * 8, replacement) } {
+        return Err("T7 Patch: cannot write a Steam vtable slot".to_owned());
+    }
+    Ok(())
+}
+
+/// Reads the vtable of the Steam interface whose global lives at `library`.
+///
+/// # Safety
+///
+/// `library` must be the address of a Steam interface global.
+unsafe fn steam_vtable(library: usize) -> Result<usize, String> {
+    // SAFETY: the caller guarantees `library` is a readable interface global.
+    let instance = unsafe { read_usize(library) };
+    if instance == 0 {
+        return Err("T7 Patch: Steam interface is not ready".to_owned());
+    }
+    // SAFETY: a non-null Steam interface begins with its vtable pointer.
+    let vtable = unsafe { read_usize(instance) };
+    if vtable == 0 {
+        return Err("T7 Patch: Steam VMT is not ready".to_owned());
+    }
+    Ok(vtable)
+}
+
+/// The nine Steam vtable slots the patch replaces, as `(interface global, slot index)`.
+fn steam_slots() -> [(usize, usize); 9] {
+    [
+        (steam_user(), STEAMAPI_STEAMUSER_GETUSERNAME),
+        (steam_user(), STEAMAPI_STEAMUSER_VT_NAMEBYXUID),
+        (steam_interface(), STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT),
+        (steam_interface(), STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT2),
+        (steam_interface(), STEAMAPI_INTERFACE_IS_VAC_BANNED),
+        (
+            steam_interface(),
+            STEAMAPI_INTERFACE_GET_DLC_DOWNLOAD_PROGRESS,
+        ),
+        (steam_matchmaking(), STEAMAPI_MATCHMAKING_GETLOBBYCHATENTRY),
+        (steam_matchmaking(), STEAMAPI_MATCHMAKING_CREATELOBBY),
+        (steam_networking(), STEAMAPI_NETWORKING_READP2PPACKET),
+    ]
 }
 
 /// Port of `Protection::GetUsernamePtr`.
@@ -1617,35 +1649,143 @@ unsafe fn load_settings_initial() {
     unsafe { apply_settings(&snapshot) };
 }
 
-/// Port of `MainThread`. Polls the settings file once a second and reapplies it on change.
+/// Port of `MainThread`. Polls the settings file once a second and reapplies it on change,
+/// until the stop event passed as `param` is signalled.
 ///
 /// # Safety
 ///
-/// Started with `CreateThread`; runs for the life of the process.
-unsafe extern "system" fn main_thread(_param: *mut c_void) -> u32 {
+/// Started by [`ManagedWorker::start`] with its stop event as `param`, which stays open
+/// until this thread has exited.
+unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
+    let stop = HANDLE(param);
     let mut seed = unix_time_seed();
     let value = msvc_rand(&mut seed);
     // SAFETY: the random-seed global is an int-sized game variable.
     unsafe { write_i32(address(offsets::RANDOM_SEED_GLOBAL), value) };
     let path = Path::new(PATCH_CONFIG_LOCATION);
-    loop {
-        arxan_bypass_maintain();
-        let changed = {
-            let mut cfg = lock(&USER_CONFIG);
-            if cfg.update_watcher_time(path) {
-                cfg.loadfrom(path);
-                Some(cfg.snapshot())
-            } else {
-                None
+    // SAFETY: `stop` is the worker's open event handle.
+    while unsafe { WaitForSingleObject(stop, 1000) } == WAIT_TIMEOUT {
+        // A panic must neither end the worker, which would make it unstoppable by event,
+        // nor unwind into the OS thread start routine.
+        let refreshed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            arxan_bypass_maintain();
+            let changed = {
+                let mut cfg = lock(&USER_CONFIG);
+                if cfg.update_watcher_time(path) {
+                    cfg.loadfrom(path);
+                    Some(cfg.snapshot())
+                } else {
+                    None
+                }
+            };
+            if let Some(cfg) = changed {
+                // SAFETY: the game is running.
+                unsafe { apply_settings(&cfg) };
             }
-        };
-        if let Some(cfg) = changed {
-            // SAFETY: the game is running.
-            unsafe { apply_settings(&cfg) };
+        }));
+        if refreshed.is_err() {
+            crate::dllmain::debug_print(
+                "T7 Patch: config refresh failed; worker remains stoppable.\n",
+            );
         }
-        // SAFETY: `Sleep` takes a plain millisecond count.
-        unsafe { Sleep(1000) };
     }
+    0
+}
+
+/// Port of the fork's `ManagedWorker`: a thread with a manual-reset stop event. The handles
+/// are kept as integers so the worker can live in a `static Mutex`.
+struct ManagedWorker {
+    stop: usize,
+    thread: usize,
+}
+
+impl ManagedWorker {
+    const fn new() -> Self {
+        Self { stop: 0, thread: 0 }
+    }
+
+    const fn running(&self) -> bool {
+        self.thread != 0
+    }
+
+    /// Starts `entry` with the stop event as its parameter. Does nothing if already running.
+    fn start(
+        &mut self,
+        entry: unsafe extern "system" fn(*mut c_void) -> u32,
+    ) -> Result<(), String> {
+        if self.running() {
+            return Ok(());
+        }
+        // SAFETY: creates an unnamed manual-reset event, initially unsignalled.
+        let stop = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(|_| "T7 Patch: cannot create worker stop event".to_owned())?;
+        // SAFETY: `entry` takes the stop event, which stays open until the thread is joined.
+        let thread = unsafe {
+            CreateThread(
+                None,
+                0,
+                Some(entry),
+                Some(stop.0.cast_const()),
+                THREAD_CREATION_FLAGS(0),
+                None,
+            )
+        };
+        let Ok(thread) = thread else {
+            // SAFETY: `stop` was created above and no thread uses it.
+            let _ = unsafe { CloseHandle(stop) };
+            return Err("T7 Patch: cannot create config worker".to_owned());
+        };
+        self.stop = stop.0 as usize;
+        self.thread = thread.0 as usize;
+        Ok(())
+    }
+
+    /// Signals the stop event and waits for the thread to exit. Refuses to join itself.
+    fn stop(&mut self) -> Result<(), String> {
+        if !self.running() {
+            return Ok(());
+        }
+        let thread = HANDLE(self.thread as *mut c_void);
+        let stop = HANDLE(self.stop as *mut c_void);
+        // SAFETY: `thread` is the worker's open handle; the id queries have no preconditions.
+        if unsafe { GetThreadId(thread) == GetCurrentThreadId() } {
+            return Err("T7 Patch: config worker cannot join itself".to_owned());
+        }
+        // SAFETY: both handles are open until closed below.
+        let joined = unsafe {
+            SetEvent(stop).is_ok() && WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0
+        };
+        if !joined {
+            return Err("T7 Patch: cannot join config worker".to_owned());
+        }
+        // SAFETY: the thread has exited, so neither handle is used again.
+        unsafe {
+            let _ = CloseHandle(thread);
+            let _ = CloseHandle(stop);
+        }
+        self.thread = 0;
+        self.stop = 0;
+        Ok(())
+    }
+}
+
+static CONFIG_WORKER: Mutex<ManagedWorker> = Mutex::new(ManagedWorker::new());
+
+/// Port of `Protection::start_worker`. Starts the settings watcher on the injectorless path,
+/// unless it is already running.
+pub fn start_worker() -> Result<(), String> {
+    let mut worker = lock(&CONFIG_WORKER);
+    if IS_INJECTORLESS_INSTALL.load(Ordering::Relaxed) && !worker.running() {
+        // SAFETY: the game is running; this is called by the patch lifecycle.
+        unsafe { load_settings_initial() };
+        worker.start(main_thread)?;
+    }
+    Ok(())
+}
+
+/// Port of `Protection::stop_worker`. Stops and joins the settings watcher if it runs.
+pub fn stop_worker() -> Result<(), String> {
+    lock(&CONFIG_WORKER).stop()
 }
 
 /// Re-applies the Arxan bypass if the game restored it. Called once per second by the main thread.
@@ -2673,14 +2813,29 @@ unsafe fn copy_name_into_game() {
     }
 }
 
-/// Port of `Protection::install`.
+/// Set once [`initialize`] has finished. Callbacks from an earlier activation may still be
+/// running, so the one-time state is never rebuilt.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Set before the `IsProcessorFeaturePresent` IAT entry is written.
+static IAT_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Set before the lobby-message print marker is written.
+static LOBBY_MARKER_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Set before the update-preload pointer is written.
+static PRELOAD_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// The update-preload pointer captured before it was replaced.
+static ORIGINAL_PRELOAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Port of the fork's `Protection::initialize`. Runs once: resolves the game function table,
+/// caches the local XUID, clears the network password, registers the lobby packet
+/// callbacks, and snapshots the original of every Steam vtable slot the patch replaces.
 ///
 /// # Safety
 ///
-/// Must run once, inside the game process, after the executable is mapped and
-/// before any lobby message is dispatched.
-#[allow(clippy::too_many_lines)]
-pub unsafe fn install() {
+/// Must run inside the game process after the executable is mapped and Steam is loaded.
+pub unsafe fn initialize() -> Result<(), String> {
+    if INITIALIZED.load(Ordering::Acquire) {
+        return Ok(());
+    }
     // SAFETY: called inside the game process; every RVA matches its field's signature.
     let table = unsafe { Game::resolve() };
     let _ = GAME.set(table);
@@ -2688,93 +2843,97 @@ pub unsafe fn install() {
     // SAFETY: reads the local player's XUID from the game's player data.
     CACHED_XUID.store(unsafe { local_player_xuid() }, Ordering::Relaxed);
     set_network_password(0);
+    register_packet_callbacks();
 
+    let mut snapshot: BTreeMap<usize, BTreeMap<usize, usize>> = BTreeMap::new();
+    for (library, index) in steam_slots() {
+        // SAFETY: `library` is a Steam interface global of the running game.
+        let vtable = unsafe { steam_vtable(library) }?;
+        // SAFETY: `index` is a slot of that interface's vtable.
+        let original = unsafe { read_usize(vtable + index * 8) };
+        snapshot.entry(library).or_default().insert(index, original);
+    }
+    *lock(&STEAM_API_HOOKS) = snapshot;
+
+    INITIALIZED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Port of `Protection::install`. Each write records what it replaced before it happens,
+/// so [`uninstall`] can undo a partial install.
+///
+/// # Safety
+///
+/// Must run inside the game process after [`initialize`], before any lobby message is
+/// dispatched.
+pub unsafe fn install() -> Result<(), String> {
     // SAFETY: the game is running, so its name buffers are mapped.
     unsafe { copy_name_into_game() };
+
+    // Save the actual IAT entry, which may already belong to another module.
+    // SAFETY: the main module is the image whose import table holds `IsProcessorFeaturePresent`.
+    let Some(iat) = (unsafe { iat_hook::find(c"IsProcessorFeaturePresent", 0) }) else {
+        return Err("T7 Patch: missing IsProcessorFeaturePresent import".to_owned());
+    };
+    // SAFETY: `iat` is an IAT entry inside the mapped image.
+    let original = unsafe { iat.read_unaligned() };
+    O_IS_PROCESSOR_FEATURE_PRESENT.store(original, Ordering::Release);
+    IAT_INSTALLED.store(true, Ordering::Release);
 
     // SAFETY: reads the game's networking global at +0x10, as the original does.
     let networking_slot = unsafe { read_usize(steam_networking() + 0x10) };
     O_READ_P2P_PACKET.store(networking_slot, Ordering::Relaxed);
 
-    // SAFETY: the main module is the image whose import table holds `IsProcessorFeaturePresent`.
-    let original = unsafe {
-        iat_hook::detour_iat_ptr(
-            c"IsProcessorFeaturePresent",
+    // SAFETY: `iat` is an IAT entry; nothing is written if its page cannot be made writable.
+    if !unsafe {
+        crate::arxan::write_usize(
+            iat as usize,
             is_processor_feature_present as *const () as usize,
-            0,
         )
-    };
-    O_IS_PROCESSOR_FEATURE_PRESENT.store(original, Ordering::Relaxed);
-
-    // SAFETY: each slot is a valid vtable entry and each replacement matches its signature.
-    unsafe {
-        swap_steam_api_pointer(
-            steam_user(),
-            STEAMAPI_STEAMUSER_GETUSERNAME,
-            get_username_ptr as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_user(),
-            STEAMAPI_STEAMUSER_VT_NAMEBYXUID,
-            get_username_xuid_ptr as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_interface(),
-            STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT,
-            get_owns_content as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_interface(),
-            STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT2,
-            get_owns_content2 as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_interface(),
-            STEAMAPI_INTERFACE_IS_VAC_BANNED,
-            is_vac_banned as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_interface(),
-            STEAMAPI_INTERFACE_GET_DLC_DOWNLOAD_PROGRESS,
-            get_dlc_download_progress as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_matchmaking(),
-            STEAMAPI_MATCHMAKING_GETLOBBYCHATENTRY,
-            get_lobby_chat_entry as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_matchmaking(),
-            STEAMAPI_MATCHMAKING_CREATELOBBY,
-            create_lobby as *const () as usize,
-        );
-        swap_steam_api_pointer(
-            steam_networking(),
-            STEAMAPI_NETWORKING_READP2PPACKET,
-            read_p2p_packet as *const () as usize,
-        );
+    } {
+        return Err("T7 Patch: cannot write the IsProcessorFeaturePresent import".to_owned());
     }
 
-    // SAFETY: the update-preload pointer is a writable game global.
-    unsafe {
-        write_usize(
-            address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN),
-            cl_switch_state_idle_update as *const () as usize,
-        );
+    let replacements = [
+        get_username_ptr as *const () as usize,
+        get_username_xuid_ptr as *const () as usize,
+        get_owns_content as *const () as usize,
+        get_owns_content2 as *const () as usize,
+        is_vac_banned as *const () as usize,
+        get_dlc_download_progress as *const () as usize,
+        get_lobby_chat_entry as *const () as usize,
+        create_lobby as *const () as usize,
+        read_p2p_packet as *const () as usize,
+    ];
+    for ((library, index), replacement) in steam_slots().into_iter().zip(replacements) {
+        // SAFETY: each slot is a valid vtable entry and each replacement matches its signature.
+        unsafe { swap_steam_api_pointer(library, index, replacement) }?;
     }
 
-    register_packet_callbacks();
+    let preload = address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN);
+    // SAFETY: the update-preload pointer is a game global.
+    ORIGINAL_PRELOAD.store(unsafe { read_usize(preload) }, Ordering::Release);
+    PRELOAD_INSTALLED.store(true, Ordering::Release);
+    // SAFETY: as above; nothing is written if it cannot be made writable.
+    if !unsafe {
+        crate::arxan::write_usize(preload, cl_switch_state_idle_update as *const () as usize)
+    } {
+        return Err("T7 Patch: cannot write the update-preload pointer".to_owned());
+    }
 
     let prints = address(offsets::PTR_LOBBYMSGPRINTS);
-    // SAFETY: the print global is a writable game variable.
-    unsafe {
-        OLD_LOBBYMSG_PRINTS.store(read_i64(prints), Ordering::Relaxed);
-        write_i64(prints, LOBBY_MSG_MARKER.cast_signed());
-    }
+    // SAFETY: the print global is a game variable.
+    OLD_LOBBYMSG_PRINTS.store(unsafe { read_i64(prints) }, Ordering::Release);
+    // Publish the return address before the marker that makes the exception path read it.
     CACHED_RETN_ADDY.store(
         addr_i64(address(offsets::PTR_SAVE_LOBBY_MSG_EXCEPT_ADDY)),
-        Ordering::Relaxed,
+        Ordering::Release,
     );
+    LOBBY_MARKER_INSTALLED.store(true, Ordering::Release);
+    // SAFETY: as above; nothing is written if it cannot be made writable.
+    if !unsafe { crate::arxan::write_bytes(prints, &LOBBY_MSG_MARKER.to_le_bytes()) } {
+        return Err("T7 Patch: cannot write the lobby-message marker".to_owned());
+    }
 
     // SAFETY: the create-lobby function takes one pointer-sized argument and has no return value.
     unsafe {
@@ -2791,107 +2950,81 @@ pub unsafe fn install() {
         dvar_set_from_string_by_name(c"g_allowvote", c"0", true);
         dvar_set_from_string_by_name(c"maxvoicepacketsperframe", c"0", true);
     }
-
-    if IS_INJECTORLESS_INSTALL.load(Ordering::Relaxed) {
-        // SAFETY: the game is running.
-        unsafe { load_settings_initial() };
-        // SAFETY: the thread entry takes one pointer and runs for the life of the process.
-        let _ = unsafe {
-            CreateThread(
-                None,
-                0,
-                Some(main_thread),
-                None,
-                THREAD_CREATION_FLAGS(0),
-                None,
-            )
-        };
-    }
+    Ok(())
 }
 
-/// Port of `Protection::uninstall`. Restores the hooked game and Steam entries.
+/// Port of `Protection::uninstall`. Restores the Steam vtable snapshot and every game entry
+/// [`install`] recorded, trying all of them, then reports any failure. The snapshot and the
+/// trampolines stay alive for callbacks already in flight.
 ///
 /// # Safety
 ///
-/// Must run once, after [`install`], while the game is still running.
-pub unsafe fn uninstall() {
-    // SAFETY: the print global is the game variable installed over.
-    unsafe {
-        write_i64(
-            address(offsets::PTR_LOBBYMSGPRINTS),
-            OLD_LOBBYMSG_PRINTS.load(Ordering::Relaxed),
+/// Must run inside the game process while the game is still running.
+pub unsafe fn uninstall() -> Result<(), String> {
+    let mut failures: Vec<&str> = Vec::new();
+
+    let snapshot = lock(&STEAM_API_HOOKS).clone();
+    for (library, slots) in &snapshot {
+        // SAFETY: `library` is a Steam interface global recorded by `initialize`.
+        let Ok(vtable) = (unsafe { steam_vtable(*library) }) else {
+            failures.push("Steam interface");
+            continue;
+        };
+        for (index, original) in slots {
+            // SAFETY: restores the snapshot value of the same vtable entry.
+            if !unsafe { crate::arxan::write_usize(vtable + index * 8, *original) } {
+                failures.push("Steam vtable slot");
+            }
+        }
+    }
+
+    if LOBBY_MARKER_INSTALLED.load(Ordering::Acquire) {
+        let old = OLD_LOBBYMSG_PRINTS.load(Ordering::Acquire);
+        // SAFETY: the print global is the game variable `install` wrote.
+        if unsafe {
+            crate::arxan::write_bytes(address(offsets::PTR_LOBBYMSGPRINTS), &old.to_le_bytes())
+        } {
+            LOBBY_MARKER_INSTALLED.store(false, Ordering::Release);
+        } else {
+            failures.push("lobby-message marker");
+        }
+    }
+
+    if PRELOAD_INSTALLED.load(Ordering::Acquire) {
+        let original = ORIGINAL_PRELOAD.load(Ordering::Acquire);
+        // SAFETY: the update-preload pointer is the game global `install` wrote.
+        if unsafe {
+            crate::arxan::write_usize(address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN), original)
+        } {
+            PRELOAD_INSTALLED.store(false, Ordering::Release);
+        } else {
+            failures.push("update-preload pointer");
+        }
+    }
+
+    if IAT_INSTALLED.load(Ordering::Acquire) {
+        let original = O_IS_PROCESSOR_FEATURE_PRESENT.load(Ordering::Acquire);
+        // SAFETY: the main module's import table was read by `install`.
+        let restored = unsafe { iat_hook::find(c"IsProcessorFeaturePresent", 0) }.is_some_and(
+            // SAFETY: `slot` is the IAT entry `install` replaced, and `original` its old value.
+            |slot| unsafe { crate::arxan::write_usize(slot as usize, original) },
         );
-    };
+        if restored {
+            IAT_INSTALLED.store(false, Ordering::Release);
+        } else {
+            failures.push("IsProcessorFeaturePresent import");
+        }
+    }
+
     set_network_password(0);
-    // SAFETY: the saved original is the real `IsProcessorFeaturePresent`.
-    unsafe {
-        iat_hook::detour_iat_ptr(
-            c"IsProcessorFeaturePresent",
-            O_IS_PROCESSOR_FEATURE_PRESENT.load(Ordering::Relaxed),
-            0,
-        );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "T7 Patch: protection restoration failed: {}",
+            failures.join(", ")
+        ))
     }
-
-    let user = steam_user();
-    let interface = steam_interface();
-    let matchmaking = steam_matchmaking();
-    let networking = steam_networking();
-    // SAFETY: each original was recorded by `install`, so it matches its slot.
-    unsafe {
-        swap_steam_api_pointer(
-            user,
-            STEAMAPI_STEAMUSER_GETUSERNAME,
-            get_original_steam_ptr(user, STEAMAPI_STEAMUSER_GETUSERNAME),
-        );
-        swap_steam_api_pointer(
-            user,
-            STEAMAPI_STEAMUSER_VT_NAMEBYXUID,
-            get_original_steam_ptr(user, STEAMAPI_STEAMUSER_VT_NAMEBYXUID),
-        );
-        swap_steam_api_pointer(
-            interface,
-            STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT,
-            get_original_steam_ptr(interface, STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT),
-        );
-        swap_steam_api_pointer(
-            interface,
-            STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT2,
-            get_original_steam_ptr(interface, STEAMAPI_INTERFACE_CHECK_OWNS_CONTENT2),
-        );
-        swap_steam_api_pointer(
-            interface,
-            STEAMAPI_INTERFACE_IS_VAC_BANNED,
-            get_original_steam_ptr(interface, STEAMAPI_INTERFACE_IS_VAC_BANNED),
-        );
-        swap_steam_api_pointer(
-            interface,
-            STEAMAPI_INTERFACE_GET_DLC_DOWNLOAD_PROGRESS,
-            get_original_steam_ptr(interface, STEAMAPI_INTERFACE_GET_DLC_DOWNLOAD_PROGRESS),
-        );
-        swap_steam_api_pointer(
-            matchmaking,
-            STEAMAPI_MATCHMAKING_GETLOBBYCHATENTRY,
-            get_original_steam_ptr(matchmaking, STEAMAPI_MATCHMAKING_GETLOBBYCHATENTRY),
-        );
-        swap_steam_api_pointer(
-            matchmaking,
-            STEAMAPI_MATCHMAKING_CREATELOBBY,
-            get_original_steam_ptr(matchmaking, STEAMAPI_MATCHMAKING_CREATELOBBY),
-        );
-        swap_steam_api_pointer(
-            networking,
-            STEAMAPI_NETWORKING_READP2PPACKET,
-            get_original_steam_ptr(networking, STEAMAPI_NETWORKING_READP2PPACKET),
-        );
-    }
-
-    // SAFETY: the update-preload pointer is a writable game global.
-    unsafe {
-        write_usize(
-            address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN),
-            address(offsets::CL_SWITCH_STATE_IDLE_UPDATE),
-        );
-    };
 }
 
 // ---------------------------------------------------------------------------

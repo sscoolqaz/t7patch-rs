@@ -20,9 +20,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD, RtlPcToFileHeader};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameA, GetModuleHandleA, GetProcAddress};
-use windows::Win32::System::Memory::{
-    PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtect,
-};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, OpenProcess, OpenThread, PROCESS_ALL_ACCESS,
     THREAD_ALL_ACCESS,
@@ -44,12 +41,14 @@ const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 const UNKNOWN_MODULE: &str = "<Unknown Module>";
 const CLIENTFIELD_DOESNT_EXIST: &CStr = c"Clientfield does not exist";
 
-/// Set while the hook is being removed, so the next fault resumes cleanly.
-pub static IS_UNHOOKING: AtomicBool = AtomicBool::new(false);
 /// Thread id currently writing the crash log, or 0 when nobody is.
 static LCK_DUMPING: AtomicU32 = AtomicU32::new(0);
 /// Pointer slot the hook was written into, or 0.
 static FN_PTR_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// The callback the pointer slot held before the hook was written.
+static ORIGINAL_DISPATCH_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+/// Set just before the dispatcher is patched, so a write that fails partway is still restored.
+static DISPATCHER_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Original stub bytes saved before the Wine-style patch.
 static WINE_OLD_DATA: Mutex<Option<[u8; WINE_HOOK_SIZE]>> = Mutex::new(None);
 static SAVED_EXCEPTIONS: Mutex<Option<HashMap<i64, CONTEXT>>> = Mutex::new(None);
@@ -247,18 +246,6 @@ unsafe fn dump_saved_exceptions(log: &mut std::fs::File, code: i32) {
 /// Called by the process's exception dispatcher with a valid record and context.
 unsafe extern "system" fn exception_hook(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) {
     if record.is_null() || context.is_null() {
-        return;
-    }
-
-    if IS_UNHOOKING.load(Ordering::Acquire) {
-        // SAFETY: `context` is the valid context of the current exception.
-        unsafe {
-            (*context).Dr7 = 0;
-            (*context).Rip = address(offsets::ROP_RETN) as u64;
-        }
-        IS_UNHOOKING.store(false, Ordering::Release);
-        // SAFETY: as above.
-        unsafe { zw_continue(context) };
         return;
     }
 
@@ -498,22 +485,30 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
     }
 }
 
-/// Patches the stub on current Windows, which stores a pointer to the handler.
+/// Patches the stub on current Windows, which stores a pointer to the handler. The slot's
+/// previous value is saved for [`uninstall`].
 ///
 /// # Safety
 ///
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` in ntdll.
-unsafe fn install_pointer_hook(dispatcher: usize, handler: usize) {
+unsafe fn install_pointer_hook(dispatcher: usize, handler: usize) -> Result<(), String> {
     // SAFETY: the dispatcher's first word was checked by the caller to match the pattern.
     let displacement = unsafe { ((dispatcher + 4) as *const i32).read_unaligned() };
     let Some(slot) = rip_relative_target(dispatcher + 8, displacement) else {
-        return;
+        return Err("T7 Patch: exception dispatcher slot is out of range".to_owned());
     };
     FN_PTR_HOOK.store(slot, Ordering::Release);
+    // SAFETY: `slot` is the 8-byte callback pointer the dispatcher loads RIP-relatively.
+    let original = unsafe { (slot as *const usize).read_unaligned() };
+    ORIGINAL_DISPATCH_CALLBACK.store(original, Ordering::Release);
+    DISPATCHER_INSTALLED.store(true, Ordering::Release);
 
     // SAFETY: the slot is an 8-byte pointer inside ntdll's data; nothing is written if it
     // cannot be made writable.
-    unsafe { crate::arxan::write_usize(slot, handler) };
+    if !unsafe { crate::arxan::write_usize(slot, handler) } {
+        return Err("T7 Patch: cannot write the exception dispatcher slot".to_owned());
+    }
+    Ok(())
 }
 
 /// The target of a RIP-relative operand: `next_instruction` plus the signed `disp32`
@@ -537,7 +532,7 @@ fn wine_stub(handler: usize) -> [u8; WINE_HOOK_SIZE] {
 /// # Safety
 ///
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` with the Wine stub.
-unsafe fn install_wine_hook(dispatcher: usize, handler: usize) {
+unsafe fn install_wine_hook(dispatcher: usize, handler: usize) -> Result<(), String> {
     let begin = dispatcher + WINE_KI_DISPATCH_OFFSET;
     let mut old_data = [0u8; WINE_HOOK_SIZE];
     // SAFETY: the stub is WINE_HOOK_SIZE bytes inside ntdll's code.
@@ -545,9 +540,13 @@ unsafe fn install_wine_hook(dispatcher: usize, handler: usize) {
         std::ptr::copy_nonoverlapping(begin as *const u8, old_data.as_mut_ptr(), WINE_HOOK_SIZE);
     };
     *WINE_OLD_DATA.lock().unwrap_or_else(PoisonError::into_inner) = Some(old_data);
+    DISPATCHER_INSTALLED.store(true, Ordering::Release);
 
     // SAFETY: `begin` is the stub described above; it is rewritten with the new bytes.
-    unsafe { crate::arxan::write_bytes(begin, &wine_stub(handler)) };
+    if !unsafe { crate::arxan::write_bytes(begin, &wine_stub(handler)) } {
+        return Err("T7 Patch: cannot write the Wine exception dispatcher stub".to_owned());
+    }
+    Ok(())
 }
 
 /// Restores the Wine-style dispatcher stub.
@@ -555,77 +554,81 @@ unsafe fn install_wine_hook(dispatcher: usize, handler: usize) {
 /// # Safety
 ///
 /// `dispatcher` must be the address of `KiUserExceptionDispatcher` with the patched stub.
-unsafe fn uninstall_wine_hook(dispatcher: usize) {
+unsafe fn uninstall_wine_hook(dispatcher: usize) -> Result<(), String> {
     let saved = *WINE_OLD_DATA.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(old_data) = saved else {
-        return;
+        return Ok(());
     };
     // SAFETY: restores the bytes saved by `install_wine_hook` at the same address.
-    unsafe { crate::arxan::write_bytes(dispatcher + WINE_KI_DISPATCH_OFFSET, &old_data) };
+    if !unsafe { crate::arxan::write_bytes(dispatcher + WINE_KI_DISPATCH_OFFSET, &old_data) } {
+        return Err("T7 Patch: cannot restore the Wine exception dispatcher stub".to_owned());
+    }
+    Ok(())
 }
 
-/// Installs the exception hook into `KiUserExceptionDispatcher`.
+/// Address of `ntdll!KiUserExceptionDispatcher` and the first word of its code, which
+/// selects the layout.
+fn dispatcher_layout() -> Result<(usize, i32), String> {
+    // SAFETY: resolves ntdll's dispatcher export.
+    let dispatcher = unsafe { proc_address("ntdll.dll", s!("KiUserExceptionDispatcher")) };
+    if dispatcher == 0 {
+        return Err("T7 Patch: missing exception dispatcher".to_owned());
+    }
+    // SAFETY: the dispatcher's code is readable; its first word selects the layout.
+    let first_word = unsafe { (dispatcher as *const i32).read_unaligned() };
+    Ok((dispatcher, first_word))
+}
+
+/// Port of the fork's `InstallHook`: installs the exception hook into
+/// `KiUserExceptionDispatcher`. An unknown dispatcher layout is an error.
 ///
 /// # Safety
 ///
 /// Must run inside the game process, after ntdll is loaded.
-pub unsafe fn install() {
-    // SAFETY: resolves ntdll's dispatcher export.
-    let dispatcher = unsafe { proc_address("ntdll.dll", s!("KiUserExceptionDispatcher")) };
-    if dispatcher == 0 {
-        return;
-    }
-
-    // SAFETY: the dispatcher's code is readable; its first word selects the layout.
-    let first_word = unsafe { (dispatcher as *const i32).read_unaligned() };
+pub unsafe fn install() -> Result<(), String> {
+    let (dispatcher, first_word) = dispatcher_layout()?;
+    let handler = exception_hook as *const () as usize;
     if first_word == KI_DISPATCH_PTR_PATTERN {
         // SAFETY: the pattern matches the pointer layout handled by `install_pointer_hook`.
-        unsafe { install_pointer_hook(dispatcher, exception_hook as *const () as usize) };
+        unsafe { install_pointer_hook(dispatcher, handler) }
     } else if first_word == WINE_STUB_PATTERN {
         // SAFETY: the pattern matches the Wine stub handled by `install_wine_hook`.
-        unsafe { install_wine_hook(dispatcher, exception_hook as *const () as usize) };
+        unsafe { install_wine_hook(dispatcher, handler) }
+    } else {
+        Err("T7 Patch: unsupported exception dispatcher".to_owned())
     }
 }
 
-/// Points the dispatcher at a no-op and restores any patched stub.
+/// Port of the fork's `UninstallHook`: restores the dispatcher's original callback, or the
+/// original Wine stub. Does nothing if the hook was never installed.
 ///
 /// # Safety
 ///
-/// Must run inside the game process; the hook must have been installed by [`install`].
-pub unsafe fn uninstall() {
-    // SAFETY: calls the game's INT3 stub, which forces an exception to set up debug registers.
-    unsafe {
-        let trigger: unsafe extern "system" fn() =
-            std::mem::transmute(address(offsets::INT3_2_BO3));
-        trigger();
+/// Must run inside the game process.
+pub unsafe fn uninstall() -> Result<(), String> {
+    if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
+        return Ok(());
     }
-
-    // SAFETY: resolves ntdll's dispatcher export.
-    let dispatcher = unsafe { proc_address("ntdll.dll", s!("KiUserExceptionDispatcher")) };
-    if dispatcher == 0 {
-        return;
-    }
-    // SAFETY: the dispatcher's code is readable; its first word selects the layout.
-    let first_word = unsafe { (dispatcher as *const i32).read_unaligned() };
+    let (dispatcher, first_word) = dispatcher_layout()?;
     if first_word == KI_DISPATCH_PTR_PATTERN {
         let slot = FN_PTR_HOOK.load(Ordering::Acquire);
         if slot != 0 {
-            let mut old = PAGE_PROTECTION_FLAGS(0);
-            // SAFETY: `slot` is the pointer slot written by `install_pointer_hook`.
-            unsafe {
-                let _ = VirtualProtect(slot as *const _, 8, PAGE_EXECUTE_READWRITE, &raw mut old);
-                (slot as *mut usize).write_unaligned(nullsub as *const () as usize);
-                let _ = VirtualProtect(slot as *const _, 8, old, &raw mut old);
+            let original = ORIGINAL_DISPATCH_CALLBACK.load(Ordering::Acquire);
+            // SAFETY: `slot` is the pointer slot written by `install_pointer_hook`, and
+            // `original` is the value it held before.
+            if !unsafe { crate::arxan::write_usize(slot, original) } {
+                return Err("T7 Patch: cannot restore the exception dispatcher slot".to_owned());
             }
         }
     } else if first_word == WINE_STUB_PATTERN {
         // SAFETY: the stub was patched by `install_wine_hook`.
-        unsafe { uninstall_wine_hook(dispatcher) };
+        unsafe { uninstall_wine_hook(dispatcher) }?;
+    } else {
+        return Err("T7 Patch: dispatcher changed before restoration".to_owned());
     }
+    DISPATCHER_INSTALLED.store(false, Ordering::Release);
+    Ok(())
 }
-
-/// Replacement handler that does nothing, used once the hook is removed.
-unsafe extern "system" fn nullsub() {}
 
 #[cfg(test)]
 mod tests {

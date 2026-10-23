@@ -15,10 +15,12 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
-use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::arxan;
 use crate::campaign;
@@ -1713,203 +1715,303 @@ pub unsafe extern "system" fn bg_cache_get_lui_menu_data_for_index(
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Port of `hooks::ApplyVMTHooks`. Copies the lobby object's vtable and points slot 24 at
-/// [`global_instant_message`].
-pub fn apply_vmt_hooks() {
+const LOBBY_VTABLE_LEN: usize = 50;
+/// Lobby vtable copy that slot 24 is redirected through. It has a fixed address and is never
+/// freed, so callbacks still in flight after a restore or reinstall keep a valid table.
+static LOBBY_VTABLE: [AtomicUsize; LOBBY_VTABLE_LEN] =
+    [const { AtomicUsize::new(0) }; LOBBY_VTABLE_LEN];
+/// Slot 24 (byte offset 192): `Global_InstantMessage`.
+const LOBBY_VTABLE_INSTANT_MESSAGE: usize = 192 / 8;
+/// Offset of the lobby object pointer inside the `DW_LOBBY` object.
+const LOBBY_OBJECT_OFFSET: usize = 1384;
+/// Address of the lobby object's vtable pointer while the VMT hook is applied, or 0.
+static LOBBY_VTABLE_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// The vtable pointer the slot held before the VMT hook, or 0.
+static ORIGINAL_LOBBY_VTABLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Port of `hooks::ApplyVMTHooks`. Copies the lobby object's vtable into [`LOBBY_VTABLE`],
+/// points slot 24 at [`global_instant_message`], and swaps the object onto the copy.
+pub fn apply_vmt_hooks() -> Result<(), String> {
     // SAFETY: `DW_LOBBY` is the game's global lobby pointer, readable once the game runs.
     let lobby = unsafe { read_game::<usize>(offsets::address(offsets::DW_LOBBY)) };
-    // SAFETY: `lobby + 1384` holds the object pointer, and the object holds its vtable pointer.
-    let object = unsafe { read_game::<usize>(lobby + 1384) };
-    // SAFETY: as above.
-    let vtable = unsafe { read_game::<usize>(object) };
-
-    let table: &mut [usize; 50] = Box::leak(Box::new([0; 50]));
-    for (index, entry) in table.iter_mut().enumerate() {
-        // SAFETY: the game vtable has at least 50 entries.
-        *entry = unsafe { read_game::<usize>(vtable + index * 8) };
+    if lobby == 0 {
+        return Err("T7 Patch: lobby is not initialized".to_owned());
     }
-    let table_address = table.as_ptr().addr();
-    // SAFETY: `object` is the lobby object, and its vtable slot is writable.
-    unsafe { write_game::<usize>(object, table_address) };
-    // SAFETY: slot 24 of the new table (offset 192) is inside the leaked table.
-    unsafe {
-        write_game::<usize>(
-            table_address + 192,
-            global_instant_message as GlobalInstantMessageFn as *const () as usize,
+    // SAFETY: `lobby + 1384` holds the lobby object pointer.
+    let object = unsafe { read_game::<usize>(lobby + LOBBY_OBJECT_OFFSET) };
+    if object == 0 {
+        return Err("T7 Patch: lobby VMT is not initialized".to_owned());
+    }
+    // SAFETY: the lobby object begins with its vtable pointer.
+    let vtable = unsafe { read_game::<usize>(object) };
+    if vtable == 0 {
+        return Err("T7 Patch: lobby VMT is not initialized".to_owned());
+    }
+
+    for (index, entry) in LOBBY_VTABLE.iter().enumerate() {
+        // SAFETY: the game vtable has at least 50 entries.
+        entry.store(
+            unsafe { read_game::<usize>(vtable + index * 8) },
+            Ordering::Relaxed,
         );
-    };
+    }
+    LOBBY_VTABLE[LOBBY_VTABLE_INSTANT_MESSAGE].store(
+        global_instant_message as GlobalInstantMessageFn as *const () as usize,
+        Ordering::Relaxed,
+    );
+
+    LOBBY_VTABLE_SLOT.store(object, Ordering::Release);
+    ORIGINAL_LOBBY_VTABLE.store(vtable, Ordering::Release);
+    // `AtomicUsize` has the layout of `usize`, so the array is a plain pointer table.
+    let table = LOBBY_VTABLE.as_ptr().addr();
+    // SAFETY: `object` is the lobby object, whose first word is its vtable pointer.
+    if !unsafe { arxan::write_usize(object, table) } {
+        return Err("T7 Patch: cannot write the lobby VMT".to_owned());
+    }
+    Ok(())
 }
 
-/// Writes `bytes` at `address` with the protection changes the C++ makes around each patch.
-fn patch(address: usize, bytes: &[u8]) {
+/// Port of `hooks::RestoreVMTHooks`. Points the lobby object back at its original vtable.
+pub fn restore_vmt_hooks() -> Result<(), String> {
+    let slot = LOBBY_VTABLE_SLOT.load(Ordering::Acquire);
+    let original = ORIGINAL_LOBBY_VTABLE.load(Ordering::Acquire);
+    if slot == 0 || original == 0 {
+        return Ok(());
+    }
+    // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
+    if !unsafe { arxan::write_usize(slot, original) } {
+        return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
+    }
+    LOBBY_VTABLE_SLOT.store(0, Ordering::Release);
+    ORIGINAL_LOBBY_VTABLE.store(0, Ordering::Release);
+    Ok(())
+}
+
+/// Bytes a memory patch replaced, so the patch can be undone.
+struct MemoryPatch {
+    address: usize,
+    original: Vec<u8>,
+}
+
+/// Every applied memory patch, in the order applied.
+static MEMORY_PATCHES: Mutex<Vec<MemoryPatch>> = Mutex::new(Vec::new());
+
+/// Port of `SaveMemoryPatch`. Saves the bytes at `address`, then writes `bytes` over them
+/// with the protection changes the C++ makes around each patch.
+fn patch(address: usize, bytes: &[u8]) -> Result<(), String> {
+    let mut original = vec![0u8; bytes.len()];
+    let mut copied = 0usize;
+    // SAFETY: `original` is writable for `bytes.len()` bytes; `ReadProcessMemory` checks that
+    // the source range is readable instead of faulting.
+    let read = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            original.as_mut_ptr().cast(),
+            bytes.len(),
+            Some(&raw mut copied),
+        )
+    };
+    if read.is_err() || copied != bytes.len() {
+        return Err("T7 Patch: unreadable memory patch target".to_owned());
+    }
+    MEMORY_PATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(MemoryPatch { address, original });
+
     // SAFETY: the callers pass addresses inside the game image, which is committed executable memory.
-    let _ = unsafe { arxan::write_bytes(address, bytes) };
+    if !unsafe { arxan::write_bytes(address, bytes) } {
+        return Err("T7 Patch: cannot write a memory patch".to_owned());
+    }
+    Ok(())
 }
 
 /// Port of `hooks::ApplyMemoryPatches`. Applies the SL, movsx, process-priority and
-/// tokenizer byte patches to the game image.
-pub fn apply_memory_patches() {
+/// tokenizer byte patches to the game image, saving each original first.
+pub fn apply_memory_patches() -> Result<(), String> {
     // SL fix: nop out the calls to com_error.
-    patch(offsets::address(0x1964766), &[0x90; 5]);
-    patch(offsets::address(0x19646A7), &[0x90; 5]);
+    patch(offsets::address(0x1964766), &[0x90; 5])?;
+    patch(offsets::address(0x19646A7), &[0x90; 5])?;
 
-    // Fix movsx issue with package readglob: byte 1 of the dword at 0x1EEACF2 becomes 0xB7.
-    let readglob = offsets::address(0x1EEACF2);
-    // SAFETY: the dword is in the game's code section.
-    let mut word = unsafe { read_game::<[u8; 4]>(readglob) };
-    word[1] = 0xB7;
-    patch(readglob, &word);
+    // Fix movsx issue with package readglob: the opcode byte after 0x1EEACF2 becomes movzx.
+    patch(offsets::address(0x1EEACF2) + 1, &[0xB7])?;
 
     patch(
         offsets::address(offsets::PTR_CMP_TOKENIZE_STRING_INTERNAL),
         &[0x2F],
-    );
+    )?;
 
     // Process priority: above normal.
-    patch(offsets::address(0x22BC1CD), &0x8000i32.to_le_bytes());
-    patch(offsets::address(0x22BC1D2), &0x8000i32.to_le_bytes());
+    patch(offsets::address(0x22BC1CD), &0x8000u32.to_le_bytes())?;
+    patch(offsets::address(0x22BC1D2), &0x8000u32.to_le_bytes())?;
 
     // movsx -> movzx.
-    patch(offsets::address(0x1F21EF8), &[0xB6]);
-    patch(offsets::address(0x1CA4C84), &[0xB6]);
+    patch(offsets::address(0x1F21EF8), &[0xB6])?;
+    patch(offsets::address(0x1CA4C84), &[0xB6])?;
+    Ok(())
+}
+
+/// Port of `hooks::RestoreMemoryPatches`. Restores every saved patch in reverse order,
+/// trying all of them. The saved list is cleared only when every restore succeeds.
+pub fn restore_memory_patches() -> Result<(), String> {
+    let mut patches = MEMORY_PATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut failed = false;
+    for saved in patches.iter().rev() {
+        // SAFETY: each address was patched by `patch`, which read the same range first.
+        if !unsafe { arxan::write_bytes(saved.address, &saved.original) } {
+            failed = true;
+        }
+    }
+    if failed {
+        return Err("T7 Patch: memory restoration failed".to_owned());
+    }
+    patches.clear();
+    Ok(())
 }
 
 /// Creates one `MinHook` hook at `rva`, pointing it at `detour`. When `slot` is given, the
 /// trampoline is stored there.
 ///
-/// As in the C++, a failed create is ignored. The slot then stays 0 and the detour never runs.
-fn hook<F: Copy>(rva: usize, detour: F, slot: Option<&Original<F>>) {
+/// As in the fork's `CreatePatchHook`, a failed create is an error.
+fn hook<F: Copy>(rva: usize, detour: F, slot: Option<&Original<F>>) -> Result<(), String> {
     const { assert!(size_of::<F>() == size_of::<usize>()) };
     // SAFETY: `F` is a function pointer, so its bytes are the detour's entry address.
     let detour_address: usize = unsafe { std::mem::transmute_copy(&detour) };
     // SAFETY: the callers pair `rva` with a detour of the matching signature `F`.
-    let created = unsafe { ffi::create_hook(offsets::address(rva), detour_address) };
-    if let (Ok(trampoline), Some(slot)) = (created, slot) {
+    let trampoline = unsafe { ffi::create_hook(offsets::address(rva), detour_address) }
+        .map_err(|error| format!("T7 Patch: MH_CreateHook failed at {rva:#X}: {error}"))?;
+    if let Some(slot) = slot {
         slot.store(trampoline);
     }
+    Ok(())
 }
 
-/// Port of `hooks::ApplyHooks`. Installs the campaign and Lua hooks, creates every
-/// `MinHook` hook in the C++ order, then enables them all.
+/// Port of `hooks::ApplyHooks`. Creates the campaign and Lua hooks, then every `MinHook`
+/// hook in the C++ order. Nothing is enabled here: the lifecycle enables every hook at once
+/// after the protection module is installed.
 #[allow(clippy::too_many_lines)]
-pub fn apply_hooks() {
+pub fn create_hooks() -> Result<(), String> {
     // The campaign and Lua hooks are created by their own modules, as in the C++.
-    let _ = campaign::install_hooks();
-    lua_symbols::install_hooks();
+    campaign::install_hooks()
+        .map_err(|error| format!("T7 Patch: campaign hook creation failed: {error}"))?;
+    lua_symbols::install_hooks()?;
 
     hook(
         offsets::PTR_LOBBY_MSG_RW_PREP_WRITE_MSG,
         hk_lobby_msg_rw_prep_write_msg as PrepWriteMsgFn,
         Some(&ORIG_LOBBY_MSG_RW_PREP_WRITE_MSG),
-    );
+    )?;
     hook(
         LOBBY_MSG_RW_PREP_READ_MSG,
         hk_lobby_msg_rw_prep_read_msg as PrepReadMsgFn,
         Some(&ORIG_LOBBY_MSG_RW_PREP_READ_MSG),
-    );
+    )?;
     hook(
         COD_GET_BUILD_TITLE,
         hk_cod_get_build_title as BuildTitleFn,
         None,
-    );
+    )?;
     hook(
         LIVE_SYSTEM_INFO,
         hk_live_system_info as LiveSystemInfoFn,
         Some(&ORIG_LIVE_SYSTEM_INFO),
-    );
+    )?;
     hook(
         LOBBY_TYPES_GET_MSG_TYPE_NAME,
         hk_lobby_types_get_msg_type_name as MsgTypeNameFn,
         Some(&ORIG_LOBBY_TYPES_GET_MSG_TYPE_NAME),
-    );
-    hook(QMEMCPY, hk_qmemcpy as QmemcpyFn, Some(&ORIG_QMEMCPY));
+    )?;
+    hook(QMEMCPY, hk_qmemcpy as QmemcpyFn, Some(&ORIG_QMEMCPY))?;
     hook(
         FLSOME_WEIRD_CHARACTER_INDEX,
         hk_flsome_weird_character_index as WeirdCharacterIndexFn,
         Some(&ORIG_FLSOME_WEIRD_CHARACTER_INDEX),
-    );
+    )?;
     hook(
         SEH_REPLACE_DIRECTIVE_IN_STRING_WITH_BINDING,
         hk_seh_replace_directive_in_string_with_binding as SehReplaceFn,
         Some(&ORIG_SEH_REPLACE),
-    );
+    )?;
     hook(
         offsets::PTR_LOBBY_MSG_RW_PACKAGE_INT,
         hk_lobby_msg_rw_package_int as PackageIntFn,
         Some(&ORIG_PACKAGE_INT),
-    );
+    )?;
     hook(
         offsets::PTR_LOBBY_MSG_RW_PACKAGE_UINT,
         hk_lobby_msg_rw_package_uint as PackageUIntFn,
         Some(&ORIG_PACKAGE_UINT),
-    );
+    )?;
     hook(
         offsets::PTR_LOBBY_MSG_RW_PACKAGE_UCHAR,
         hk_lobby_msg_rw_package_uchar as PackageUCharFn,
         Some(&ORIG_PACKAGE_UCHAR),
-    );
+    )?;
     hook(
         UI_DO_MODEL_STRING_REPLACEMENT,
         hk_ui_do_model_string_replacement as ModelStringFn,
         Some(&ORIG_UI_DO_MODEL_STRING_REPLACEMENT),
-    );
+    )?;
     hook(
         LIVE_STEAM_INIT_SERVER,
         hk_live_steam_init_server as VoidFn,
         None,
-    );
-    hook(CMD_MENU_RESPONSE_F, hk_cmd_menu_response_f as MenuFn, None);
+    )?;
+    hook(CMD_MENU_RESPONSE_F, hk_cmd_menu_response_f as MenuFn, None)?;
     hook(
         CMD_MENU_RESPONSE_CACHED_F,
         hk_cmd_menu_response_cached_f as MenuFn,
         None,
-    );
+    )?;
     hook(
         UI_MODEL_GET_MODEL_FROM_PATH_0,
         hk_ui_model_get_model_from_path_0 as ModelPathFn,
         Some(&ORIG_UI_MODEL_GET_MODEL_FROM_PATH_0),
-    );
+    )?;
     hook(
         UI_MODEL_GET_MODEL_FROM_PATH,
         hk_ui_model_get_model_from_path as ModelPathFn,
         Some(&ORIG_UI_MODEL_GET_MODEL_FROM_PATH),
-    );
+    )?;
     hook(
         UI_MODEL_CREATE_MODEL_FROM_PATH,
         hk_ui_model_create_model_from_path as ModelPathFn,
         Some(&ORIG_UI_MODEL_CREATE_MODEL_FROM_PATH),
-    );
+    )?;
     hook(
         UI_MODEL_ALLOCATE_NODE,
         hk_ui_model_allocate_node as AllocateNodeFn,
         Some(&ORIG_UI_MODEL_ALLOCATE_NODE),
-    );
+    )?;
     hook(
         SYS_VERIFY_PACKET_CHECKSUM,
         hk_sys_verify_packet_checksum as VerifyChecksumFn,
         Some(&ORIG_SYS_VERIFY_PACKET_CHECKSUM),
-    );
+    )?;
     hook(
         SYS_CHECKSUM_COPY,
         hk_sys_checksum_copy as ChecksumCopyFn,
         Some(&ORIG_SYS_CHECKSUM_COPY),
-    );
+    )?;
     hook(
         LOBBY_MSG_RW_PRINT_MESSAGE,
         hk_lobby_msg_rw_print_message as VoidFn,
         None,
-    );
+    )?;
     hook(
         LOBBY_MSG_RW_PRINT_DEBUG_MESSAGE,
         hk_lobby_msg_rw_print_debug_message as PrintDebugFn,
         None,
-    );
-    hook(EXEC_LUA_CMD, hk_exec_lua_cmd as VoidFn, None);
+    )?;
+    hook(EXEC_LUA_CMD, hk_exec_lua_cmd as VoidFn, None)?;
     hook(
         LIVE_USER_GET_NAME,
         hk_live_user_get_name as LiveUserGetNameFn,
         None,
-    );
+    )?;
     // Not ported: the C++ hooks its own CRT's `__report_gsfailure` here, so that a
     // `/GS` stack-cookie failure in T7Patch.dll faults where the exception handler
     // can catch it. This DLL is Rust only and has no `/GS` checks to fail.
@@ -1917,93 +2019,94 @@ pub fn apply_hooks() {
         offsets::PTR_DW_INSTANT_DISPATCH_MESSAGE,
         hk_dw_instant_dispatch_message as DispatchMessageFn,
         None,
-    );
+    )?;
     hook(
         CL_CONNECTIONLESS_CMD,
         hk_cl_connectionless_cmd as ConnectionlessFn,
         Some(&ORIG_CL_CONNECTIONLESS_CMD),
-    );
+    )?;
     hook(
         LIVE_PRESENCE_SERIALIZE,
         hk_live_presence_serialize as PresenceSerializeFn,
         Some(&ORIG_LIVE_PRESENCE_SERIALIZE),
-    );
+    )?;
     hook(
         offsets::PTR_CL_GET_CONFIG_STRING,
         hk_cl_get_config_string as GetConfigStringFn,
         Some(&ORIG_CL_GET_CONFIG_STRING),
-    );
+    )?;
     hook(
         MODS_SUBSCRIBE_UGC,
         hk_mods_subscribe_ugc as SubscribeUgcFn,
         Some(&ORIG_MODS_SUBSCRIBE_UGC),
-    );
+    )?;
     hook(
         LIVE_INVITES_ACCEPT_INVITE,
         hk_live_invites_accept_invite as InviteFn,
         Some(&ORIG_LIVE_INVITES_ACCEPT_INVITE),
-    );
+    )?;
     hook(
         LIVE_INVITES_SEND_JOIN_INFO,
         hk_live_invites_send_join_info as SendJoinInfoFn,
         Some(&ORIG_LIVE_INVITES_SEND_JOIN_INFO),
-    );
+    )?;
     hook(
         LIVE_INVITES_JOIN_MESSAGE_ACTION,
         hk_live_invites_join_message_action as InviteFn,
         Some(&ORIG_LIVE_INVITES_JOIN_MESSAGE_ACTION),
-    );
-    hook(UI_BROWSER_OPEN, hk_ui_browser_open as BrowserOpenFn, None);
+    )?;
+    hook(UI_BROWSER_OPEN, hk_ui_browser_open as BrowserOpenFn, None)?;
     // The five BG_Cache hooks are commented out in the C++ and are not created here.
     hook(
         USER_HAS_LICENSE_FOR_APP,
         hk_user_has_license_for_app as LicenseFn,
         Some(&ORIG_USER_HAS_LICENSE_FOR_APP),
-    );
+    )?;
     hook(
         LIVE_INVENTORY_GET_ITEM_QUANTITY,
         hk_live_inventory_get_item_quantity as ItemQuantityFn,
         Some(&ORIG_LIVE_INVENTORY_GET_ITEM_QUANTITY),
-    );
+    )?;
     hook(
         LIVE_ENTITLEMENTS_IS_ENTITLEMENT_ACTIVE_FOR_CONTROLLER,
         hk_live_entitlements_is_entitlement_active_for_controller as ControllerPairBoolFn,
         Some(&ORIG_LIVE_ENTITLEMENTS_IS_ACTIVE),
-    );
+    )?;
     hook(
         LIVE_INVENTORY_ARE_EXTRA_SLOTS_PURCHASED,
         hk_live_inventory_are_extra_slots_purchased as ControllerBoolFn,
         Some(&ORIG_LIVE_INVENTORY_ARE_EXTRA_SLOTS_PURCHASED),
-    );
+    )?;
     hook(
         LIVE_INVENTORY_IS_VALID,
         hk_live_inventory_is_valid as ControllerBoolFn,
         Some(&ORIG_LIVE_INVENTORY_IS_VALID),
-    );
+    )?;
     hook(
         INFO_VALUE_FOR_KEY,
         hk_info_value_for_key as ValueForKeyFn,
         Some(&ORIG_INFO_VALUE_FOR_KEY),
-    );
+    )?;
     hook(
         MODS_IS_MODS_LOADED,
         hk_mods_is_mods_loaded as ModsLoadedFn,
         Some(&ORIG_MODS_IS_MODS_LOADED),
-    );
+    )?;
     hook(
         MODS_IS_MODS_LOADED_1,
         hk_mods_is_mods_loaded_1 as ModsLoadedFn,
         Some(&ORIG_MODS_IS_MODS_LOADED_1),
-    );
+    )?;
 
-    // MH_EnableHook(MH_ALL_HOOKS)
-    let _ = ffi::enable_all_hooks();
+    Ok(())
 }
 
-/// Port of `hooks::DestroyHooks`. Disables every hook.
-pub fn destroy_hooks() {
+/// Port of `hooks::DestroyHooks`. Disables every hook. The hooks are not removed, so a
+/// callback still running through a trampoline stays valid.
+pub fn destroy_hooks() -> Result<(), String> {
     // SAFETY: a null target is MinHook's `MH_ALL_HOOKS`, which disables every hook.
-    let _ = unsafe { ffi::disable_hook(0) };
+    unsafe { ffi::disable_hook(0) }
+        .map_err(|error| format!("T7 Patch: MinHook disable failed: {error}"))
 }
 
 #[cfg(test)]
