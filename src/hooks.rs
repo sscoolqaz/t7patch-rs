@@ -1769,7 +1769,7 @@ pub fn apply_vmt_hooks() -> Result<(), String> {
     // `AtomicUsize` has the layout of `usize`, so the array is a plain pointer table.
     let table = LOBBY_VTABLE.as_ptr().addr();
     // SAFETY: `object` is the lobby object, whose first word is its vtable pointer.
-    if !unsafe { arxan::write_usize(object, table) } {
+    if !unsafe { arxan::swap_usize(object, vtable, table) }.complete() {
         return Err("T7 Patch: cannot write the lobby VMT".to_owned());
     }
     Ok(())
@@ -1792,7 +1792,7 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
     }
     if current[0] == ours {
         // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
-        if !unsafe { arxan::write_usize(slot, original) } {
+        if !unsafe { arxan::swap_usize(slot, ours, original) }.complete() {
             return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
         }
     }

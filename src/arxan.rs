@@ -4,11 +4,13 @@
 //! code for known checksum instruction sequences. The sequences are stored
 //! XOR-encrypted here and rewritten in memory so the scan no longer matches.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualProtect, VirtualQuery};
+use windows::Win32::System::Memory::{
+    MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS, VirtualProtect, VirtualQuery,
+};
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::build::{self, Build};
@@ -175,9 +177,105 @@ fn ready_signal_set() -> bool {
 /// a pointer wide, so a range that crosses more pages is a caller bug and is refused.
 const MAX_WRITE_PAGES: usize = 4;
 const PAGE_SIZE: usize = 0x1000;
+/// How many times a failed protection restore is retried.
+const RESTORE_ATTEMPTS: usize = 3;
 
-/// Writes `bytes` over `address`, temporarily making every touched page writable and
-/// reporting which stages completed.
+/// Set once a page could not be returned to its original protection. The
+/// lifecycle treats this as terminal: the image is left with a writable page.
+static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
+
+/// True once a page protection could not be restored.
+pub(crate) fn protection_lost() -> bool {
+    PROTECTION_LOST.load(Ordering::Acquire)
+}
+
+/// Changes page protections. A seam over `VirtualProtect` for tests.
+trait PageProtect {
+    /// Sets `[start, start + size)` to `protection`, returning the old protection.
+    fn protect(&mut self, start: usize, size: usize, protection: u32) -> Option<u32>;
+}
+
+struct LiveProtect;
+
+impl PageProtect for LiveProtect {
+    fn protect(&mut self, start: usize, size: usize, protection: u32) -> Option<u32> {
+        let mut old = PAGE_PROTECTION_FLAGS(0);
+        // SAFETY: callers pass committed ranges; `old` is a valid out-pointer.
+        unsafe {
+            VirtualProtect(
+                start as *const _,
+                size,
+                PAGE_PROTECTION_FLAGS(protection),
+                &raw mut old,
+            )
+        }
+        .ok()
+        .map(|()| old.0)
+    }
+}
+
+/// The original protection of every page one write touches. Built on the stack
+/// before the first change and unwound in reverse, so it needs no allocation and
+/// works while threads are frozen.
+struct ProtectionJournal {
+    entries: [(usize, usize, u32); MAX_WRITE_PAGES],
+    len: usize,
+}
+
+impl ProtectionJournal {
+    const fn new() -> Self {
+        Self {
+            entries: [(0, 0, 0); MAX_WRITE_PAGES],
+            len: 0,
+        }
+    }
+
+    /// Makes every page of `[address, end)` writable, recording each original
+    /// protection as it is replaced. On failure the pages already changed are
+    /// restored and `false` is returned.
+    fn make_writable(&mut self, ops: &mut impl PageProtect, address: usize, end: usize) -> bool {
+        let first_page = address & !(PAGE_SIZE - 1);
+        let last_page = (end - 1) & !(PAGE_SIZE - 1);
+        let page_count = (last_page - first_page) / PAGE_SIZE + 1;
+        if page_count > MAX_WRITE_PAGES {
+            return false;
+        }
+        for index in 0..page_count {
+            let page = first_page + index * PAGE_SIZE;
+            let start = address.max(page);
+            let stop = end.min(page + PAGE_SIZE);
+            let Some(old) = ops.protect(start, stop - start, PAGE_EXECUTE_READWRITE) else {
+                // Restore the pages already made writable before reporting failure.
+                let _ = self.restore(ops);
+                return false;
+            };
+            self.entries[self.len] = (start, stop - start, old);
+            self.len += 1;
+        }
+        true
+    }
+
+    /// Puts every recorded page back, newest first, retrying failures. Returns
+    /// `false`, and sets [`PROTECTION_LOST`], if any page stays changed.
+    fn restore(&mut self, ops: &mut impl PageProtect) -> bool {
+        let mut restored = true;
+        while self.len > 0 {
+            self.len -= 1;
+            let (start, size, old) = self.entries[self.len];
+            if !(0..RESTORE_ATTEMPTS).any(|_| ops.protect(start, size, old).is_some()) {
+                restored = false;
+            }
+        }
+        if !restored {
+            PROTECTION_LOST.store(true, Ordering::Release);
+        }
+        restored
+    }
+}
+
+/// Writes `bytes` over `address` while the caller holds the patch transaction,
+/// temporarily making every touched page writable and reporting which stages
+/// completed. [`crate::threads`] calls this under its freeze.
 ///
 /// A caller must journal the original bytes before calling this: when
 /// [`WriteReport::bytes_written`] is true the image already contains the new bytes,
@@ -185,8 +283,9 @@ const PAGE_SIZE: usize = 0x1000;
 ///
 /// # Safety
 ///
-/// `[address, address + bytes.len())` must lie inside committed memory.
-pub(crate) unsafe fn write_bytes_reported(address: usize, bytes: &[u8]) -> WriteReport {
+/// `[address, address + bytes.len())` must lie inside committed memory, and the
+/// caller must hold [`crate::threads::lock_transaction`].
+pub(crate) unsafe fn write_bytes_in_transaction(address: usize, bytes: &[u8]) -> WriteReport {
     let mut report = WriteReport::default();
     if bytes.is_empty() {
         report.bytes_written = true;
@@ -197,45 +296,10 @@ pub(crate) unsafe fn write_bytes_reported(address: usize, bytes: &[u8]) -> Write
     let Some(end) = address.checked_add(bytes.len()) else {
         return report;
     };
-    let first_page = address & !(PAGE_SIZE - 1);
-    let last_page = (end - 1) & !(PAGE_SIZE - 1);
-    let page_count = (last_page - first_page) / PAGE_SIZE + 1;
-    if page_count > MAX_WRITE_PAGES {
+    let mut ops = LiveProtect;
+    let mut journal = ProtectionJournal::new();
+    if !journal.make_writable(&mut ops, address, end) {
         return report;
-    }
-
-    let mut saved = [(
-        0usize,
-        0usize,
-        windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0),
-    ); MAX_WRITE_PAGES];
-    let mut protected = 0;
-    for (index, slot) in saved.iter_mut().take(page_count).enumerate() {
-        let page = first_page + index * PAGE_SIZE;
-        let start = address.max(page);
-        let stop = end.min(page + PAGE_SIZE);
-        let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-        // SAFETY: the caller guarantees the whole range is committed memory.
-        let changed = unsafe {
-            VirtualProtect(
-                start as *const _,
-                stop - start,
-                windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
-                &raw mut old,
-            )
-        };
-        if changed.is_err() {
-            // Restore the pages already made writable before reporting failure.
-            for (start, size, old) in saved[..protected].iter().rev() {
-                let mut ignored = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-                // SAFETY: these pages were made writable above.
-                let _ =
-                    unsafe { VirtualProtect(*start as *const _, *size, *old, &raw mut ignored) };
-            }
-            return report;
-        }
-        *slot = (start, stop - start, old);
-        protected = index + 1;
     }
 
     // SAFETY: every touched page was made writable above, and `bytes` does not
@@ -248,17 +312,21 @@ pub(crate) unsafe fn write_bytes_reported(address: usize, bytes: &[u8]) -> Write
         FlushInstructionCache(GetCurrentProcess(), Some(address as *const _), bytes.len())
     }
     .is_ok();
-
-    let mut protection_restored = true;
-    for (start, size, old) in saved[..protected].iter().rev() {
-        let mut ignored = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-        // SAFETY: restores the protection captured above for the same page.
-        if unsafe { VirtualProtect(*start as *const _, *size, *old, &raw mut ignored) }.is_err() {
-            protection_restored = false;
-        }
-    }
-    report.protection_restored = protection_restored;
+    report.protection_restored = journal.restore(&mut ops);
     report
+}
+
+/// Writes `bytes` over `address` under the patch transaction, temporarily making
+/// the pages writable. For data and code that no other thread executes; code
+/// that may be running goes through [`crate::threads::write_code`].
+///
+/// # Safety
+///
+/// `[address, address + bytes.len())` must lie inside committed memory.
+pub(crate) unsafe fn write_bytes_reported(address: usize, bytes: &[u8]) -> WriteReport {
+    let _transaction = crate::threads::lock_transaction();
+    // SAFETY: forwarded from the caller; the transaction is held.
+    unsafe { write_bytes_in_transaction(address, bytes) }
 }
 
 /// Writes `bytes` over `address`, temporarily making the page writable.
@@ -274,15 +342,79 @@ pub(crate) unsafe fn write_bytes(address: usize, bytes: &[u8]) -> bool {
     unsafe { write_bytes_reported(address, bytes).complete() }
 }
 
-/// Writes a pointer-sized `value` at `address` through [`write_bytes`]. Nothing is
-/// written when the page cannot be made writable.
+/// Result of one pointer publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PointerWrite {
+    /// The slot now holds the new value.
+    pub(crate) written: bool,
+    pub(crate) protection_restored: bool,
+    /// The slot's value when the swap was attempted. Differs from `expected`
+    /// when nothing was written because the slot had changed.
+    pub(crate) observed: usize,
+}
+
+impl PointerWrite {
+    pub(crate) const fn complete(self) -> bool {
+        self.written && self.protection_restored
+    }
+}
+
+/// Atomically replaces the pointer at `slot` with `new` if it still holds
+/// `expected`. The swap is one aligned `lock cmpxchg`, so a reader on another
+/// thread sees either the old or the new pointer, never a torn mix. Anything
+/// `new` points at must be fully initialized before this is called.
+///
+/// Nothing is written when `slot` is not 8-byte aligned, when its page cannot be
+/// made writable, or when it no longer holds `expected`. Page-protection
+/// changes are serialized with code writes by the patch transaction.
 ///
 /// # Safety
 ///
-/// `address` must be a committed pointer slot (an IAT, vtable or ntdll data entry).
+/// `slot` must be a committed pointer slot (an IAT, vtable, global or ntdll data
+/// entry) that other code reads as a `usize`.
+pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> PointerWrite {
+    let mut result = PointerWrite {
+        written: false,
+        protection_restored: true,
+        observed: 0,
+    };
+    if slot == 0 || !slot.is_multiple_of(align_of::<usize>()) {
+        return result;
+    }
+    let _transaction = crate::threads::lock_transaction();
+    // SAFETY: the slot is committed, aligned and read as a `usize` by other code.
+    let atomic = unsafe { AtomicUsize::from_ptr(slot as *mut usize) };
+    result.observed = atomic.load(Ordering::Acquire);
+    if result.observed != expected {
+        return result;
+    }
+    let mut ops = LiveProtect;
+    let mut journal = ProtectionJournal::new();
+    if !journal.make_writable(&mut ops, slot, slot + size_of::<usize>()) {
+        return result;
+    }
+    match atomic.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => result.written = true,
+        Err(actual) => result.observed = actual,
+    }
+    result.protection_restored = journal.restore(&mut ops);
+    result
+}
+
+/// Atomically publishes `value` at `address`, replacing whatever it holds now.
+/// Use [`swap_usize`] when the current value is known.
+///
+/// # Safety
+///
+/// As for [`swap_usize`].
 pub(crate) unsafe fn write_usize(address: usize, value: usize) -> bool {
+    if address == 0 || !address.is_multiple_of(align_of::<usize>()) {
+        return false;
+    }
+    // SAFETY: forwarded from the caller; the slot is aligned.
+    let current = unsafe { AtomicUsize::from_ptr(address as *mut usize) }.load(Ordering::Acquire);
     // SAFETY: forwarded from the caller.
-    unsafe { write_bytes(address, &value.to_le_bytes()) }
+    unsafe { swap_usize(address, current, value) }.complete()
 }
 
 /// Finds all occurrences of `pattern` in the executable sections of the image.
@@ -630,6 +762,50 @@ unsafe fn external_code_patches_installed(image_base: usize) -> bool {
     }
 }
 
+/// How [`uninstall`] left the bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// The original checksum code is back, or nothing was installed.
+    Restored,
+    /// Another module installed the bypass; it is not ours to remove.
+    External,
+    /// Kept on purpose because code that depends on it may still be live.
+    Retained,
+}
+
+/// Restores the original checksum code. Run it last in a rollback, once every
+/// hook and code patch that the bypass hides is gone. With `dependents_live`
+/// set the bypass is kept, because the integrity checks would trip over the
+/// patches still in the image.
+pub fn uninstall(dependents_live: bool) -> Result<Removal, String> {
+    let mut state = lock_state();
+    if !ACTIVE.load(Ordering::Acquire) {
+        return if state.partial {
+            Err("T7 Patch: Arxan restoration is incomplete".to_owned())
+        } else {
+            Ok(Removal::Restored)
+        };
+    }
+    if EXTERNAL.load(Ordering::Acquire) {
+        ACTIVE.store(false, Ordering::Release);
+        EXTERNAL.store(false, Ordering::Release);
+        return Ok(Removal::External);
+    }
+    if dependents_live {
+        return Ok(Removal::Retained);
+    }
+    // Stop maintenance from re-applying the bytes while they are restored.
+    WAITING_FOR_READY_SIGNAL.store(false, Ordering::Release);
+    let applied = state.patches.len();
+    if restore_applied(&mut state, applied) {
+        ACTIVE.store(false, Ordering::Release);
+        Ok(Removal::Restored)
+    } else {
+        ACTIVE.store(false, Ordering::Release);
+        Err("T7 Patch: Arxan restoration is incomplete".to_owned())
+    }
+}
+
 /// Re-applies the replacement bytes if the game restored them after the ready signal.
 pub fn maintain() {
     if !ACTIVE.load(Ordering::Acquire)
@@ -697,6 +873,106 @@ pub fn active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fake pages: `protections[page]` is the current protection, and `fail`
+    /// fails the given 0-based calls.
+    struct FakePages {
+        protections: Vec<u32>,
+        calls: usize,
+        fail: Vec<usize>,
+    }
+
+    impl PageProtect for FakePages {
+        fn protect(&mut self, start: usize, _size: usize, protection: u32) -> Option<u32> {
+            let call = self.calls;
+            self.calls += 1;
+            if self.fail.contains(&call) {
+                return None;
+            }
+            let page = start / PAGE_SIZE;
+            Some(std::mem::replace(&mut self.protections[page], protection))
+        }
+    }
+
+    const PAGE_READONLY: u32 = 0x02;
+
+    #[test]
+    fn journal_restores_every_page_in_reverse() {
+        let mut pages = FakePages {
+            protections: vec![PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_EXECUTE_READ],
+            calls: 0,
+            fail: Vec::new(),
+        };
+        let mut journal = ProtectionJournal::new();
+        assert!(journal.make_writable(&mut pages, 0x0FFC, 0x2004));
+        assert_eq!(pages.protections, [PAGE_EXECUTE_READWRITE; 3]);
+        assert!(journal.restore(&mut pages));
+        assert_eq!(
+            pages.protections,
+            [PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_EXECUTE_READ]
+        );
+    }
+
+    #[test]
+    fn journal_unwinds_when_any_page_cannot_be_made_writable() {
+        for failing in 0..3 {
+            let mut pages = FakePages {
+                protections: vec![PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_EXECUTE_READ],
+                calls: 0,
+                fail: vec![failing],
+            };
+            let mut journal = ProtectionJournal::new();
+            assert!(!journal.make_writable(&mut pages, 0x0FFC, 0x2004));
+            assert_eq!(
+                pages.protections,
+                [PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_EXECUTE_READ],
+                "failure at change {failing}"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_retries_a_failed_restore() {
+        let mut pages = FakePages {
+            protections: vec![PAGE_EXECUTE_READ],
+            calls: 0,
+            // Call 0 makes the page writable; the first restore attempt fails.
+            fail: vec![1],
+        };
+        let mut journal = ProtectionJournal::new();
+        assert!(journal.make_writable(&mut pages, 0x10, 0x18));
+        assert!(journal.restore(&mut pages));
+        assert_eq!(pages.protections, [PAGE_EXECUTE_READ]);
+    }
+
+    #[test]
+    fn journal_refuses_ranges_over_the_page_limit() {
+        let mut pages = FakePages {
+            protections: vec![PAGE_EXECUTE_READ; 8],
+            calls: 0,
+            fail: Vec::new(),
+        };
+        let mut journal = ProtectionJournal::new();
+        assert!(!journal.make_writable(&mut pages, 0, PAGE_SIZE * 5));
+        assert_eq!(pages.calls, 0);
+    }
+
+    #[test]
+    fn swap_usize_is_compare_and_swap_on_aligned_slots() {
+        let slot = Box::new(AtomicUsize::new(5));
+        let address = slot.as_ptr().addr();
+        // SAFETY: `address` is a live, aligned heap `usize`.
+        let stale = unsafe { swap_usize(address, 4, 9) };
+        assert!(!stale.written);
+        assert_eq!(stale.observed, 5);
+        assert_eq!(slot.load(Ordering::Acquire), 5);
+        // SAFETY: as above.
+        let swapped = unsafe { swap_usize(address, 5, 9) };
+        assert!(swapped.complete());
+        assert_eq!(slot.load(Ordering::Acquire), 9);
+        // SAFETY: as above; a misaligned address is refused before any access.
+        assert!(!unsafe { swap_usize(address + 1, 9, 1) }.written);
+    }
 
     #[test]
     fn decrypt_patch_xors_with_key() {

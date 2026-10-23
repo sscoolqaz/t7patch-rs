@@ -59,6 +59,12 @@ const LOBBY_MSG_COPY_READ: usize = 0x44;
 /// Value written into the lobby-message print global. Its appearance in `rcx`
 /// marks an exception raised by the game's print hook.
 const LOBBY_MSG_MARKER: u64 = 0xFFEEDDCC44332212;
+
+/// A 64-bit game word as a pointer-sized value. The crate is x64-only.
+const fn word(value: u64) -> usize {
+    const _: () = assert!(size_of::<usize>() == size_of::<u64>());
+    usize::from_ne_bytes(value.to_ne_bytes())
+}
 const DROPPED_MSG_TYPE: i32 = 0xFF;
 const FRIENDS_REFRESH_MS: u64 = 30 * 1000;
 const DLC_PROGRESS_TTL_MS: u64 = 60 * 5 * 1000;
@@ -975,7 +981,7 @@ pub mod iat_hook {
             return 0;
         }
         // SAFETY: `slot` is an IAT entry; nothing is written if its page cannot be made writable.
-        if !unsafe { crate::arxan::write_usize(slot as usize, new_function) } {
+        if !unsafe { crate::arxan::swap_usize(slot as usize, current, new_function) }.complete() {
             return 0;
         }
         current
@@ -2947,8 +2953,8 @@ pub unsafe fn install() -> Result<(), String> {
 
     let detour = is_processor_feature_present as *const () as usize;
     // SAFETY: `iat` is an IAT entry inside the mapped image.
-    let report = unsafe { crate::arxan::write_bytes_reported(iat as usize, &detour.to_le_bytes()) };
-    if report.bytes_written {
+    let report = unsafe { crate::arxan::swap_usize(iat as usize, original, detour) };
+    if report.written {
         IAT_INSTALLED.store(true, Ordering::Release);
         // The detour can raise the induced 0x17 exception from now on.
         crate::exception::note_exception_producer();
@@ -2979,8 +2985,14 @@ pub unsafe fn install() -> Result<(), String> {
     PRELOAD_INSTALLED.store(true, Ordering::Release);
     // SAFETY: as above; nothing is written if it cannot be made writable.
     if !unsafe {
-        crate::arxan::write_usize(preload, cl_switch_state_idle_update as *const () as usize)
-    } {
+        crate::arxan::swap_usize(
+            preload,
+            ORIGINAL_PRELOAD.load(Ordering::Acquire),
+            cl_switch_state_idle_update as *const () as usize,
+        )
+    }
+    .complete()
+    {
         return Err("T7 Patch: cannot write the update-preload pointer".to_owned());
     }
 
@@ -2993,9 +3005,14 @@ pub unsafe fn install() -> Result<(), String> {
         Ordering::Release,
     );
     // SAFETY: as above; the marker global is a game variable.
-    let report =
-        unsafe { crate::arxan::write_bytes_reported(prints, &LOBBY_MSG_MARKER.to_le_bytes()) };
-    if report.bytes_written {
+    let report = unsafe {
+        crate::arxan::swap_usize(
+            prints,
+            word(OLD_LOBBYMSG_PRINTS.load(Ordering::Acquire).cast_unsigned()),
+            word(LOBBY_MSG_MARKER),
+        )
+    };
+    if report.written {
         LOBBY_MARKER_INSTALLED.store(true, Ordering::Release);
         // The invalid marker can raise the induced lobby-print exception from now on.
         crate::exception::note_exception_producer();
@@ -3073,8 +3090,14 @@ pub unsafe fn uninstall() -> Result<(), String> {
         let old = OLD_LOBBYMSG_PRINTS.load(Ordering::Acquire);
         // SAFETY: the print global is the game variable `install` wrote.
         if unsafe {
-            crate::arxan::write_bytes(address(offsets::PTR_LOBBYMSGPRINTS), &old.to_le_bytes())
-        } {
+            crate::arxan::swap_usize(
+                address(offsets::PTR_LOBBYMSGPRINTS),
+                word(LOBBY_MSG_MARKER),
+                word(old.cast_unsigned()),
+            )
+        }
+        .complete()
+        {
             LOBBY_MARKER_INSTALLED.store(false, Ordering::Release);
         } else {
             failures.push("lobby-message marker");
@@ -3085,8 +3108,14 @@ pub unsafe fn uninstall() -> Result<(), String> {
         let original = ORIGINAL_PRELOAD.load(Ordering::Acquire);
         // SAFETY: the update-preload pointer is the game global `install` wrote.
         if unsafe {
-            crate::arxan::write_usize(address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN), original)
-        } {
+            crate::arxan::swap_usize(
+                address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN),
+                cl_switch_state_idle_update as *const () as usize,
+                original,
+            )
+        }
+        .complete()
+        {
             PRELOAD_INSTALLED.store(false, Ordering::Release);
         } else {
             failures.push("update-preload pointer");
@@ -3098,7 +3127,16 @@ pub unsafe fn uninstall() -> Result<(), String> {
         // SAFETY: the main module's import table was read by `install`.
         let restored = unsafe { iat_hook::find(c"IsProcessorFeaturePresent", 0) }.is_some_and(
             // SAFETY: `slot` is the IAT entry `install` replaced, and `original` its old value.
-            |slot| unsafe { crate::arxan::write_usize(slot as usize, original) },
+            |slot| {
+                unsafe {
+                    crate::arxan::swap_usize(
+                        slot as usize,
+                        is_processor_feature_present as *const () as usize,
+                        original,
+                    )
+                }
+                .complete()
+            },
         );
         if restored {
             IAT_INSTALLED.store(false, Ordering::Release);

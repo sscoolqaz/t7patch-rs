@@ -681,7 +681,7 @@ unsafe fn install_pointer_hook(dispatcher: usize, handler: usize) -> Result<(), 
 
     // SAFETY: the slot is an 8-byte pointer inside ntdll's data; nothing is written if it
     // cannot be made writable.
-    if !unsafe { crate::arxan::write_usize(slot, handler) } {
+    if !unsafe { crate::arxan::swap_usize(slot, original, handler) }.complete() {
         return Err("T7 Patch: cannot write the exception dispatcher slot".to_owned());
     }
     Ok(())
@@ -827,9 +827,10 @@ pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
         let slot = FN_PTR_HOOK.load(Ordering::Acquire);
         if slot != 0 {
             let original = ORIGINAL_DISPATCH_CALLBACK.load(Ordering::Acquire);
+            let handler = exception_hook as *const () as usize;
             // SAFETY: `slot` is the pointer slot written by `install_pointer_hook`, and
-            // `original` is the value it held before.
-            if !unsafe { crate::arxan::write_usize(slot, original) } {
+            // `original` is the value it held before. Only our own handler is replaced.
+            if !unsafe { crate::arxan::swap_usize(slot, handler, original) }.complete() {
                 return Err("T7 Patch: cannot restore the exception dispatcher slot".to_owned());
             }
         }

@@ -135,8 +135,18 @@ impl Operations for PatchOps {
         {
             failures.push(error);
         }
-        if arxan::partial() {
-            failures.push("T7 Patch: Arxan restoration is incomplete".to_owned());
+        // The bypass goes last: it hides every code patch removed above, so it is
+        // kept while any of them may still be in the image.
+        match arxan::uninstall(!failures.is_empty() || HOOKS_MAY_BE_ENABLED.load(Ordering::Acquire))
+        {
+            Ok(arxan::Removal::Retained) => failures.push(
+                "T7 Patch: Arxan bypass retained; dependent patches are still live".to_owned(),
+            ),
+            Ok(arxan::Removal::Restored | arxan::Removal::External) => {}
+            Err(error) => failures.push(error),
+        }
+        if arxan::protection_lost() {
+            failures.push("T7 Patch: a page protection could not be restored".to_owned());
         }
         if crate::threads::thaw_failed() {
             failures.push("T7 Patch: a game thread could not be resumed".to_owned());

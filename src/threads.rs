@@ -557,7 +557,8 @@ fn hazard_range(address: usize, length: usize) -> (usize, usize) {
     )
 }
 
-fn lock_transaction() -> MutexGuard<'static, ()> {
+/// Serializes code writes, pointer publication and page-protection changes.
+pub(crate) fn lock_transaction() -> MutexGuard<'static, ()> {
     PATCH_TRANSACTION
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -642,7 +643,8 @@ pub(crate) unsafe fn write_code_batch(
         reports.clear();
         for patch in patches {
             // SAFETY: forwarded from the caller; no other thread can execute the range.
-            let report = unsafe { crate::arxan::write_bytes_reported(patch.address, patch.bytes) };
+            let report =
+                unsafe { crate::arxan::write_bytes_in_transaction(patch.address, patch.bytes) };
             reports.push(report);
             if !report.complete() {
                 break;
