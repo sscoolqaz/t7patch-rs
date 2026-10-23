@@ -1401,10 +1401,13 @@ unsafe extern "system" fn hk_dw_instant_dispatch_message(
         }
     }
 
-    // SAFETY: `msg` is the local message over the payload; the callee reads a copy of it.
+    // SAFETY: `msg` is the local message over the payload, and the callee reads a copy of
+    // it; `message` is forwarded to the game's handler unchanged, as in the C++.
     if is_valid
         && packet_type == PACKET_TYPE_INFO_REQUEST_PENDING
-        && unsafe { protection::check_pending_info_requests(sender_xuid, &raw mut msg) }
+        && unsafe {
+            protection::check_pending_info_requests(sender_xuid, &raw mut msg, message.cast_mut())
+        }
     {
         return 0;
     }
@@ -1748,12 +1751,13 @@ pub fn apply_vmt_hooks() -> Result<(), String> {
         return Err("T7 Patch: lobby VMT is not initialized".to_owned());
     }
 
-    for (index, entry) in LOBBY_VTABLE.iter().enumerate() {
-        // SAFETY: the game vtable has at least 50 entries.
-        entry.store(
-            unsafe { read_game::<usize>(vtable + index * 8) },
-            Ordering::Relaxed,
-        );
+    let mut entries = [0usize; LOBBY_VTABLE_LEN];
+    // An unreadable or short vtable fails the install (and rolls back) instead of faulting.
+    if !read_memory(vtable, &mut entries) {
+        return Err("T7 Patch: unreadable lobby VMT".to_owned());
+    }
+    for (entry, value) in LOBBY_VTABLE.iter().zip(entries) {
+        entry.store(value, Ordering::Relaxed);
     }
     LOBBY_VTABLE[LOBBY_VTABLE_INSTANT_MESSAGE].store(
         global_instant_message as GlobalInstantMessageFn as *const () as usize,
@@ -1778,9 +1782,15 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
     if slot == 0 || original == 0 {
         return Ok(());
     }
-    // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
-    if !unsafe { arxan::write_usize(slot, original) } {
-        return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
+    // Restore only while the object still points at our table: if the game freed and
+    // reused it, the slot is no longer a vtable pointer and must not be written.
+    let mut current = [0usize; 1];
+    let ours = LOBBY_VTABLE.as_ptr().addr();
+    if read_memory(slot, &mut current) && current[0] == ours {
+        // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
+        if !unsafe { arxan::write_usize(slot, original) } {
+            return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
+        }
     }
     LOBBY_VTABLE_SLOT.store(0, Ordering::Release);
     ORIGINAL_LOBBY_VTABLE.store(0, Ordering::Release);
@@ -1796,23 +1806,30 @@ struct MemoryPatch {
 /// Every applied memory patch, in the order applied.
 static MEMORY_PATCHES: Mutex<Vec<MemoryPatch>> = Mutex::new(Vec::new());
 
-/// Port of `SaveMemoryPatch`. Saves the bytes at `address`, then writes `bytes` over them
-/// with the protection changes the C++ makes around each patch.
-fn patch(address: usize, bytes: &[u8]) -> Result<(), String> {
-    let mut original = vec![0u8; bytes.len()];
+/// Copies `out.len()` values from `address` with `ReadProcessMemory`, which reports an
+/// unreadable range instead of faulting. Returns false unless every byte was copied.
+fn read_memory<T: Copy>(address: usize, out: &mut [T]) -> bool {
+    let size = size_of_val(out);
     let mut copied = 0usize;
-    // SAFETY: `original` is writable for `bytes.len()` bytes; `ReadProcessMemory` checks that
-    // the source range is readable instead of faulting.
+    // SAFETY: `out` is writable for `size` bytes and any bit pattern is accepted by the
+    // callers' plain-integer `T`; `ReadProcessMemory` checks the source range.
     let read = unsafe {
         ReadProcessMemory(
             GetCurrentProcess(),
             address as *const c_void,
-            original.as_mut_ptr().cast(),
-            bytes.len(),
+            out.as_mut_ptr().cast(),
+            size,
             Some(&raw mut copied),
         )
     };
-    if read.is_err() || copied != bytes.len() {
+    read.is_ok() && copied == size
+}
+
+/// Port of `SaveMemoryPatch`. Saves the bytes at `address`, then writes `bytes` over them
+/// with the protection changes the C++ makes around each patch.
+fn patch(address: usize, bytes: &[u8]) -> Result<(), String> {
+    let mut original = vec![0u8; bytes.len()];
+    if !read_memory(address, &mut original) {
         return Err("T7 Patch: unreadable memory patch target".to_owned());
     }
     MEMORY_PATCHES

@@ -488,6 +488,10 @@ pub static PRIVATE_PASSWORD: Mutex<[i64; 3]> = Mutex::new([0; 3]);
 /// Filled once by [`initialize`] and never changed afterwards.
 pub static STEAM_API_HOOKS: Mutex<BTreeMap<usize, BTreeMap<usize, usize>>> =
     Mutex::new(BTreeMap::new());
+/// `(interface, slot)` pairs [`swap_steam_api_pointer`] may have written, recorded before
+/// each write, so `uninstall` restores only those and leaves other hooks on the
+/// remaining slots alone.
+static STEAM_SWAPPED: Mutex<BTreeSet<(usize, usize)>> = Mutex::new(BTreeSet::new());
 /// Lobby message handlers keyed by message type (a `BYTE` in the original).
 pub static PACKET_CALLBACKS: Mutex<BTreeMap<u8, PacketCallback>> = Mutex::new(BTreeMap::new());
 
@@ -975,6 +979,7 @@ pub unsafe fn swap_steam_api_pointer(
     }
     // SAFETY: the Steam interface global and its vtable are mapped while Steam is loaded.
     let vtable = unsafe { steam_vtable(library) }?;
+    lock(&STEAM_SWAPPED).insert((library, index));
     // SAFETY: `vtable + index * 8` is a vtable entry; nothing is written if it cannot be
     // made writable.
     if !unsafe { crate::arxan::write_usize(vtable + index * 8, replacement) } {
@@ -2419,8 +2424,10 @@ pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyM
 ///
 /// # Safety
 ///
-/// `msg` must be a live `msg_t` owned by the caller.
-pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg) -> bool {
+/// `msg` must be a live `msg_t` owned by the caller, read from `payload`. `payload` is the
+/// raw message the game dispatched, forwarded unchanged to `dwInstantHandleLobbyMessage`
+/// exactly as the C++ does (`(char*)_msg`, which there is the raw payload pointer).
+pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mut c_char) -> bool {
     // SAFETY: `msg` is a live message, copied as the original does.
     let mut copy = unsafe { *msg };
     let size = copy.cursize.wrapping_sub(copy.readcount);
@@ -2455,8 +2462,9 @@ pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg) -> bool {
         if result != 0 {
             return true;
         }
-        // SAFETY: the handler takes the original message pointer as its byte buffer.
-        unsafe { (g.dw_instant_handle_lobby_message)(xuid, 0, msg.cast()) };
+        // SAFETY: the handler gets the game's own payload pointer, as in the C++; only the
+        // inspection above reads through the local `msg`.
+        unsafe { (g.dw_instant_handle_lobby_message)(xuid, 0, payload) };
         return true;
     }
 
@@ -2964,17 +2972,26 @@ pub unsafe fn uninstall() -> Result<(), String> {
     let mut failures: Vec<&str> = Vec::new();
 
     let snapshot = lock(&STEAM_API_HOOKS).clone();
-    for (library, slots) in &snapshot {
+    let swapped: Vec<(usize, usize)> = lock(&STEAM_SWAPPED).iter().copied().collect();
+    for (library, index) in swapped {
+        let Some(original) = snapshot
+            .get(&library)
+            .and_then(|slots| slots.get(&index))
+            .copied()
+        else {
+            failures.push("Steam original");
+            continue;
+        };
         // SAFETY: `library` is a Steam interface global recorded by `initialize`.
-        let Ok(vtable) = (unsafe { steam_vtable(*library) }) else {
+        let Ok(vtable) = (unsafe { steam_vtable(library) }) else {
             failures.push("Steam interface");
             continue;
         };
-        for (index, original) in slots {
-            // SAFETY: restores the snapshot value of the same vtable entry.
-            if !unsafe { crate::arxan::write_usize(vtable + index * 8, *original) } {
-                failures.push("Steam vtable slot");
-            }
+        // SAFETY: restores the snapshot value of a vtable entry `install` wrote.
+        if unsafe { crate::arxan::write_usize(vtable + index * 8, original) } {
+            lock(&STEAM_SWAPPED).remove(&(library, index));
+        } else {
+            failures.push("Steam vtable slot");
         }
     }
 
