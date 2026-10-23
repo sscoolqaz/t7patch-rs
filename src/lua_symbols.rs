@@ -13,6 +13,7 @@
 //! original behaviour instead of faulting. Symbol files are handled as bytes,
 //! as the C++ `std::string` handling does, because they need not be UTF-8.
 
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsString, c_char, c_void};
@@ -856,6 +857,42 @@ fn lock_symbols() -> MutexGuard<'static, ()> {
     SYMBOL_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Number of objects between the stack base and top, as `lua_gettop` returns it.
+/// None when the top is below the base or not on an object boundary.
+fn stack_index(top: usize, base: usize) -> Option<usize> {
+    let span = top.checked_sub(base)?;
+    (span % HKS_OBJECT_SIZE == 0).then_some(span / HKS_OBJECT_SIZE)
+}
+
+/// Address of stack slot `index`, counted from `base` (0 is the first slot).
+fn slot_address(base: usize, index: usize) -> Option<usize> {
+    base.checked_add(index.checked_mul(HKS_OBJECT_SIZE)?)
+}
+
+/// Where the stack stands after a push that started at index `index`.
+#[derive(Debug, PartialEq, Eq)]
+enum PushResult {
+    /// One object was pushed. Holds the pushed slot and the slot below it,
+    /// both computed from the base read after the push.
+    Pushed { pushed: usize, below: usize },
+    /// The push did not leave exactly one new object. Holds the address that
+    /// restores the stack to `index` objects, from the base read after the push.
+    Unexpected { restore_top: usize },
+}
+
+/// Checks a push against the stack as read after it. Every address comes from
+/// `base`, so a push that moved the stack is handled. `index` must be at least 1.
+fn push_result(index: usize, top: usize, base: usize) -> Option<PushResult> {
+    let restore_top = slot_address(base, index)?;
+    if index == 0 || stack_index(top, base) != Some(index + 1) {
+        return Some(PushResult::Unexpected { restore_top });
+    }
+    Some(PushResult::Pushed {
+        pushed: restore_top,
+        below: slot_address(base, index - 1)?,
+    })
+}
+
 /// Reads the Lua stack top and base, and checks that the top holds an object.
 ///
 /// # Safety
@@ -877,23 +914,43 @@ unsafe fn stack_bounds(lua_state: *mut i64) -> Option<(usize, usize)> {
     Some((top, base))
 }
 
-/// Pushes `rewritten` as a new string and swaps it into the slot of the old
-/// error object. Returns false and restores the top if the push misbehaves.
+/// Writes `top` into the state's stack-top slot. With a top rebuilt from the
+/// current base, this is `lua_settop` for a top at or below the current one.
+///
+/// # Safety
+///
+/// `lua_state` must point to a live Lua state, and `top` must lie in its stack.
+unsafe fn set_stack_top(lua_state: *mut i64, top: usize) {
+    let Ok(top) = i64::try_from(top) else {
+        return;
+    };
+    // SAFETY: the caller guarantees a live state, and the slot lies inside its header.
+    unsafe { *lua_state.add(LUA_STATE_TOP_INDEX) = top };
+}
+
+/// Pushes `rewritten` as a new string and swaps it into the slot of the error
+/// object at stack index `index`. Returns false, and restores the stack to
+/// `index` objects where it can, if the push misbehaves.
+///
+/// `lua_checkstack` and `lua_settop` are not bound, so the stack-top slot
+/// stands in for them, with indices relative to the base. `lua_pushlstring`
+/// may grow and move the stack, so no address read before it is used after it:
+/// the base is read again and every slot is rebuilt from it.
 ///
 /// # Safety
 ///
 /// `lua_state` must point to a live Lua state whose stack top holds an object.
-unsafe fn replace_top_error_object(lua_state: *mut i64, rewritten: &[u8]) -> bool {
+unsafe fn replace_top_error_object(lua_state: *mut i64, index: usize, rewritten: &[u8]) -> bool {
     if rewritten.is_empty() || rewritten.len() > MAX_STACK_TRACE_SIZE {
         return false;
     }
     // SAFETY: the caller guarantees a live state.
-    let Some((top, _)) = (unsafe { stack_bounds(lua_state) }) else {
+    let Some((top, base)) = (unsafe { stack_bounds(lua_state) }) else {
         return false;
     };
-    let Ok(top_slot) = i64::try_from(top) else {
+    if stack_index(top, base) != Some(index) {
         return false;
-    };
+    }
 
     // SAFETY: the offset comes from the game image's build table, and the signature matches
     // the February 2026 `lua_pushlstring`.
@@ -901,25 +958,36 @@ unsafe fn replace_top_error_object(lua_state: *mut i64, rewritten: &[u8]) -> boo
     // SAFETY: the callee copies `rewritten.len()` bytes from a valid buffer onto the live state.
     unsafe { push_string(lua_state, rewritten.as_ptr().cast(), rewritten.len()) };
 
-    // SAFETY: the state is still live, and this reads its top slot.
-    let new_top = unsafe { *lua_state.add(LUA_STATE_TOP_INDEX) };
-    if Some(new_top) != i64::try_from(top + HKS_OBJECT_SIZE).ok() {
-        // SAFETY: restores the top slot this function read above.
-        unsafe { *lua_state.add(LUA_STATE_TOP_INDEX) = top_slot };
+    // SAFETY: the state is still live. The bounds are read again because the push may
+    // have moved the stack.
+    let Some((top, base)) = (unsafe { stack_bounds(lua_state) }) else {
+        // Without a valid base there is no safe top to restore.
         return false;
+    };
+    match push_result(index, top, base) {
+        Some(PushResult::Pushed { pushed, below }) => {
+            // SAFETY: both slots were computed from the current base and lie below the
+            // current top. Each is one 16-byte value, and the two do not overlap.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    ptr::with_exposed_provenance::<u8>(pushed),
+                    ptr::with_exposed_provenance_mut::<u8>(below),
+                    HKS_OBJECT_SIZE,
+                );
+                set_stack_top(lua_state, pushed);
+            }
+            true
+        }
+        Some(PushResult::Unexpected { restore_top }) => {
+            if restore_top <= top {
+                // SAFETY: the address is `index` slots above the current base, at or below
+                // the current top.
+                unsafe { set_stack_top(lua_state, restore_top) };
+            }
+            false
+        }
+        None => false,
     }
-
-    // SAFETY: the pushed object is at `top` and the old error object is at `top - 16`.
-    // Each is one 16-byte value, and the two ranges do not overlap.
-    unsafe {
-        ptr::copy_nonoverlapping(
-            ptr::with_exposed_provenance::<u8>(top),
-            ptr::with_exposed_provenance_mut::<u8>(top - HKS_OBJECT_SIZE),
-            HKS_OBJECT_SIZE,
-        );
-        *lua_state.add(LUA_STATE_TOP_INDEX) = top_slot;
-    }
-    true
 }
 
 /// Rewrites the stack trace at the top of the Lua error object, if it has any
@@ -933,7 +1001,10 @@ unsafe fn resolve_top_error_stack(lua_state: *mut i64) {
         return;
     }
     // SAFETY: the caller guarantees a live state.
-    let Some((top, _)) = (unsafe { stack_bounds(lua_state) }) else {
+    let Some((top, base)) = (unsafe { stack_bounds(lua_state) }) else {
+        return;
+    };
+    let Some(index) = stack_index(top, base) else {
         return;
     };
     let Ok(object) = i64::try_from(top - HKS_OBJECT_SIZE) else {
@@ -955,16 +1026,42 @@ unsafe fn resolve_top_error_stack(lua_state: *mut i64) {
     // before any further Lua call can move them.
     let original = unsafe { std::slice::from_raw_parts(stack.cast::<u8>(), length) }.to_vec();
 
-    let _guard = lock_symbols();
-    let symbols = load_symbols_for_active_mod();
-    let (rewritten, resolved_frames) =
-        rewrite_stack_trace(&original, &symbols, &stock_databases().symbols);
+    // The lock covers only the symbol work. It is released before the push, so a
+    // Lua error that unwinds out of the VM cannot leave it held. Nothing after the
+    // push reads shared state, so it is not taken again.
+    let (rewritten, resolved_frames) = {
+        let _guard = lock_symbols();
+        let symbols = load_symbols_for_active_mod();
+        rewrite_stack_trace(&original, &symbols, &stock_databases().symbols)
+    };
     if resolved_frames != 0 && !rewritten.is_empty() && rewritten != original {
-        // SAFETY: the state is still live, and no Lua call has happened since `stack_bounds`.
-        if unsafe { replace_top_error_object(lua_state, &rewritten) } {
+        // SAFETY: the state is still live. The callee checks that the stack still holds
+        // `index` objects before it pushes.
+        if unsafe { replace_top_error_object(lua_state, index, &rewritten) } {
             // SAFETY: the message is a static NUL-terminated string.
             unsafe { OutputDebugStringA(s!("T7 Patch: resolved Lua stack symbols.\n")) };
         }
+    }
+}
+
+thread_local! {
+    /// Set while this thread rewrites a stack trace in `LuaStateManagerError`.
+    static IN_ERROR_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as inside the error-hook rewrite until dropped.
+struct ErrorHookGuard;
+
+impl ErrorHookGuard {
+    /// Returns None if this thread is already inside the rewrite.
+    fn try_enter() -> Option<Self> {
+        IN_ERROR_HOOK.with(|flag| (!flag.replace(true)).then_some(Self))
+    }
+}
+
+impl Drop for ErrorHookGuard {
+    fn drop(&mut self) {
+        IN_ERROR_HOOK.with(|flag| flag.set(false));
     }
 }
 
@@ -1016,17 +1113,23 @@ unsafe extern "system" fn hksi_lua_get_info_hook(
 
 /// Detour for `LuaStateManagerError`. Rewrites stack symbols, then calls the
 /// original. A panic in the rewrite is caught so the original error still runs.
+/// A call that re-enters the hook during the rewrite goes straight to the original.
 unsafe extern "system" fn lua_state_manager_error_hook(error: *const c_char, lua_state: *mut i64) {
-    let resolved = panic::catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the game passes `lua_state` to this hook as a live state.
-        unsafe { resolve_top_error_stack(lua_state) };
-    }));
-    if resolved.is_err() {
-        // SAFETY: the message is a static NUL-terminated string.
-        unsafe {
-            OutputDebugStringA(s!(
-                "T7 Patch: Lua symbol resolution failed; using the original stack trace.\n"
-            ));
+    // The guard is dropped before the original runs, so an error the original raises
+    // is rewritten in turn, but one raised by the rewrite's own Lua calls is not.
+    if let Some(guard) = ErrorHookGuard::try_enter() {
+        let resolved = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: the game passes `lua_state` to this hook as a live state.
+            unsafe { resolve_top_error_stack(lua_state) };
+        }));
+        drop(guard);
+        if resolved.is_err() {
+            // SAFETY: the message is a static NUL-terminated string.
+            unsafe {
+                OutputDebugStringA(s!(
+                    "T7 Patch: Lua symbol resolution failed; using the original stack trace.\n"
+                ));
+            }
         }
     }
     let address = ORIGINAL_LUA_STATE_MANAGER_ERROR.load(Ordering::Acquire);
@@ -1134,6 +1237,86 @@ mod tests {
         memory.write_u32(METHOD + METHOD_INSTRUCTION_COUNT_OFFSET, 3);
         memory.write_usize(METHOD + METHOD_INSTRUCTIONS_OFFSET, INSTRUCTIONS);
         memory
+    }
+
+    #[test]
+    fn stack_index_counts_whole_objects() {
+        assert_eq!(stack_index(0x1000, 0x1000), Some(0));
+        assert_eq!(stack_index(0x1030, 0x1000), Some(3));
+        assert_eq!(stack_index(0x1008, 0x1000), None);
+        assert_eq!(stack_index(0x0FF0, 0x1000), None);
+    }
+
+    #[test]
+    fn slot_address_rejects_overflow() {
+        assert_eq!(slot_address(0x1000, 2), Some(0x1020));
+        assert_eq!(slot_address(usize::MAX - 8, 1), None);
+        assert_eq!(slot_address(0, usize::MAX), None);
+    }
+
+    #[test]
+    fn push_result_uses_the_base_read_after_the_push() {
+        // Two objects at 0x1000 before the push; the push moved the stack to 0x8000.
+        assert_eq!(
+            push_result(2, 0x8030, 0x8000),
+            Some(PushResult::Pushed {
+                pushed: 0x8020,
+                below: 0x8010
+            })
+        );
+        assert_eq!(
+            push_result(2, 0x1030, 0x1000),
+            Some(PushResult::Pushed {
+                pushed: 0x1020,
+                below: 0x1010
+            })
+        );
+    }
+
+    #[test]
+    fn push_result_restores_index_on_a_bad_push() {
+        for top in [0x8020, 0x8040, 0x8028] {
+            assert_eq!(
+                push_result(2, top, 0x8000),
+                Some(PushResult::Unexpected {
+                    restore_top: 0x8020
+                })
+            );
+        }
+        assert_eq!(
+            push_result(0, 0x8010, 0x8000),
+            Some(PushResult::Unexpected {
+                restore_top: 0x8000
+            })
+        );
+    }
+
+    #[test]
+    fn error_hook_guard_blocks_reentry_until_dropped() {
+        let outer = ErrorHookGuard::try_enter();
+        assert!(outer.is_some());
+        assert!(ErrorHookGuard::try_enter().is_none());
+        drop(outer);
+        assert!(ErrorHookGuard::try_enter().is_some());
+    }
+
+    #[test]
+    fn error_hook_guard_resets_after_a_panic() {
+        let result = panic::catch_unwind(|| {
+            let _guard = ErrorHookGuard::try_enter().expect("first entry");
+            panic!("rewrite failed");
+        });
+        assert!(result.is_err());
+        assert!(ErrorHookGuard::try_enter().is_some());
+    }
+
+    #[test]
+    fn error_hook_guard_is_per_thread() {
+        let _guard = ErrorHookGuard::try_enter().expect("first entry");
+        let other = std::thread::spawn(|| ErrorHookGuard::try_enter().is_some())
+            .join()
+            .expect("thread");
+        assert!(other);
     }
 
     #[test]
