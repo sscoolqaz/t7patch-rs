@@ -88,8 +88,8 @@ fn run_patching() {
     let _ = ffi::initialize();
 
     if protection::CUSTOM_NAME[0].load(Ordering::Relaxed) == 0 {
-        // SAFETY: the name is a short, NUL-free ASCII string.
-        unsafe { protection::set_player_name(DEFAULT_PLAYER_NAME) };
+        // As in the C++, only the local copy is set here, not the game's name buffers.
+        let _ = protection::set_custom_name(DEFAULT_PLAYER_NAME);
     }
 
     protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
@@ -102,6 +102,50 @@ fn run_patching() {
     unsafe { exception::install() };
     // SAFETY: as above.
     unsafe { protection::install() };
+}
+
+/// Port of the exported `SetFriendsOnly`.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetFriendsOnly(is_friends_only: u8) {
+    protection::IS_FRIENDS_ONLY.store(is_friends_only != 0, Ordering::Relaxed);
+}
+
+/// Port of the exported `SetAutoInstallMods`.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetAutoInstallMods(is_enabled: u8) {
+    protection::IS_AUTO_INSTALL_MODS_ENABLED.store(is_enabled != 0, Ordering::Relaxed);
+}
+
+/// Port of the exported `SetPlayerName`. Names longer than 15 bytes are ignored.
+///
+/// # Safety
+///
+/// `name` must be null or a NUL-terminated string, and the game must be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetPlayerName(name: *const c_char) {
+    if name.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a NUL-terminated string, checked for null above.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    // SAFETY: the caller guarantees the game, and so its name buffers, are running.
+    unsafe { protection::set_player_name(name) };
+}
+
+/// Port of the exported `SetNetworkPassword`. An empty password clears it.
+///
+/// # Safety
+///
+/// `password` must be null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetNetworkPassword(password: *const c_char) {
+    let password = if password.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: the caller passes a NUL-terminated string, checked for null above.
+        unsafe { CStr::from_ptr(password) }.to_bytes()
+    };
+    protection::set_network_password_text(password);
 }
 
 /// Enables the injectorless install path. Must be called before `zbr_run_gamemode_lui`.
@@ -155,6 +199,8 @@ pub extern "C" fn Unload() {
     exception::IS_UNHOOKING.store(true, Ordering::Release);
     // SAFETY: the exception hook was installed by `run_patching`.
     unsafe { exception::uninstall() };
+    // Not in the C++: disable the detours so none jumps into this DLL after it is freed.
+    hooks::destroy_hooks();
 
     for id in other_thread_ids() {
         if let Some(thread) = open_thread(id) {

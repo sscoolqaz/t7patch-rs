@@ -86,10 +86,13 @@ pub unsafe fn detect_build() -> Build {
     classify(nt.FileHeader.TimeDateStamp, nt.OptionalHeader.SizeOfImage)
 }
 
-/// Base address of the running executable, or 0 if it cannot be queried.
+/// Base address of the running executable, or 0 if it cannot be queried. Cached after the first call.
 pub fn image_base() -> usize {
-    // SAFETY: a null module name asks for the calling process's executable; no pointers are passed.
-    unsafe { GetModuleHandleW(None) }.map_or(0, |module| module.0 as usize)
+    static BASE: OnceLock<usize> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        // SAFETY: a null module name asks for the calling process's executable; no pointers are passed.
+        unsafe { GetModuleHandleW(None) }.map_or(0, |module| module.0 as usize)
+    })
 }
 
 /// The build of the running executable, detected once and cached.

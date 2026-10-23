@@ -1436,6 +1436,16 @@ pub fn set_auto_install_mods(enabled: bool) {
     IS_AUTO_INSTALL_MODS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Stores `name` as the local custom name without touching the game's buffers.
+/// Returns the stored fields, or `None` when the name is longer than 15 bytes.
+pub fn set_custom_name(name: &[u8]) -> Option<[u8; PLAYER_NAME_LEN]> {
+    let fields = player_name_fields(name)?;
+    for (cell, byte) in CUSTOM_NAME.iter().zip(fields) {
+        cell.store(byte, Ordering::Relaxed);
+    }
+    Some(fields)
+}
+
 /// Port of `SetPlayerName`. Writes the name into the game's name buffers and
 /// keeps the local copy. Names longer than 15 bytes are ignored.
 ///
@@ -1443,12 +1453,9 @@ pub fn set_auto_install_mods(enabled: bool) {
 ///
 /// The game's name buffers and player data must be mapped (the game is running).
 pub unsafe fn set_player_name(name: &[u8]) {
-    let Some(fields) = player_name_fields(name) else {
+    let Some(fields) = set_custom_name(name) else {
         return;
     };
-    for (cell, byte) in CUSTOM_NAME.iter().zip(fields) {
-        cell.store(byte, Ordering::Relaxed);
-    }
     // SAFETY: `P_USER_DATA` and `P_NAME_BUFFER` are game name buffers of at least 16 bytes.
     unsafe {
         copy_bytes((address(offsets::P_USER_DATA) + 8) as *mut u8, &fields);
@@ -2564,9 +2571,12 @@ pub unsafe fn except_hook(record: *const EXCEPTION_RECORD, context: *mut CONTEXT
     }
 }
 
-/// The empty string the Lua-localize crash fixups substitute.
-fn ui_localize_default_text() -> u64 {
-    c"".as_ptr() as usize as u64
+/// Writable empty string, as the C++ `malloc(4)` buffer. The game may write to it.
+static UI_LOCALIZE_DEFAULT_TEXT: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
+
+/// Address of the empty string the Lua and localize crash fixups substitute.
+pub fn ui_localize_default_text() -> u64 {
+    UI_LOCALIZE_DEFAULT_TEXT.as_ptr() as usize as u64
 }
 
 /// Resumes the faulting thread with `NtContinue`-style `ZwContinue`.

@@ -12,9 +12,10 @@ use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualProtect, V
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::build::{self, Build};
+use crate::offsets;
 
 const PATCH_KEY: u8 = 0x69;
-const READY_SIGNAL_RVA: usize = 0x1686_E948;
+const READY_SIGNAL_RVA: usize = 0x1686E948;
 const CRC1_EXPECTED_COUNT: usize = 259;
 const CRC2_EXPECTED_COUNT: usize = 259;
 const CRC3_EXPECTED_COUNT: usize = 847;
@@ -122,8 +123,8 @@ unsafe fn memory_range(address: usize, size: usize, require_executable: bool) ->
     address >= region_start && size <= information.RegionSize - (address - region_start)
 }
 
-fn ready_signal_set(image_base: usize) -> bool {
-    let address = image_base + READY_SIGNAL_RVA;
+fn ready_signal_set() -> bool {
+    let address = offsets::address(READY_SIGNAL_RVA);
     // SAFETY: `memory_range` confirms the word is committed and readable before it is read.
     unsafe {
         memory_range(address, size_of::<usize>(), false)
@@ -408,7 +409,7 @@ pub fn maintain() {
     if !ACTIVE.load(Ordering::Acquire)
         || EXTERNAL.load(Ordering::Acquire)
         || !WAITING_FOR_READY_SIGNAL.load(Ordering::Acquire)
-        || !ready_signal_set(build::image_base())
+        || !ready_signal_set()
     {
         return;
     }

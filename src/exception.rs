@@ -44,9 +44,6 @@ const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 const UNKNOWN_MODULE: &str = "<Unknown Module>";
 const CLIENTFIELD_DOESNT_EXIST: &CStr = c"Clientfield does not exist";
 
-/// Stand-in localized string handed to crashing UI code. It is always empty.
-static EMPTY_LOCALIZED_TEXT: [u8; 4] = [0; 4];
-
 /// Set while the hook is being removed, so the next fault resumes cleanly.
 pub static IS_UNHOOKING: AtomicBool = AtomicBool::new(false);
 /// Thread id currently writing the crash log, or 0 when nobody is.
@@ -120,11 +117,6 @@ unsafe fn resume_at(context: *mut CONTEXT, rip: usize) {
     }
 }
 
-/// Address of the empty localized string returned to crashing UI code.
-fn localized_empty_text() -> u64 {
-    EMPTY_LOCALIZED_TEXT.as_ptr().addr() as u64
-}
-
 fn open_crash_log() -> std::fs::File {
     match OpenOptions::new()
         .create(true)
@@ -155,6 +147,14 @@ fn suspend_process() {
     let _ = unsafe { CloseHandle(process) };
 }
 
+/// Removes and returns one saved exception context, if any.
+fn take_saved_exception() -> Option<(i64, CONTEXT)> {
+    let mut saved = lock_saved();
+    let map = saved.as_mut()?;
+    let key = *map.keys().next()?;
+    map.remove(&key).map(|context| (key, context))
+}
+
 /// Writes one exception line block for every saved context, then empties the map.
 ///
 /// # Safety
@@ -162,16 +162,10 @@ fn suspend_process() {
 /// Reads the saved stack of each context; the addresses are the faulting thread's own stack.
 unsafe fn dump_saved_exceptions(log: &mut std::fs::File, code: i32) {
     let image_base = build::image_base() as u64;
-    let mut saved = lock_saved();
-    let Some(map) = saved.as_mut() else {
-        return;
-    };
 
-    while let Some(&key) = map.keys().next() {
-        let Some(context) = map.remove(&key) else {
-            break;
-        };
-
+    // The lock is held only to take one entry. A fault while dumping, on this
+    // thread or another, can then add its context and is dumped by this loop.
+    while let Some((key, context)) = take_saved_exception() {
         let mut module_base: *mut c_void = std::ptr::null_mut();
         // SAFETY: `key` is a code address captured from an exception record.
         unsafe { RtlPcToFileHeader(key as *const c_void, &raw mut module_base) };
@@ -293,7 +287,7 @@ unsafe extern "system" fn exception_hook(record: *mut EXCEPTION_RECORD, context:
 ///
 /// `context` must be the context of the exception at `at`.
 unsafe fn redirect_known_crash(at: usize, context: *mut CONTEXT) -> bool {
-    let text = localized_empty_text();
+    let text = protection::ui_localize_default_text();
 
     // SAFETY (all `resume_at` / field writes below): `context` is the current exception's context.
     unsafe {
@@ -307,16 +301,8 @@ unsafe fn redirect_known_crash(at: usize, context: *mut CONTEXT) -> bool {
             resume_at(context, address(0x15E4BA3));
         } else if at == address(0x12EE4EC) {
             resume_at(context, address(0x12EE5E8));
-        } else if at == address(0x22C965C) {
-            resume_at(context, address(0x22C9686));
-        } else if at == address(offsets::LUA_CRASH1) {
-            resume_at(context, address(offsets::LUA_CRASH1_RIP));
-        } else if at == address(offsets::LUA_CRASH2) {
-            (*context).Rdx = text;
-            zw_continue(context);
-        } else if at == address(offsets::LUA_CRASH3) {
-            (*context).Rsi = text;
-            zw_continue(context);
+        // The character-index and LUA_CRASH1-3 fixups that the C++ repeats here are
+        // left to `protection::except_hook`, which handles them first.
         } else if at == address(0x22328F6) {
             (*context).Rcx = text;
             zw_continue(context);
