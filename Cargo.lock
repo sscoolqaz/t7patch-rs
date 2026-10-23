@@ -5,8 +5,6 @@ version = 4
 [[package]]
 name = "min_hook_rs"
 version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39cccc0a5c13bf9e531546f9226703a05aa82cc065e95445034ba0724ed66453"
 dependencies = [
  "windows-sys",
 ]

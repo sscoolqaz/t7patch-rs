@@ -1,0 +1,383 @@
+//! x86_64 instruction decoder
+
+/// Simplified instruction structure for trampoline generation
+#[derive(Debug, Clone, Default)]
+pub struct HookInstruction {
+    pub len: u8,
+    pub opcode: u8,
+    pub opcode2: u8,
+    pub modrm: u8,
+    pub immediate: i32,
+    pub immediate_size: u8,
+    pub displacement: i32,
+}
+
+impl HookInstruction {
+    #[inline]
+    pub fn is_rip_relative(&self) -> bool {
+        (self.modrm & 0xC7) == 0x05
+    }
+
+    #[inline]
+    pub fn modrm_reg(&self) -> u8 {
+        (self.modrm & 0x38) >> 3
+    }
+
+    #[inline]
+    pub fn modrm_rm(&self) -> u8 {
+        self.modrm & 0x07
+    }
+
+    #[inline]
+    pub fn modrm_mod(&self) -> u8 {
+        self.modrm >> 6
+    }
+
+    #[inline]
+    pub fn is_conditional_jump(&self) -> bool {
+        // Short conditional jumps (70-7F)
+        if (self.opcode & 0xF0) == 0x70 {
+            return true;
+        }
+
+        // LOOP instructions (E0-E3)
+        if (self.opcode & 0xFC) == 0xE0 {
+            return true;
+        }
+
+        // Long conditional jumps (0F 80-8F)
+        if self.opcode == 0x0F && (self.opcode2 & 0xF0) == 0x80 {
+            return true;
+        }
+
+        false
+    }
+}
+
+// Table constants
+const C_MODRM: u8 = 0x01;
+const C_IMM8: u8 = 0x02;
+const C_IMM16: u8 = 0x04;
+const C_IMM_P66: u8 = 0x10;
+const C_REL8: u8 = 0x20;
+const C_REL32: u8 = 0x40;
+const C_GROUP: u8 = 0x80;
+
+const PRE_NONE: u8 = 0x01;
+const PRE_F2: u8 = 0x02;
+const PRE_F3: u8 = 0x04;
+const PRE_66: u8 = 0x08;
+const PRE_67: u8 = 0x10;
+const PRE_LOCK: u8 = 0x20;
+const PRE_SEG: u8 = 0x40;
+
+const DELTA_OPCODES: usize = 0x4a;
+
+static HDE64_TABLE: &[u8] = &[
+    0xa5, 0xaa, 0xa5, 0xb8, 0xa5, 0xaa, 0xa5, 0xaa, 0xa5, 0xb8, 0xa5, 0xb8, 0xa5, 0xb8, 0xa5, 0xb8,
+    0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xac, 0xc0, 0xcc, 0xc0, 0xa1, 0xa1, 0xa1, 0xa1,
+    0xb1, 0xa5, 0xa5, 0xa6, 0xc0, 0xc0, 0xd7, 0xda, 0xe0, 0xc0, 0xe4, 0xc0, 0xea, 0xea, 0xe0, 0xe0,
+    0x98, 0xc8, 0xee, 0xf1, 0xa5, 0xd3, 0xa5, 0xa5, 0xa1, 0xea, 0x9e, 0xc0, 0xc0, 0xc2, 0xc0, 0xe6,
+    0x03, 0x7f, 0x11, 0x7f, 0x01, 0x7f, 0x01, 0x3f, 0x01, 0x01, 0xab, 0x8b, 0x90, 0x64, 0x5b, 0x5b,
+    0x5b, 0x5b, 0x5b, 0x92, 0x5b, 0x5b, 0x76, 0x90, 0x92, 0x92, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b,
+    0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x6a, 0x73, 0x90, 0x5b, 0x52, 0x52, 0x52, 0x52, 0x5b, 0x5b,
+    0x5b, 0x5b, 0x77, 0x7c, 0x77, 0x85, 0x5b, 0x5b, 0x70, 0x5b, 0x7a, 0xaf, 0x76, 0x76, 0x5b, 0x5b,
+    0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x5b, 0x86, 0x01, 0x03, 0x01, 0x04, 0x03, 0xd5,
+    0x03, 0xd5, 0x03, 0xcc, 0x01, 0xbc, 0x03, 0xf0, 0x03, 0x03, 0x04, 0x00, 0x50, 0x50, 0x50, 0x50,
+    0xff, 0x20, 0x20, 0x20, 0x20, 0x01, 0x01, 0x01, 0x01, 0xc4, 0x02, 0x10, 0xff, 0xff, 0xff, 0x01,
+    0x00, 0x03, 0x11, 0xff, 0x03, 0xc4, 0xc6, 0xc8, 0x02, 0x10, 0x00, 0xff, 0xcc, 0x01, 0x01, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x03, 0x01, 0xff, 0xff, 0xc0, 0xc2, 0x10, 0x11, 0x02, 0x03,
+    0x01, 0x01, 0x01, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x10, 0x10, 0x10, 0x10, 0x02, 0x10, 0x00, 0x00, 0xc6, 0xc8, 0x02, 0x02, 0x02, 0x02, 0x06, 0x00,
+    0x04, 0x00, 0x02, 0xff, 0x00, 0xc0, 0xc2, 0x01, 0x01, 0x03, 0x03, 0x03, 0xca, 0x40, 0x00, 0x0a,
+    0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x33, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xbf, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xbf,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0xff, 0x40, 0x40, 0x40, 0x40,
+    0x41, 0x49, 0x40, 0x40, 0x40, 0x40, 0x4c, 0x42, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+    0x4f, 0x44, 0x53, 0x40, 0x40, 0x40, 0x44, 0x57, 0x43, 0x5c, 0x40, 0x60, 0x40, 0x40, 0x40, 0x40,
+    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x64, 0x66, 0x6e, 0x6b, 0x40, 0x40,
+    0x6a, 0x46, 0x40, 0x40, 0x44, 0x46, 0x40, 0x40, 0x5b, 0x44, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00,
+    0x06, 0x06, 0x06, 0x06, 0x01, 0x06, 0x06, 0x02, 0x06, 0x06, 0x00, 0x06, 0x00, 0x0a, 0x0a, 0x00,
+    0x00, 0x00, 0x02, 0x07, 0x07, 0x06, 0x02, 0x0d, 0x06, 0x06, 0x06, 0x0e, 0x05, 0x05, 0x02, 0x02,
+    0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x05, 0x06, 0x06, 0x06, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00,
+    0x08, 0x00, 0x10, 0x00, 0x18, 0x00, 0x20, 0x00, 0x28, 0x00, 0x30, 0x00, 0x80, 0x01, 0x82, 0x01,
+    0x86, 0x00, 0xf6, 0xcf, 0xfe, 0x3f, 0xab, 0x00, 0xb0, 0x00, 0xb1, 0x00, 0xb3, 0x00, 0xba, 0xf8,
+    0xbb, 0x00, 0xc0, 0x00, 0xc1, 0x00, 0xc7, 0xbf, 0x62, 0xff, 0x00, 0x8d, 0xff, 0x00, 0xc4, 0xff,
+    0x00, 0xc5, 0xff, 0x00, 0xff, 0xff, 0xeb, 0x01, 0xff, 0x0e, 0x12, 0x08, 0x00, 0x13, 0x09, 0x00,
+    0x16, 0x08, 0x00, 0x17, 0x09, 0x00, 0x2b, 0x09, 0x00, 0xae, 0xff, 0x07, 0xb2, 0xff, 0x00, 0xb4,
+    0xff, 0x00, 0xb5, 0xff, 0x00, 0xc3, 0x01, 0x00, 0xc7, 0xff, 0xbf, 0xe7, 0x08, 0x00, 0xf0, 0x02,
+    0x00,
+];
+
+pub fn decode_instruction(code: &[u8]) -> HookInstruction {
+    let mut hs = HookInstruction::default();
+    let mut p = 0usize;
+    let mut pref = 0u8;
+    let mut op64 = 0u8;
+
+    if code.is_empty() {
+        return hs;
+    }
+
+    // Parse prefixes
+    for _ in 0..16 {
+        if p >= code.len() {
+            break;
+        }
+
+        match code[p] {
+            0xf3 | 0xf2 => {
+                p += 1;
+                pref |= if code[p - 1] == 0xf3 { PRE_F3 } else { PRE_F2 };
+            }
+            0xf0 => {
+                p += 1;
+                pref |= PRE_LOCK;
+            }
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {
+                p += 1;
+                pref |= PRE_SEG;
+            }
+            0x66 => {
+                p += 1;
+                pref |= PRE_66;
+            }
+            0x67 => {
+                p += 1;
+                pref |= PRE_67;
+            }
+            _ => break,
+        }
+    }
+
+    if pref == 0 {
+        pref |= PRE_NONE;
+    }
+
+    if p >= code.len() {
+        return hs;
+    }
+
+    let mut c = code[p];
+    p += 1;
+
+    // REX prefix
+    if (c & 0xf0) == 0x40 {
+        let rex_w = (c & 0xf) >> 3;
+        if rex_w != 0 && p < code.len() && (code[p] & 0xf8) == 0xb8 {
+            op64 += 1;
+        }
+
+        if p >= code.len() {
+            return hs;
+        }
+
+        c = code[p];
+        p += 1;
+    }
+
+    hs.opcode = c;
+    let mut ht = 0usize;
+
+    // Two-byte opcode
+    if c == 0x0f {
+        if p >= code.len() {
+            return hs;
+        }
+        hs.opcode2 = code[p];
+        p += 1;
+        c = hs.opcode2;
+        ht += DELTA_OPCODES;
+    } else if (0xa0..=0xa3).contains(&c) {
+        op64 += 1;
+        if (pref & PRE_67) != 0 {
+            pref |= PRE_66;
+        } else {
+            pref &= !PRE_66;
+        }
+    }
+
+    let opcode = c;
+    let mut cflags = get_table_entry(ht, opcode);
+
+    if (cflags & C_GROUP) != 0 {
+        let group_offset = ht + (cflags & 0x7f) as usize;
+        if group_offset + 1 < HDE64_TABLE.len() {
+            let t = u16::from_le_bytes([HDE64_TABLE[group_offset], HDE64_TABLE[group_offset + 1]]);
+            cflags = (t & 0xff) as u8;
+        }
+    }
+
+    // ModR/M processing
+    if (cflags & C_MODRM) != 0 {
+        if p >= code.len() {
+            return hs;
+        }
+
+        c = code[p];
+        p += 1;
+        hs.modrm = c;
+
+        let modrm_mod = c >> 6;
+        let modrm_rm = c & 7;
+        let modrm_reg = (c & 0x38) >> 3;
+
+        // SIB and displacement processing
+        let (sib_bytes, disp_size) = process_addressing_mode(code, p, modrm_mod, modrm_rm, pref);
+        p += sib_bytes as usize;
+        p += process_displacement(code, p, disp_size, &mut hs);
+
+        // Additional immediate for F6/F7 instructions
+        if modrm_reg <= 1 {
+            if opcode == 0xf6 {
+                cflags |= C_IMM8;
+            } else if opcode == 0xf7 {
+                cflags |= C_IMM_P66;
+            }
+        }
+    }
+
+    // Process immediate values
+    process_immediate_values(code, &mut p, &mut hs, cflags, pref, op64);
+
+    hs.len = p.min(15) as u8;
+    hs
+}
+
+fn get_table_entry(ht_offset: usize, opcode: u8) -> u8 {
+    let table_idx_offset = ht_offset + (opcode / 4) as usize;
+    if table_idx_offset >= HDE64_TABLE.len() {
+        return 0;
+    }
+
+    let table_idx = HDE64_TABLE[table_idx_offset];
+    let final_idx = ht_offset + table_idx as usize + (opcode % 4) as usize;
+
+    if final_idx >= HDE64_TABLE.len() {
+        return 0;
+    }
+
+    HDE64_TABLE[final_idx]
+}
+
+fn process_addressing_mode(
+    code: &[u8],
+    pos: usize,
+    modrm_mod: u8,
+    modrm_rm: u8,
+    pref: u8,
+) -> (u8, u8) {
+    let mut sib_bytes = 0u8;
+    let mut disp_size = 0u8;
+
+    match modrm_mod {
+        0 => {
+            if (pref & PRE_67) != 0 {
+                if modrm_rm == 6 {
+                    disp_size = 2;
+                }
+            } else if modrm_rm == 5 {
+                disp_size = 4;
+            }
+        }
+        1 => {
+            disp_size = 1;
+        }
+        2 => {
+            disp_size = 2;
+            if (pref & PRE_67) == 0 {
+                disp_size <<= 1;
+            }
+        }
+        _ => {}
+    }
+
+    if modrm_mod != 3 && modrm_rm == 4 && pos < code.len() {
+        sib_bytes = 1;
+        let sib = code[pos];
+        if (sib & 7) == 5 && (modrm_mod & 1) == 0 {
+            disp_size = 4;
+        }
+    }
+
+    (sib_bytes, disp_size)
+}
+
+fn process_displacement(code: &[u8], pos: usize, disp_size: u8, hs: &mut HookInstruction) -> usize {
+    if disp_size == 0 || pos + disp_size as usize > code.len() {
+        return 0;
+    }
+
+    match disp_size {
+        1 => {
+            hs.displacement = code[pos] as i8 as i32;
+        }
+        2 => {
+            hs.displacement = i16::from_le_bytes([code[pos], code[pos + 1]]) as i32;
+        }
+        4 => {
+            hs.displacement =
+                i32::from_le_bytes([code[pos], code[pos + 1], code[pos + 2], code[pos + 3]]);
+        }
+        _ => {}
+    }
+
+    disp_size as usize
+}
+
+fn read_immediate(code: &[u8], pos: &mut usize, hs: &mut HookInstruction, size: u8) -> bool {
+    if *pos + size as usize > code.len() {
+        return false;
+    }
+
+    hs.immediate = match size {
+        1 => code[*pos] as i8 as i32,
+        2 => i16::from_le_bytes([code[*pos], code[*pos + 1]]) as i32,
+        4 => i32::from_le_bytes([code[*pos], code[*pos + 1], code[*pos + 2], code[*pos + 3]]),
+        8 => i32::from_le_bytes([code[*pos], code[*pos + 1], code[*pos + 2], code[*pos + 3]]),
+        _ => 0,
+    };
+
+    hs.immediate_size = size;
+    *pos += size as usize;
+    true
+}
+
+fn process_immediate_values(
+    code: &[u8],
+    pos: &mut usize,
+    hs: &mut HookInstruction,
+    cflags: u8,
+    pref: u8,
+    op64: u8,
+) {
+    if (cflags & C_IMM_P66) != 0 {
+        if (cflags & C_REL32) != 0 {
+            if (pref & PRE_66) != 0 {
+                read_immediate(code, pos, hs, 2);
+                return;
+            }
+        } else if op64 != 0 {
+            read_immediate(code, pos, hs, 8);
+        } else if (pref & PRE_66) == 0 {
+            read_immediate(code, pos, hs, 4);
+        } else {
+            read_immediate(code, pos, hs, 2);
+        }
+    }
+
+    if (cflags & C_IMM16) != 0 {
+        read_immediate(code, pos, hs, 2);
+    }
+
+    if (cflags & C_IMM8) != 0 {
+        read_immediate(code, pos, hs, 1);
+    }
+
+    if (cflags & C_REL32) != 0 {
+        read_immediate(code, pos, hs, 4);
+    } else if (cflags & C_REL8) != 0 {
+        read_immediate(code, pos, hs, 1);
+    }
+}

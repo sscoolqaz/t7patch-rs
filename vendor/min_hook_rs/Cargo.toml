@@ -1,0 +1,50 @@
+[package]
+name = "min_hook_rs"
+version = "2.2.1"
+edition = "2024"
+license = "MIT"
+authors = ["Rukkhadevata123 <rukkhadevata@foxmail.com>"]
+description = "A Rust implementation of MinHook library for Windows x64 function hooking with simplified but reliable instruction decoding"
+documentation = "https://docs.rs/min_hook_rs"
+homepage = "https://github.com/Rukkhadevata123/min_hook_rs"
+repository = "https://github.com/Rukkhadevata123/min_hook_rs"
+readme = "README.md"
+keywords = ["hook", "windows", "x64", "function", "detour"]
+categories = ["os::windows-apis", "development-tools", "api-bindings"]
+exclude = [
+    ".github/",
+    "target/",
+    ".vscode/",
+    "Cargo.lock",
+]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Environment",
+    "Win32_System_Memory",
+    "Win32_System_Kernel",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_Security",
+    "Win32_Storage",
+    "Win32_Storage_FileSystem",
+]
+
+# Library configuration
+[lib]
+name = "min_hook_rs"
+crate-type = ["rlib"]
