@@ -3116,7 +3116,7 @@ static DVAR_SETTINGS_APPLIED: AtomicBool = AtomicBool::new(false);
 ///
 /// # Errors
 ///
-/// Returns an error when a game function or Steam interface cannot be resolved, or a Steam vtable slot cannot be read.
+/// Returns an error when a Steam interface pointer or its vtable pointer is still null.
 pub unsafe fn initialize() -> Result<(), String> {
     if INITIALIZED.load(Ordering::Acquire) {
         return Ok(());

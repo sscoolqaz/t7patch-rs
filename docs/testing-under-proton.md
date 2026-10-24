@@ -156,8 +156,9 @@ Two helpers live in [`tools/`](../tools):
   constant in `src/offsets.rs` (`offset_prologues.json`). That last file shows
   whether each constant is a function start or a site inside a function; it is
   how the PrepReadData bug was found. It needs `llvm-nm` to find the
-  trampoline slot in the DLL, and the DLL given must be the exact file in the
-  game folder.
+  trampoline slot in the DLL. The DLL given must be the exact file in the game
+  folder, with its symbol table (the default release build keeps it; a stripped
+  DLL is refused).
 
 ```bash
 tools/capture_hooks.py --dll "<game dir>/t7patch.dll" --offsets src/offsets.rs --out capture --delay 25

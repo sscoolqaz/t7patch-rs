@@ -1047,7 +1047,8 @@ pub(crate) fn note_exception_producer() {
 
 /// Port of the fork's `UninstallHook`: restores the dispatcher's original callback when no
 /// exception producer was ever exposed. Once the lobby marker or the IAT detour has been
-/// written, or on the Wine stub layout, the hook is retained for the process lifetime.
+/// written, or on the Wine stub layout while a thread is inside the stub, the hook is
+/// retained for the process lifetime.
 /// Does nothing if the hook was never installed.
 ///
 /// # Safety
@@ -1056,7 +1057,9 @@ pub(crate) fn note_exception_producer() {
 ///
 /// # Errors
 ///
-/// Returns an error when the original callback or Wine stub cannot be restored. The hook then stays installed.
+/// Returns an error when the dispatcher's layout is unknown or changed, or when its
+/// original callback slot cannot be written back. The hook then stays installed. A Wine
+/// stub that cannot be restored yet is kept and is not an error.
 pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
     if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         return Ok(());

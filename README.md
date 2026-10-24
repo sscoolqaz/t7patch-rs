@@ -14,7 +14,8 @@ or Lua path has been verified. It is untested on Windows. The tests pass under W
 
 Two states are deliberately retained after unload: the exception dispatcher once an
 induced-exception patch (the lobby marker or the `IsProcessorFeaturePresent` detour) has
-been live, or always on the Wine stub layout, and the three dvar settings changed at
+been live, or on the Wine stub layout while a frozen stack scan still finds a thread in
+the stub, and the three dvar settings changed at
 install, because there is no verified dvar finder address to restore them.
 
 ## Documentation

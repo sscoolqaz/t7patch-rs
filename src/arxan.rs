@@ -706,7 +706,10 @@ pub fn partial() -> bool {
 ///
 /// # Errors
 ///
-/// Returns the reason when the executable is not a supported build or a checksum patch cannot be written. A failed install leaves the bypass partially applied for the caller's rollback to undo.
+/// Returns the reason when the executable is not a supported build, a checksum
+/// pattern is not found as expected, a previous restore is incomplete, or the patches
+/// cannot be written. A failed write rolls back the patches already applied; the error
+/// says whether that rollback was incomplete.
 pub fn install() -> Result<String, String> {
     let mut state = lock_state();
     if ACTIVE.load(Ordering::Acquire) {

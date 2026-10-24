@@ -51,7 +51,9 @@ def image_base(path):
     return struct.unpack_from("<Q", pe, header + 24 + 24)[0]
 
 nm = subprocess.run(["llvm-nm", args.dll], capture_output=True, text=True, check=True).stdout
-orig_va = next(int(l.split()[0], 16) for l in nm.splitlines() if "ORIG_PACKAGE_UINT.0" in l)
+orig_va = next((int(l.split()[0], 16) for l in nm.splitlines() if "ORIG_PACKAGE_UINT.0" in l), None)
+if orig_va is None:
+    sys.exit(f"{args.dll} has no ORIG_PACKAGE_UINT symbol; pass an unstripped release build")
 orig_rva = orig_va - image_base(args.dll)
 dll_sha = hashlib.sha256(open(args.dll, "rb").read()).hexdigest()
 

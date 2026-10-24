@@ -26,7 +26,8 @@ pub type MinHookError = HookError;
 ///
 /// # Errors
 ///
-/// Returns the hooking library's error, for example when it is already initialized or its memory cannot be allocated.
+/// Returns the hooking library's error when it is already initialized or its internal
+/// lock is poisoned.
 pub fn initialize() -> Result<(), MinHookError> {
     min_hook_rs::initialize()
 }
