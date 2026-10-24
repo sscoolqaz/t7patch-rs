@@ -52,6 +52,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 15 | `cee873f` (verdict trace), `detours,trace` | The user could click into a lobby, but hosting failed. Our own client's info response was dropped: `info-check: xuid=<local-xuid> DROP reason=info-response-rejected detail=2`. Code 2 is a failure to read the `valid` bool of the first lobby element. The sender is the local player (P_USER_DATA). Exited after 80 s with zero `c0000005`. |
 | 17 | `8abb861` (nested parser), `detours,trace` | The local client's info response now parses and goes to the game's handler: `info-check: xuid=<local-xuid> DROP reason=info-response-handled detail=0` (run 15: `info-response-rejected detail=2`). Exited after 64 s, with zero `c0000005` and no crash log. Whether hosting succeeded is per the user. |
 | 18 | `d068a9f` (msg_t handoff), `detours,trace` | **Hosting works.** The lobby loaded. The verdict trace shows our own `keep reason=local` / `info-response-handled` pair every 5 to 8 s while hosting. The user then played a round. Exited 229 s after load with zero `c0000005` and no crash log; the five request/response pairs logged were all handled. |
+| 19 | `d068a9f`, **full patch** (`T7PATCH_ONLY` unset, so the VMT hook is on and `trace` is off), no Proton log | The user hosted and played a couple of rounds. Exited after 263 s with no crash-log entry. Without a Proton log there are no AV counts. |
 
 ## Findings
 
@@ -324,8 +325,8 @@ loaded the same DLL without faulting.
   local `msg`, positioned after the IM header, which is the same work as the
   normal path. Upstream passes the raw pointer too, but never reaches that
   line. Run 18 confirmed it: the lobby hosts.
-- Next, run the full patch (`T7PATCH_ONLY` unset, which adds the VMT hook)
-  without `trace`, to a lobby and a round.
+- Run 19 confirmed the full patch (VMT hook included, no `trace`): it hosts
+  and plays a round under Proton. Still untested: Windows.
 - Open (also upstream): the normal path calls `LobbyMsg_HandleIM` without
   checking `msg.overflowed` after `MSG_ReadData`. The game's own handler
   skips dispatch on overflow.
