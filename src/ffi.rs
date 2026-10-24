@@ -4,7 +4,10 @@
 //! The port keeps `MinHook`'s design: the HDE64 length decoder, trampolines
 //! allocated within 2 GB of the target, and thread suspension while patching.
 //! The vendored copy freezes fail closed and applies each change as one
-//! transaction: on any error except [`HookError::ThreadResume`] no hook changes state.
+//! transaction: on an error no hook changes state, with two exceptions. After
+//! [`HookError::ThreadResume`] the change may have applied. After
+//! [`HookError::ThreadContext`], if a moved thread's context could not be restored,
+//! every hook in the change is left disabled.
 //!
 //! Every wrapper holds [`crate::threads::lock_transaction`], so a hook change never
 //! runs alongside the crate's own code writes: two freezes at once could suspend each
@@ -26,7 +29,9 @@ use min_hook_rs::{ALL_HOOKS, HookError};
 /// - [`HookError::ThreadSuspend`] (13): a thread could not be enumerated,
 ///   opened or suspended, so nothing was patched.
 /// - [`HookError::ThreadContext`] (14): a suspended thread's context could not
-///   be read or written, and the change was rolled back.
+///   be read or written, and the change was rolled back. If a moved thread's
+///   context could not be restored either, every hook in the change is left
+///   disabled instead.
 /// - [`HookError::ThreadResume`] (15): a frozen thread could not be resumed. The
 ///   change may have applied. Terminal: every later call is refused with it.
 pub type MinHookError = HookError;

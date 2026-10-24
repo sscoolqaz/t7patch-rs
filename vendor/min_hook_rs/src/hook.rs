@@ -327,8 +327,9 @@ impl FrozenThreads {
     // confirmed, also retries: under Wine that happens to a thread that is
     // starting or exiting. Returns the disturbance, or `None` once frozen.
     //
-    // `gone` holds the ids whose thread had exited, which may still be listed on
-    // the second enumeration and are not new.
+    // `gone` holds the ids whose thread had exited. One listed again on the second
+    // enumeration is checked once more: if its id now names a live thread of this
+    // process, a new thread was given the recycled id, which is a disturbance.
     fn attempt(
         &mut self,
         list: &mut ThreadList,
@@ -360,7 +361,7 @@ impl FrozenThreads {
         let settled = fresh
             .as_slice()
             .iter()
-            .all(|&id| seen.contains(id) || gone.contains(id));
+            .all(|&id| seen.contains(id) || (gone.contains(id) && still_gone(id)));
         Ok((!settled).then_some(HookError::ThreadSuspend))
     }
 
@@ -460,6 +461,22 @@ fn resume_one(handle: HANDLE) -> bool {
         }
     }
     exited(handle)
+}
+
+/// True when `id` names no live thread of this process. An id that cannot be checked
+/// counts as live, so the caller retries rather than trusting it.
+fn still_gone(id: u32) -> bool {
+    // SAFETY: plain Win32 calls on a handle this function opens and closes.
+    unsafe {
+        let handle = sys::open_thread(id);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let owner = GetProcessIdOfThread(handle);
+        let gone = (owner != 0 && owner != GetCurrentProcessId()) || exited(handle);
+        CloseHandle(handle);
+        gone
+    }
 }
 
 /// True when the thread behind `handle` has exited.
@@ -1641,8 +1658,9 @@ mod tests {
         fault::open_error(ERROR_INVALID_PARAMETER);
         fault::fail(Call::OpenThread, 0b1);
         enable_hook(target(mix_a)).expect("an exited thread does not block the freeze");
-        // Still listed on the check, but known gone, so not taken for a new thread.
-        assert_eq!(fault::rounds(), 2);
+        // The thread reported gone is still listed and in fact alive, as a thread
+        // given a recycled id would be, so the first attempt is retried.
+        assert_eq!(fault::rounds(), 4);
         assert!(hooked(mix_a));
     }
 

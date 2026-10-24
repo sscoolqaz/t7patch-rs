@@ -80,8 +80,9 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    context then hangs with every other thread frozen. (Suspending such threads
    deadlocked the T7Patch-rs test binary in 4 of 6 runs.) An attempt whose context
    read fails is retried the same way, since under Wine that happens to a thread
-   that is starting or exiting. An id whose thread had exited may still be listed,
-   so it is not counted as new. After 16 disturbed attempts the freeze gives up
+   that is starting or exiting. An id whose thread had exited and that is listed
+   again is opened once more: if it now names a live thread of this process (a new
+   thread given the recycled id), the attempt is retried too. After 16 disturbed attempts the freeze gives up
    with `ThreadSuspend`, or `ThreadContext` if the last one failed a context read.
    Enumeration uses `NtQuerySystemInformation(SystemProcessInformation)` into a
    buffer sized with headroom before the freeze, and ids go into fixed arrays, so
@@ -141,5 +142,9 @@ removed. Neither changes behaviour.
   deadlock. `src/threads.rs` in T7Patch-rs has the same exposure. Wine's
   `NtQuerySystemInformation` may allocate on its Unix side, from an allocator a
   suspended thread could hold (not verified); `src/threads.rs` shares that too.
+- A thread already starting up when the first snapshot is taken is suspended like
+  any other, and its context read can block under Wine for the same reason a late
+  thread's did. Retries cannot bound a call that blocks. Upstream had the same
+  exposure in its single context read, and `src/threads.rs` shares it.
 - Only RIP is checked (unchanged from upstream). A return address into a trampoline (from a relocated
   `call` in the prologue) on some thread's stack is not detected.

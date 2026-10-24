@@ -53,7 +53,9 @@ pub enum HookError {
     /// A thread could not be enumerated, opened or suspended, so nothing was patched
     ThreadSuspend = 13,
 
-    /// A suspended thread's context could not be read or written; the change was rolled back
+    /// A suspended thread's context could not be read or written. The change was rolled
+    /// back, or, if a moved thread's context could not be restored either, every hook in
+    /// the change was left disabled
     ThreadContext = 14,
 
     /// A frozen thread could not be resumed. Terminal: the change may have applied, and
