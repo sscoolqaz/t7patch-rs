@@ -46,7 +46,10 @@ static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
 /// Patch components for in-game diagnosis, chosen with the `T7PATCH_ONLY`
 /// environment variable: a comma-separated subset of `arxan`, `dispatcher`,
-/// `hooks` and `protection`. Unset, everything is installed, as upstream does.
+/// `protection` and the hook names below. Unset, everything is installed, as upstream
+/// does. `hooks` means every hook stage. To split it, `create` creates the `MinHook`
+/// detours without enabling them, `detours` creates and enables them, and `vmt` applies
+/// the lobby VMT hook, which is independent of the detours.
 /// Proton passes launch-option variables through to the game, so a component
 /// can be switched off without a rebuild.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +60,9 @@ static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 struct Components {
     arxan: bool,
     dispatcher: bool,
-    hooks: bool,
+    create_hooks: bool,
+    enable_hooks: bool,
+    vmt_hook: bool,
     protection: bool,
 }
 
@@ -65,21 +70,28 @@ impl Components {
     const ALL: Self = Self {
         arxan: true,
         dispatcher: true,
-        hooks: true,
+        create_hooks: true,
+        enable_hooks: true,
+        vmt_hook: true,
         protection: true,
     };
 
-    /// Parses a `T7PATCH_ONLY` value. Unknown names are ignored.
+    /// Parses a `T7PATCH_ONLY` value. Unknown names are ignored. Enabled detours imply
+    /// created ones.
     fn parse(value: &str) -> Self {
         let has = |name: &str| {
             value
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case(name))
         };
+        let all_hooks = has("hooks");
+        let enable_hooks = all_hooks || has("detours");
         Self {
             arxan: has("arxan"),
             dispatcher: has("dispatcher"),
-            hooks: has("hooks"),
+            create_hooks: enable_hooks || has("create"),
+            enable_hooks,
+            vmt_hook: all_hooks || has("vmt"),
             protection: has("protection"),
         }
     }
@@ -119,7 +131,7 @@ impl Operations for PatchOps {
         }
         protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
 
-        if components.hooks && !HOOKS_PREPARED.load(Ordering::Acquire) {
+        if components.create_hooks && !HOOKS_PREPARED.load(Ordering::Acquire) {
             if !HOOK_LIB_INITIALIZED.load(Ordering::Acquire) {
                 ffi::initialize()
                     .map_err(|error| format!("T7 Patch: MinHook initialize failed: {error}"))?;
@@ -159,10 +171,13 @@ impl Operations for PatchOps {
         unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) }
             .map_err(|_| "T7 Patch: cannot set process priority".to_owned())?;
 
-        if !Components::current().hooks {
+        let components = Components::current();
+        if components.vmt_hook {
+            hooks::apply_vmt_hooks()?;
+        }
+        if !components.enable_hooks {
             return Ok(());
         }
-        hooks::apply_vmt_hooks()?;
         // Enabling can fail after a subset of hooks is live, so mark them first.
         HOOKS_MAY_BE_ENABLED.store(true, Ordering::Release);
         ffi::enable_all_hooks().map_err(|error| format!("T7 Patch: MinHook enable failed: {error}"))
@@ -360,13 +375,19 @@ mod tests {
 
     #[test]
     fn diagnostic_components_parse_a_subset() {
+        const NONE: Components = Components {
+            arxan: false,
+            dispatcher: false,
+            create_hooks: false,
+            enable_hooks: false,
+            vmt_hook: false,
+            protection: false,
+        };
         assert_eq!(
             Components::parse("dispatcher"),
             Components {
-                arxan: false,
                 dispatcher: true,
-                hooks: false,
-                protection: false
+                ..NONE
             }
         );
         assert!(Components::parse(" Arxan , DISPATCHER,bogus").arxan);
@@ -374,14 +395,38 @@ mod tests {
             Components::parse("arxan,dispatcher,hooks,protection"),
             Components::ALL
         );
+        assert_eq!(Components::parse(""), NONE);
+    }
+
+    #[test]
+    fn diagnostic_components_split_the_hook_stage() {
+        let base = Components::parse("arxan,dispatcher,protection");
+        let create = Components::parse("arxan,dispatcher,protection,create");
         assert_eq!(
-            Components::parse(""),
+            create,
             Components {
-                arxan: false,
-                dispatcher: false,
-                hooks: false,
-                protection: false
+                create_hooks: true,
+                ..base
             }
+        );
+        assert_eq!(
+            Components::parse("arxan,dispatcher,protection,detours"),
+            Components {
+                create_hooks: true,
+                enable_hooks: true,
+                ..base
+            }
+        );
+        assert_eq!(
+            Components::parse("arxan,dispatcher,protection,vmt"),
+            Components {
+                vmt_hook: true,
+                ..base
+            }
+        );
+        assert_eq!(
+            Components::parse("arxan,dispatcher,protection,detours,vmt"),
+            Components::ALL
         );
     }
 }
