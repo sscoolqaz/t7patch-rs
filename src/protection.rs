@@ -485,14 +485,10 @@ type NameBytes = [u8; PLAYER_NAME_LEN];
 static NAME_DEFAULT: NameBytes = [0; PLAYER_NAME_LEN];
 /// The snapshot the game currently sees.
 static NAME_CURRENT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
-/// Every snapshot ever published. A game thread may keep the pointer returned by
-/// `get_username_ptr` indefinitely, so a replaced snapshot is transferred here
-/// instead of being freed.
-#[allow(
-    clippy::vec_box,
-    reason = "each published name keeps a stable address because the game retains the pointer"
-)]
-static NAME_RETAINED: Mutex<Vec<Box<NameBytes>>> = Mutex::new(Vec::new());
+/// Every snapshot ever replaced. A game thread may keep the pointer returned by
+/// `get_username_ptr` indefinitely, so a replaced snapshot is leaked into this list
+/// instead of being freed: its address stays valid for the process lifetime.
+static NAME_RETAINED: Mutex<Vec<&'static NameBytes>> = Mutex::new(Vec::new());
 /// Set when the local snapshot changed and the game buffers still need updating.
 static NAME_PENDING: AtomicBool = AtomicBool::new(false);
 pub static OLD_LOBBYMSG_PRINTS: AtomicI64 = AtomicI64::new(0);
@@ -1547,7 +1543,9 @@ pub fn set_custom_name(name: &[u8]) -> Option<NameBytes> {
     if !previous.is_null() {
         // SAFETY: every non-null value in `NAME_CURRENT` was created by `Box::into_raw`
         // in this function and has not been freed.
-        retained.push(unsafe { Box::from_raw(previous.cast::<NameBytes>()) });
+        retained.push(Box::leak(unsafe {
+            Box::from_raw(previous.cast::<NameBytes>())
+        }));
     }
     Some(fields)
 }
@@ -3682,7 +3680,7 @@ mod tests {
         assert_eq!(custom_name_snapshot(), second);
         assert!(!custom_name_is_empty());
         // A game thread may still hold the old pointer; its bytes must not change.
-        // SAFETY: every published pointer addresses a retained Box<NameBytes>.
+        // SAFETY: every published pointer addresses a leaked, never-freed NameBytes.
         let old = unsafe { std::ptr::read(first_ptr.cast::<NameBytes>()) };
         assert_eq!(old, first);
     }
