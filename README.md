@@ -10,7 +10,8 @@ handling, a staged lifecycle with rollback, a managed config worker, restore on 
 hooks, Steam vtable slots, the lobby marker and the update-preload pointer, and a fixed
 crash queue with a safe stack probe. The full patch has been exercised in game under
 Proton: it hosts a lobby and plays rounds. That does not mean every protection, campaign
-or Lua path has been verified. It is untested on Windows. The tests pass under Wine.
+or Lua path has been verified. It is untested in game on Windows. The tests pass under
+Wine and on native Windows 11.
 
 Two states are deliberately retained after unload: the exception dispatcher once an
 induced-exception patch (the lobby marker or the `IsProcessorFeaturePresent` detour) has

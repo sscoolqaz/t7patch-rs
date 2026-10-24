@@ -26,6 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemProcessInformation,
 };
+use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadBasicInformation};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::LibraryLoader::*;
@@ -47,8 +48,11 @@ const MIN_PROCESS_BUFFER: usize = 256 * 1024;
 /// Special value indicating an invalid hook position.
 const INVALID_HOOK_POS: usize = usize::MAX;
 /// Thread access rights for suspending/resuming threads.
-const THREAD_ACCESS: u32 =
-    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT;
+const THREAD_ACCESS: u32 = THREAD_SUSPEND_RESUME
+    | THREAD_GET_CONTEXT
+    | THREAD_QUERY_INFORMATION
+    | THREAD_SET_CONTEXT
+    | THREAD_SYNCHRONIZE;
 /// How many times a failed `ResumeThread` is retried before the thread is declared stuck.
 const RESUME_ATTEMPTS: usize = 3;
 /// How many times a failed protection restore is retried.
@@ -271,24 +275,40 @@ struct ThreadMove {
     original_ip: u64,
 }
 
-/// Threads suspended by [`FrozenThreads::freeze`]. Each handle stays open until its
-/// thread is resumed by [`FrozenThreads::thaw`]. Drop thaws too, as a safety net
-/// for an early return, but cannot report a failure, so error paths thaw
-/// explicitly through [`FrozenThreads::abort`].
+/// Threads suspended by [`FrozenThreads::freeze`], with the context read from each
+/// while confirming its suspension. Each handle stays open until its thread is
+/// resumed by [`FrozenThreads::thaw`]. Drop thaws too, as a safety net for an early
+/// return, but cannot report a failure, so error paths thaw explicitly through
+/// [`FrozenThreads::abort`].
 struct FrozenThreads {
     handles: Vec<HANDLE>,
+    /// `contexts[i]` is the context of `handles[i]`, read once it was suspended.
+    contexts: Vec<AlignedContext>,
     active: bool,
+}
+
+/// What [`FrozenThreads::open_suspend`] found.
+enum Suspension {
+    /// The thread is suspended and its handle held.
+    Held,
+    /// The thread has exited, or its id names no thread of this process.
+    Gone,
+    /// The thread could not be opened or suspended and is not confirmed to have
+    /// exited. The attempt must be thawed and retried.
+    Disturbed,
 }
 
 impl FrozenThreads {
     /// Suspends every other thread of the process, verified against threads created
-    /// while the freeze runs. Fails closed: if any live thread cannot be opened or
-    /// suspended, or new threads keep appearing, the threads already suspended are
-    /// resumed and an error is returned. A thread that has exited is skipped.
+    /// while the freeze runs. Fails closed: if a live thread cannot be opened,
+    /// suspended or confirmed suspended in any of the bounded attempts, or new threads
+    /// keep appearing, the threads already suspended are resumed and an error is
+    /// returned. A thread whose handle is signaled has terminated and is skipped.
     fn freeze(list: &mut ThreadList) -> Result<Self> {
         // Allocate before suspending: a suspended thread may hold the heap lock.
         let mut frozen = Self {
             handles: Vec::with_capacity(MAX_THREADS),
+            contexts: Vec::with_capacity(MAX_THREADS),
             active: false,
         };
         let mut seen = IdSet::new();
@@ -306,7 +326,8 @@ impl FrozenThreads {
                     if !frozen.thaw() {
                         return Err(HookError::ThreadResume);
                     }
-                    // Let a starting or exiting thread settle before retrying.
+                    // Let a starting or exiting thread settle before retrying. Never
+                    // wait while threads are suspended: the thread may need one of them.
                     // SAFETY: Sleep takes a plain duration.
                     unsafe { Sleep(1) };
                 }
@@ -320,12 +341,19 @@ impl FrozenThreads {
     // suspended can create another. One attempt suspends every thread of a
     // snapshot, reads their contexts (which waits for `SuspendThread` to take
     // effect), and enumerates again. A thread in the second list but not the first
-    // was created during the freeze. It is never suspended: under Wine a thread
-    // caught mid-startup may never reach its suspension, so reading its context
-    // hangs while every other thread is frozen. The attempt is thawed and retried
-    // instead. A thread whose context cannot be read, so its suspension is not
-    // confirmed, also retries: under Wine that happens to a thread that is
-    // starting or exiting. Returns the disturbance, or `None` once frozen.
+    // was created during the freeze. It is never suspended, and the attempt is
+    // thawed and retried instead. Returns the disturbance, or `None` once frozen.
+    //
+    // Under Wine a thread whose creator was suspended between registering it and
+    // starting it never reaches its suspension, so reading its context waits forever
+    // with every other thread frozen. Such a thread has no TEB yet, so the context
+    // is read only once the TEB is set; a thread without one also retries. On
+    // Windows the TEB is set when the thread is created.
+    //
+    // A thread that cannot be opened or suspended and whose handle is not signaled
+    // retries too: Windows refuses to suspend a thread that is terminating
+    // (`STATUS_THREAD_IS_TERMINATING`) before its handle is signaled, and such a
+    // thread may still run user-mode code (DLL detach).
     //
     // `gone` holds the ids whose thread had exited. One listed again on the second
     // enumeration is checked once more: if its id now names a live thread of this
@@ -342,31 +370,42 @@ impl FrozenThreads {
         #[cfg(test)]
         fault::hide_threads(fresh);
         for &id in fresh.as_slice() {
-            if self.open_suspend(id)? {
-                seen.insert(id)?;
-            } else {
-                gone.insert(id)?;
+            match self.open_suspend(id)? {
+                Suspension::Held => seen.insert(id)?,
+                Suspension::Gone => gone.insert(id)?,
+                Suspension::Disturbed => return Ok(Some(HookError::ThreadSuspend)),
             }
         }
         for &handle in &self.handles {
             // SAFETY: `handle` is an open thread this freeze suspended.
-            if !unsafe { sys::synchronize(handle) } {
+            match unsafe { sys::started(handle) } {
+                Some(true) => {}
+                Some(false) => return Ok(Some(HookError::ThreadSuspend)),
+                None => return Ok(Some(HookError::ThreadContext)),
+            }
+            let mut context = AlignedContext::control();
+            // SAFETY: as above; the thread has started, so its suspension takes effect.
+            if !unsafe { sys::get_context(handle, &mut context) } {
                 return Ok(Some(HookError::ThreadContext));
             }
+            // Never grows: both vectors hold MAX_THREADS and pair with `handles`.
+            self.contexts.push(context);
         }
         fresh.clear();
         list.enumerate(fresh)?;
         #[cfg(test)]
         fault::hide_threads(fresh);
-        let settled = fresh
-            .as_slice()
-            .iter()
-            .all(|&id| seen.contains(id) || (gone.contains(id) && still_gone(id)));
-        Ok((!settled).then_some(HookError::ThreadSuspend))
+        for &id in fresh.as_slice() {
+            let known = seen.contains(id) || (gone.contains(id) && still_gone(id)?);
+            if !known {
+                return Ok(Some(HookError::ThreadSuspend));
+            }
+        }
+        Ok(None)
     }
 
-    /// Opens and suspends `id`. Returns `false` when the thread has already exited.
-    fn open_suspend(&mut self, id: u32) -> Result<bool> {
+    /// Opens and suspends `id`.
+    fn open_suspend(&mut self, id: u32) -> Result<Suspension> {
         if self.handles.len() >= MAX_THREADS {
             // Never grow while threads are suspended.
             return Err(HookError::ThreadSuspend);
@@ -377,30 +416,33 @@ impl FrozenThreads {
             if handle.is_null() {
                 // The id no longer names a thread: it exited after the enumeration.
                 if GetLastError() == ERROR_INVALID_PARAMETER {
-                    return Ok(false);
+                    return Ok(Suspension::Gone);
                 }
-                return Err(HookError::ThreadSuspend);
+                return Ok(Suspension::Disturbed);
             }
             let owner = GetProcessIdOfThread(handle);
             if owner != GetCurrentProcessId() {
                 CloseHandle(handle);
                 // A reused id now names another process's thread; ours exited.
-                if owner != 0 {
-                    return Ok(false);
-                }
-                return Err(HookError::ThreadSuspend);
+                // Zero means the query failed, which proves nothing.
+                return Ok(if owner != 0 {
+                    Suspension::Gone
+                } else {
+                    Suspension::Disturbed
+                });
             }
             if !sys::suspend_thread(handle) {
-                let exited = exited(handle);
+                let state = liveness(handle);
                 CloseHandle(handle);
-                if exited {
-                    return Ok(false);
-                }
-                return Err(HookError::ThreadSuspend);
+                return match state {
+                    Liveness::Exited => Ok(Suspension::Gone),
+                    Liveness::Running => Ok(Suspension::Disturbed),
+                    Liveness::Unknown => Err(HookError::ThreadSuspend),
+                };
             }
             self.handles.push(handle);
         }
-        Ok(true)
+        Ok(Suspension::Held)
     }
 
     /// Thaws after `error` and returns the error to report: `error` itself, or
@@ -433,6 +475,7 @@ impl FrozenThreads {
             }
         }
         self.handles.clear();
+        self.contexts.clear();
         if !thawed {
             THAW_FAILED.store(true, Ordering::Release);
         }
@@ -448,7 +491,7 @@ impl Drop for FrozenThreads {
 }
 
 /// Resumes a thread `freeze` suspended, retrying a failure. A thread that has
-/// exited counts as resumed.
+/// terminated counts as resumed.
 fn resume_one(handle: HANDLE) -> bool {
     for attempt in 0..RESUME_ATTEMPTS {
         if attempt > 0 {
@@ -460,31 +503,54 @@ fn resume_one(handle: HANDLE) -> bool {
             return true;
         }
     }
-    exited(handle)
+    matches!(liveness(handle), Liveness::Exited)
 }
 
-/// True when `id` names no live thread of this process. An id that cannot be checked
-/// counts as live, so the caller retries rather than trusting it.
-fn still_gone(id: u32) -> bool {
+/// True when `id` names no live thread of this process. An id that cannot be opened,
+/// or whose owner cannot be read, counts as live, so the caller retries rather than
+/// trusting it. A failed wait fails closed.
+fn still_gone(id: u32) -> Result<bool> {
     // SAFETY: plain Win32 calls on a handle this function opens and closes.
     unsafe {
         let handle = sys::open_thread(id);
         if handle.is_null() {
-            return GetLastError() == ERROR_INVALID_PARAMETER;
+            return Ok(GetLastError() == ERROR_INVALID_PARAMETER);
         }
         let owner = GetProcessIdOfThread(handle);
-        let gone = (owner != 0 && owner != GetCurrentProcessId()) || exited(handle);
+        let gone = if owner == 0 {
+            Ok(false)
+        } else if owner != GetCurrentProcessId() {
+            Ok(true)
+        } else {
+            match liveness(handle) {
+                Liveness::Exited => Ok(true),
+                Liveness::Running => Ok(false),
+                Liveness::Unknown => Err(HookError::ThreadSuspend),
+            }
+        };
         CloseHandle(handle);
         gone
     }
 }
 
-/// True when the thread behind `handle` has exited.
-fn exited(handle: HANDLE) -> bool {
-    let mut exit_code = 0u32;
-    // SAFETY: `handle` is an open thread handle and `exit_code` a valid out-pointer.
-    let read = unsafe { GetExitCodeThread(handle, &mut exit_code) != 0 };
-    read && exit_code != STILL_ACTIVE.cast_unsigned()
+/// Whether a thread has terminated, from its handle's signaled state. The exit code
+/// cannot tell: it stays `STILL_ACTIVE` while a thread terminates, and a thread may
+/// exit with that very code.
+enum Liveness {
+    Exited,
+    Running,
+    /// The wait failed, so nothing is known.
+    Unknown,
+}
+
+fn liveness(handle: HANDLE) -> Liveness {
+    // SAFETY: `handle` is an open thread handle with SYNCHRONIZE; a zero timeout
+    // never blocks.
+    match unsafe { sys::wait(handle) } {
+        WAIT_OBJECT_0 => Liveness::Exited,
+        WAIT_TIMEOUT => Liveness::Running,
+        _ => Liveness::Unknown,
+    }
 }
 
 /// A fixed-capacity, duplicate-free set of thread ids. Never allocates.
@@ -709,7 +775,7 @@ mod sys {
 
     pub(super) unsafe fn open_thread(id: u32) -> HANDLE {
         #[cfg(test)]
-        if let Some(error) = fault::open_thread() {
+        if let Some(error) = fault::open_thread(id) {
             // SAFETY: sets this thread's last-error value only.
             unsafe { SetLastError(error) };
             return ptr::null_mut();
@@ -745,16 +811,36 @@ mod sys {
         unsafe { GetThreadContext(handle, &mut context.0) != 0 }
     }
 
-    /// Reads a newly suspended thread's context, which waits until the suspension
-    /// has taken effect.
-    pub(super) unsafe fn synchronize(handle: HANDLE) -> bool {
+    /// Whether the thread has started, from its TEB, or `None` if the query failed.
+    /// Never blocks.
+    pub(super) unsafe fn started(handle: HANDLE) -> Option<bool> {
         #[cfg(test)]
-        if fault::hit(fault::Call::Synchronize) {
-            return false;
+        if fault::hit(fault::Call::Started) {
+            return Some(false);
         }
-        let mut context = AlignedContext::control();
-        // SAFETY: the caller passes an open, suspended thread; the buffer is aligned.
-        unsafe { GetThreadContext(handle, &mut context.0) != 0 }
+        // x64 THREAD_BASIC_INFORMATION is 0x30 bytes; TebBaseAddress is at +8.
+        let mut information = [0u64; 6];
+        let mut returned = 0u32;
+        // SAFETY: the handle has THREAD_QUERY_INFORMATION and the buffer is 0x30 bytes.
+        let status = unsafe {
+            NtQueryInformationThread(
+                handle,
+                ThreadBasicInformation,
+                information.as_mut_ptr().cast(),
+                size_of_val(&information) as u32,
+                &mut returned,
+            )
+        };
+        (status >= 0).then_some(information[1] != 0)
+    }
+
+    pub(super) unsafe fn wait(handle: HANDLE) -> u32 {
+        #[cfg(test)]
+        if fault::hit(fault::Call::Wait) {
+            return WAIT_FAILED;
+        }
+        // SAFETY: the caller passes an open handle with SYNCHRONIZE.
+        unsafe { WaitForSingleObject(handle, 0) }
     }
 
     pub(super) unsafe fn set_context(handle: HANDLE, context: &AlignedContext) -> bool {
@@ -814,7 +900,9 @@ mod sys {
 pub(crate) mod fault {
     use std::cell::Cell;
     use std::sync::atomic::Ordering;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE,
+    };
     use windows_sys::Win32::System::Threading::{GetThreadId, ResumeThread};
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -826,10 +914,11 @@ pub(crate) mod fault {
         Protect,
         Reprotect,
         Flush,
-        Synchronize,
+        Started,
+        Wait,
     }
 
-    const CALLS: usize = 8;
+    const CALLS: usize = 9;
     /// Most freeze rounds a hide schedule covers.
     const MAX_ROUNDS: usize = 2 * super::FREEZE_ATTEMPTS;
     /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
@@ -838,11 +927,11 @@ pub(crate) mod fault {
     thread_local! {
         /// Per call: a bitmask of which calls (by zero-based index) fail, and the next index.
         static PLAN: Cell<[(u64, u32); CALLS]> = const { Cell::new([(0, 0); CALLS]) };
-        /// The last-error value an injected `OpenThread` failure reports.
-        static OPEN_ERROR: Cell<u32> = const { Cell::new(5) };
         static FORCE_MOVES: Cell<bool> = const { Cell::new(false) };
         /// A thread id whose resumes fail, and how many more of them fail.
         static STICK: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+        /// A thread id whose opens report it gone, and how many more of them do.
+        static GONE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
         /// Handles the thaw left suspended, for the test to resume itself.
         static STUCK: Cell<[usize; MAX_STUCK]> = const { Cell::new([0; MAX_STUCK]) };
         /// Per freeze round, how many trailing ids the enumeration hides, so a thread
@@ -881,11 +970,6 @@ pub(crate) mod fault {
         });
     }
 
-    /// Sets the last error an injected `OpenThread` failure reports.
-    pub(crate) fn open_error(error: u32) {
-        OPEN_ERROR.with(|value| value.set(error));
-    }
-
     pub(crate) fn set_force_moves(force: bool) {
         FORCE_MOVES.with(|value| value.set(force));
     }
@@ -920,9 +1004,9 @@ pub(crate) mod fault {
 
     pub(crate) fn clear() {
         PLAN.with(|plan| plan.set([(0, 0); CALLS]));
-        OPEN_ERROR.with(|value| value.set(5));
         FORCE_MOVES.with(|value| value.set(false));
         STICK.with(|stick| stick.set((0, 0)));
+        GONE.with(|gone| gone.set((0, 0)));
         HIDE.with(|hide| hide.set(([0; MAX_ROUNDS], 0)));
     }
 
@@ -932,7 +1016,8 @@ pub(crate) mod fault {
             let (mask, index) = plans[call as usize];
             plans[call as usize].1 = index + 1;
             plan.set(plans);
-            index < 64 && mask & (1 << index) != 0
+            // Index 63 and beyond share bit 63, so a mask can fail every later call.
+            mask & (1 << index.min(63)) != 0
         })
     }
 
@@ -958,8 +1043,25 @@ pub(crate) mod fault {
         });
     }
 
-    pub(super) fn open_thread() -> Option<u32> {
-        hit(Call::OpenThread).then(|| OPEN_ERROR.with(Cell::get))
+    pub(super) fn open_thread(id: u32) -> Option<u32> {
+        let gone = GONE.with(|gone| {
+            let (gone_id, times) = gone.get();
+            let hit = times > 0 && gone_id == id;
+            if hit {
+                gone.set((gone_id, times - 1));
+            }
+            hit
+        });
+        if gone {
+            return Some(ERROR_INVALID_PARAMETER);
+        }
+        // Any other failure, as an access check that fails.
+        hit(Call::OpenThread).then_some(ERROR_ACCESS_DENIED)
+    }
+
+    /// Makes the next `times` opens of thread `id` report that it no longer exists.
+    pub(crate) fn gone(id: u32, times: u32) {
+        GONE.with(|gone| gone.set((id, times)));
     }
 
     pub(super) fn force_moves() -> bool {
@@ -1029,7 +1131,8 @@ impl HookManager {
     /// Applies `batch` (`(pos, enable)` pairs whose state changes) as one transaction,
     /// with every other thread frozen:
     ///
-    /// 1. read each thread's context and compute where it must resume (no writes);
+    /// 1. compute where each thread must resume from the context the freeze read
+    ///    (no writes);
     /// 2. make every patch range writable, then write the bytes;
     /// 3. write the moved contexts.
     ///
@@ -1060,15 +1163,11 @@ impl HookManager {
         let mut frozen = FrozenThreads::freeze(&mut list)?;
         let hooks = &self.hooks.items;
 
-        // Step 1: read contexts and plan the moves.
+        // Step 1: plan the moves from the contexts the freeze read. A second read
+        // would be a second chance to block.
         let mut clear = true;
-        for index in 0..frozen.handles.len() {
-            let handle = frozen.handles[index];
-            let mut context = AlignedContext::control();
-            // SAFETY: `handle` is an open, suspended thread of this process.
-            if !unsafe { sys::get_context(handle, &mut context) } {
-                return Err(frozen.abort(HookError::ThreadContext));
-            }
+        for (&handle, &context) in frozen.handles.iter().zip(&frozen.contexts) {
+            let mut context = context;
             let ip = context.0.Rip;
             let new_ip = plan_ip(hooks, batch, ip as usize);
             if watch.iter().any(|&pos| hooks[pos].slot_contains(new_ip)) {
@@ -1500,14 +1599,19 @@ mod tests {
         std::hint::black_box(f)(7) == 7 ^ 0xA5A5
     }
 
-    /// A fault mask hitting the last thread the freeze visits, so every other
-    /// thread (spinners included) is suspended first and must be resumed.
-    fn last_thread() -> u64 {
-        let mut ids = IdSet::new();
-        ThreadList::new()
-            .and_then(|mut list| list.enumerate(&mut ids))
-            .expect("enumerate");
-        1 << (ids.len - 1)
+    /// A fault mask hitting every call after the first, so one thread is suspended
+    /// (and must be resumed) and every retry fails too. Unlike a mask aimed at the
+    /// last thread, it does not depend on how many threads exist when the freeze
+    /// runs: test threads come and go.
+    fn after_first_call() -> u64 {
+        u64::MAX << 1
+    }
+
+    /// Whether the manager records the hook on `f` as enabled.
+    fn recorded_enabled(f: MixFn) -> bool {
+        let manager = get_manager().lock().unwrap();
+        let pos = manager.find_hook_entry(target(f));
+        manager.hooks.items[pos].is_enabled
     }
 
     fn retain_buffers() -> bool {
@@ -1630,7 +1734,7 @@ mod tests {
     fn open_failure_resumes_threads_and_patches_nothing() {
         let fixture = Fixture::new();
         let before = bytes(mix_a);
-        fault::fail(Call::OpenThread, last_thread());
+        fault::fail(Call::OpenThread, after_first_call());
         assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadSuspend));
         fault::clear();
         fixture.assert_threads_run();
@@ -1644,7 +1748,7 @@ mod tests {
     fn suspend_failure_resumes_threads_and_patches_nothing() {
         let fixture = Fixture::new();
         let before = bytes(mix_a);
-        fault::fail(Call::SuspendThread, last_thread());
+        fault::fail(Call::SuspendThread, after_first_call());
         assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadSuspend));
         fault::clear();
         fixture.assert_threads_run();
@@ -1654,9 +1758,9 @@ mod tests {
 
     #[test]
     fn exited_thread_is_skipped() {
-        let _fixture = Fixture::new();
-        fault::open_error(ERROR_INVALID_PARAMETER);
-        fault::fail(Call::OpenThread, 0b1);
+        let fixture = Fixture::new();
+        // A spinner, which stays alive, so the check is sure to list it again.
+        fault::gone(fixture.spinners[0], 1);
         enable_hook(target(mix_a)).expect("an exited thread does not block the freeze");
         // The thread reported gone is still listed and in fact alive, as a thread
         // given a recycled id would be, so the first attempt is retried.
@@ -1668,7 +1772,7 @@ mod tests {
     fn context_read_failure_patches_nothing() {
         let fixture = Fixture::new();
         let before = bytes(mix_a);
-        fault::fail(Call::GetContext, 0b10);
+        fault::fail(Call::GetContext, u64::MAX << 1);
         assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadContext));
         fault::clear();
         fixture.assert_threads_run();
@@ -1724,7 +1828,7 @@ mod tests {
     fn failed_disable_of_all_hooks_keeps_them_enabled() {
         let fixture = Fixture::new();
         enable_hook(ALL_HOOKS).expect("enable");
-        fault::fail(Call::OpenThread, last_thread());
+        fault::fail(Call::OpenThread, after_first_call());
         assert_eq!(disable_hook(ALL_HOOKS), Err(HookError::ThreadSuspend));
         fault::clear();
         fixture.assert_threads_run();
@@ -1751,10 +1855,11 @@ mod tests {
     fn failed_remove_keeps_the_hook() {
         let fixture = Fixture::new();
         enable_hook(target(mix_a)).expect("enable");
-        fault::fail(Call::SuspendThread, last_thread());
+        fault::fail(Call::SuspendThread, after_first_call());
         assert_eq!(remove_hook(target(mix_a)), Err(HookError::ThreadSuspend));
         // A disabled hook is still verified before its trampoline is freed.
-        fault::fail(Call::GetContext, 0b1);
+        fault::clear();
+        fault::fail(Call::GetContext, u64::MAX);
         assert_eq!(remove_hook(target(mix_b)), Err(HookError::ThreadContext));
         fault::clear();
         fixture.assert_threads_run();
@@ -1768,7 +1873,7 @@ mod tests {
     fn failed_uninitialize_stays_initialized() {
         let fixture = Fixture::new();
         enable_hook(target(mix_a)).expect("enable");
-        fault::fail(Call::GetContext, 0b1);
+        fault::fail(Call::GetContext, u64::MAX);
         assert_eq!(uninitialize(), Err(HookError::ThreadContext));
         fault::clear();
         fixture.assert_threads_run();
@@ -1794,14 +1899,25 @@ mod tests {
         fault::stick(fixture.spinners[0], u32::MAX);
         assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadResume));
         assert!(thaw_failed());
-        // The jump was written, so the hook is recorded as enabled.
-        assert!(hooked(mix_a));
-        assert!(retain_buffers());
+        // Usually the jump was written first. If a disturbed attempt thawed before
+        // writing (test threads come and go), nothing was. Either way the record
+        // matches the image.
+        let applied = hooked(mix_a);
+        assert_eq!(recorded_enabled(mix_a), applied);
+        if applied {
+            assert!(retain_buffers());
+        }
         assert_eq!(enable_hook(target(mix_b)), Err(HookError::ThreadResume));
         assert!(!hooked(mix_b));
         assert_eq!(fault::release_stuck(), 1);
+        fault::clear();
         fixture.assert_threads_run();
-        assert_eq!(enable_hook(target(mix_a)), Err(HookError::Enabled));
+        let expected = if applied {
+            Err(HookError::Enabled)
+        } else {
+            Ok(())
+        };
+        assert_eq!(enable_hook(target(mix_a)), expected);
     }
 
     #[test]
@@ -1941,7 +2057,7 @@ mod tests {
     #[test]
     fn unconfirmed_suspension_is_retried() {
         let fixture = Fixture::new();
-        fault::fail(Call::Synchronize, 0b1);
+        fault::fail(Call::GetContext, 0b1);
         enable_hook(target(mix_a)).expect("the second attempt confirms every suspension");
         assert_eq!(fault::rounds(), 3);
         fault::clear();
@@ -1953,7 +2069,7 @@ mod tests {
     fn suspension_that_is_never_confirmed_patches_nothing() {
         let fixture = Fixture::new();
         let before = bytes(mix_a);
-        fault::fail(Call::Synchronize, u64::MAX);
+        fault::fail(Call::GetContext, u64::MAX);
         assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadContext));
         assert_eq!(fault::rounds(), FREEZE_ATTEMPTS);
         fault::clear();
@@ -2007,5 +2123,57 @@ mod tests {
         assert_eq!(parse_process_threads(truncated, 77, 0, &mut ids), invalid);
         let looping = process_entry(u32::MAX, 3, &[]);
         assert_eq!(parse_process_threads(&looping, 77, 0, &mut ids), invalid);
+    }
+
+    #[test]
+    fn a_thread_that_has_not_started_restarts_the_freeze() {
+        let fixture = Fixture::new();
+        // The first thread checked has no TEB yet: its context is never read.
+        fault::fail(Call::Started, 0b1);
+        enable_hook(target(mix_a)).expect("the second attempt finds every thread started");
+        assert_eq!(fault::rounds(), 3);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(hooked(mix_a));
+    }
+
+    #[test]
+    fn a_refused_suspension_of_a_live_thread_is_retried() {
+        let fixture = Fixture::new();
+        // As Windows refuses a terminating thread whose handle is not yet signaled.
+        fault::fail(Call::SuspendThread, 0b1);
+        enable_hook(target(mix_a)).expect("the retry suspends it");
+        assert_eq!(fault::rounds(), 3);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(hooked(mix_a));
+    }
+
+    #[test]
+    fn a_refused_suspension_with_an_unknown_state_fails_closed() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        fault::fail(Call::SuspendThread, 0b1);
+        fault::fail(Call::Wait, 0b1);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadSuspend));
+        assert_eq!(fault::rounds(), 1);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert_eq!(bytes(mix_a), before);
+    }
+
+    #[test]
+    fn a_failed_wait_on_the_recheck_fails_closed() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        // A spinner looks gone; reopening it on the check works, but the wait that
+        // would confirm it exited fails. No retry follows.
+        fault::gone(fixture.spinners[0], 1);
+        fault::fail(Call::Wait, u64::MAX);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadSuspend));
+        assert!(fault::rounds() <= 2);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert_eq!(bytes(mix_a), before);
     }
 }

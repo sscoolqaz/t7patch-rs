@@ -25,13 +25,14 @@ use windows::Wdk::System::Threading::{NtQueryInformationThread, ThreadBasicInfor
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, STATUS_INFO_LENGTH_MISMATCH,
 };
+use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, ReadProcessMemory,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread,
-    GetProcessIdOfThread, OpenThread, ResumeThread, Sleep, SuspendThread, THREAD_ACCESS_RIGHTS,
-    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetProcessIdOfThread, OpenThread,
+    ResumeThread, Sleep, SuspendThread, THREAD_ACCESS_RIGHTS, THREAD_GET_CONTEXT,
+    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME, THREAD_SYNCHRONIZE, WaitForSingleObject,
 };
 
 use crate::arxan::WriteReport;
@@ -43,14 +44,12 @@ const BUSY_ATTEMPTS: usize = 5;
 /// Longest x86-64 instruction. A patch at `address` can affect an instruction
 /// that starts up to 14 bytes earlier.
 const MAX_INSTRUCTION_BYTES: usize = 15;
-/// How many times re-enumeration may find a newly created thread before the
-/// freeze is abandoned.
-const ENUMERATION_ROUNDS: usize = 3;
+/// How many freeze attempts may be disturbed (a thread created, starting or
+/// terminating during the freeze) before the freeze is abandoned.
+const FREEZE_ATTEMPTS: usize = 16;
 /// How many times a failed `ResumeThread` is retried before the thread is
 /// declared stuck.
 const RESUME_ATTEMPTS: usize = 3;
-/// `GetExitCodeThread` reports this while a thread is still running.
-const STILL_ACTIVE_CODE: u32 = 259;
 /// Smallest process-information buffer; grown before the freeze when too small.
 const MIN_PROCESS_BUFFER: usize = 256 * 1024;
 
@@ -109,6 +108,8 @@ pub(crate) enum FreezeError {
     Open,
     Suspend,
     Context,
+    Wait,
+    Starting,
     KeptAppearing,
     Resume,
     Disabled,
@@ -124,6 +125,8 @@ impl FreezeError {
             Self::Open => "cannot open a game thread",
             Self::Suspend => "cannot suspend a game thread",
             Self::Context => "cannot read a game thread context",
+            Self::Wait => "cannot tell whether a game thread exited",
+            Self::Starting => "a game thread kept starting during the freeze",
             Self::KeptAppearing => "game threads kept appearing during the freeze",
             Self::Resume => "cannot resume every game thread",
             Self::Disabled => "code writes are disabled after a failed thread resume",
@@ -139,6 +142,26 @@ pub(crate) enum AcquireError {
     Aborted(FreezeError),
     /// The abort itself could not resume a thread.
     Terminal(FreezeError),
+}
+
+/// Whether a thread has terminated, from its handle's signaled state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Exited,
+    Running,
+    /// The query failed, so nothing is known.
+    Unknown,
+}
+
+/// What [`Freeze::open_suspend`] found.
+enum Suspension {
+    /// The thread is suspended and its handle held.
+    Held,
+    /// The thread has exited, or its id names no thread of this process.
+    Gone,
+    /// The thread could not be opened or suspended and is not confirmed to have
+    /// exited. The attempt must be thawed and retried.
+    Disturbed(FreezeError),
 }
 
 /// Why an open did not produce a handle.
@@ -197,7 +220,12 @@ pub(crate) trait ThreadOps {
     fn open(&mut self, id: u32) -> Result<Self::Handle, OpenError>;
     fn suspend(&mut self, handle: Self::Handle) -> bool;
     fn resume(&mut self, handle: Self::Handle) -> bool;
-    fn exited(&mut self, handle: Self::Handle) -> bool;
+    /// Whether the thread has terminated. The exit code cannot tell: it stays
+    /// `STILL_ACTIVE` while a thread terminates, and a thread may exit with it.
+    fn liveness(&mut self, handle: Self::Handle) -> Liveness;
+    /// Whether the suspended thread has started running (has a TEB), or `None` if
+    /// that cannot be read. Never blocks.
+    fn started(&mut self, handle: Self::Handle) -> Option<bool>;
     /// The suspended thread's `(rip, rsp)`.
     fn registers(&mut self, handle: Self::Handle) -> Option<(usize, usize)>;
     /// The top (highest address) of the suspended thread's stack.
@@ -223,76 +251,119 @@ pub(crate) struct Freeze<O: ThreadOps> {
 }
 
 impl<O: ThreadOps> Freeze<O> {
-    /// Suspends every thread `ops` enumerates. On failure every suspended
-    /// thread is resumed before this returns, or the error is terminal.
+    /// Suspends every other thread of the process, verified against threads
+    /// created while the freeze runs. A disturbed attempt is thawed and retried, up
+    /// to [`FREEZE_ATTEMPTS`] times. On failure every suspended thread is resumed
+    /// before this returns, or the error is terminal.
     pub(crate) fn acquire(ops: O) -> Result<Self, AcquireError> {
         // All allocation happens before the first suspension.
         let mut freeze = Self {
             ops,
             threads: Vec::with_capacity(MAX_THREADS),
-            active: true,
+            active: false,
         };
         let mut seen = IdSet::new();
+        let mut gone = IdSet::new();
         let mut fresh = IdSet::new();
-        if let Err(error) = freeze.suspend_rounds(&mut seen, &mut fresh) {
-            return Err(freeze.abort(error));
-        }
-        Ok(freeze)
-    }
-
-    // An enumeration is a snapshot, not a creation barrier. Suspend any thread
-    // that appeared after the first one, within a bounded number of rounds.
-    //
-    // `SuspendThread` is asynchronous: a thread told to suspend may still run,
-    // and create a thread, until it is synchronized. Each round therefore reads
-    // the context of every thread it suspended (which waits for the suspension
-    // to take effect) before enumerating again, so the final "nothing new"
-    // enumeration happens with every known thread really stopped.
-    //
-    // An id enters `seen` only once its thread is held open and suspended. An
-    // opened thread keeps its id alive, so it cannot be reused under us. An id
-    // that was gone or exited is looked at again if it reappears, in case a new
-    // thread was given the recycled id.
-    fn suspend_rounds(&mut self, seen: &mut IdSet, fresh: &mut IdSet) -> Result<(), FreezeError> {
-        for _pass in 0..=ENUMERATION_ROUNDS {
-            fresh.clear();
-            self.ops.enumerate(fresh)?;
-            let first_new = self.threads.len();
-            for &id in fresh.as_slice() {
-                if seen.contains(id) {
-                    continue;
-                }
-                if self.open_suspend(id)? {
-                    seen.insert(id)?;
-                }
+        let mut disturbed = FreezeError::KeptAppearing;
+        for attempt in 0..FREEZE_ATTEMPTS {
+            if attempt > 0 {
+                // Let a starting or exiting thread settle. Never wait while threads
+                // are suspended: the thread may need one of them.
+                freeze.ops.pause();
             }
-            if self.threads.len() == first_new {
-                return Ok(());
-            }
-            for index in first_new..self.threads.len() {
-                let handle = self.threads[index].handle;
-                let (rip, rsp) = self.ops.registers(handle).ok_or(FreezeError::Context)?;
-                self.threads[index].rip = rip;
-                self.threads[index].rsp = rsp;
+            seen.clear();
+            gone.clear();
+            freeze.active = true;
+            match freeze.attempt(&mut seen, &mut gone, &mut fresh) {
+                Ok(None) => return Ok(freeze),
+                Ok(Some(error)) => {
+                    disturbed = error;
+                    if freeze.thaw_inner().is_err() {
+                        return Err(AcquireError::Terminal(error));
+                    }
+                }
+                Err(error) => return Err(freeze.abort(error)),
             }
         }
-        Err(FreezeError::KeptAppearing)
+        Err(AcquireError::Aborted(disturbed))
     }
 
-    /// Opens and suspends `id`. Returns `false` when the thread had already exited.
-    fn open_suspend(&mut self, id: u32) -> Result<bool, FreezeError> {
+    // An enumeration is a snapshot, not a creation barrier: a thread not yet
+    // suspended can create another. One attempt suspends every thread of a
+    // snapshot, reads their registers (which waits for `SuspendThread` to take
+    // effect), and enumerates again. A thread in the second list but not the
+    // first was created during the freeze. It is never suspended, and the attempt
+    // is thawed and retried instead. Returns the disturbance, or `None` once frozen.
+    //
+    // Under Wine a thread whose creator was suspended between registering it and
+    // starting it never reaches its suspension, so reading its registers waits
+    // forever with every other thread frozen. Such a thread has no TEB yet, so the
+    // registers are read only once the TEB is set; a thread without one retries.
+    // On Windows the TEB is set when the thread is created.
+    //
+    // A thread that cannot be opened or suspended and whose handle is not signaled
+    // retries too: Windows refuses to suspend a thread that is terminating
+    // (`STATUS_THREAD_IS_TERMINATING`) before its handle is signaled, and such a
+    // thread may still run user-mode code (DLL detach).
+    //
+    // An id enters `seen` once its thread is held open and suspended, so it cannot
+    // be reused under us. `gone` holds the ids whose thread had exited; one listed
+    // again on the second enumeration is opened once more, and if it names a live
+    // thread, a new thread was given the recycled id, which is a disturbance.
+    fn attempt(
+        &mut self,
+        seen: &mut IdSet,
+        gone: &mut IdSet,
+        fresh: &mut IdSet,
+    ) -> Result<Option<FreezeError>, FreezeError> {
+        fresh.clear();
+        self.ops.enumerate(fresh)?;
+        for &id in fresh.as_slice() {
+            match self.open_suspend(id)? {
+                Suspension::Held => seen.insert(id)?,
+                Suspension::Gone => gone.insert(id)?,
+                Suspension::Disturbed(error) => return Ok(Some(error)),
+            }
+        }
+        for index in 0..self.threads.len() {
+            let handle = self.threads[index].handle;
+            match self.ops.started(handle) {
+                Some(true) => {}
+                Some(false) => return Ok(Some(FreezeError::Starting)),
+                None => return Ok(Some(FreezeError::Context)),
+            }
+            let Some((rip, rsp)) = self.ops.registers(handle) else {
+                return Ok(Some(FreezeError::Context));
+            };
+            self.threads[index].rip = rip;
+            self.threads[index].rsp = rsp;
+        }
+        fresh.clear();
+        self.ops.enumerate(fresh)?;
+        for &id in fresh.as_slice() {
+            let known = seen.contains(id) || (gone.contains(id) && self.still_gone(id)?);
+            if !known {
+                return Ok(Some(FreezeError::KeptAppearing));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Opens and suspends `id`.
+    fn open_suspend(&mut self, id: u32) -> Result<Suspension, FreezeError> {
         let handle = match self.ops.open(id) {
             Ok(handle) => handle,
-            Err(OpenError::Gone) => return Ok(false),
-            Err(OpenError::Failed) => return Err(FreezeError::Open),
+            Err(OpenError::Gone) => return Ok(Suspension::Gone),
+            Err(OpenError::Failed) => return Ok(Suspension::Disturbed(FreezeError::Open)),
         };
         if !self.ops.suspend(handle) {
-            let exited = self.ops.exited(handle);
+            let state = self.ops.liveness(handle);
             self.ops.close(handle);
-            return if exited {
-                Ok(false)
-            } else {
-                Err(FreezeError::Suspend)
+            return match state {
+                Liveness::Exited => Ok(Suspension::Gone),
+                Liveness::Running => Ok(Suspension::Disturbed(FreezeError::Suspend)),
+                Liveness::Unknown => Err(FreezeError::Wait),
             };
         }
         if self.threads.len() >= self.threads.capacity() {
@@ -305,7 +376,26 @@ impl<O: ThreadOps> Freeze<O> {
             rip: 0,
             rsp: 0,
         });
-        Ok(true)
+        Ok(Suspension::Held)
+    }
+
+    /// True when `id` names no live thread of this process. An id that cannot be
+    /// opened counts as live, so the caller retries rather than trusting it. A
+    /// failed wait fails closed.
+    fn still_gone(&mut self, id: u32) -> Result<bool, FreezeError> {
+        match self.ops.open(id) {
+            Ok(handle) => {
+                let state = self.ops.liveness(handle);
+                self.ops.close(handle);
+                match state {
+                    Liveness::Exited => Ok(true),
+                    Liveness::Running => Ok(false),
+                    Liveness::Unknown => Err(FreezeError::Wait),
+                }
+            }
+            Err(OpenError::Gone) => Ok(true),
+            Err(OpenError::Failed) => Ok(false),
+        }
     }
 
     fn abort(&mut self, error: FreezeError) -> AcquireError {
@@ -399,7 +489,7 @@ impl<O: ThreadOps> Freeze<O> {
                 return true;
             }
         }
-        if self.ops.exited(handle) {
+        if self.ops.liveness(handle) == Liveness::Exited {
             self.ops.close(handle);
             return true;
         }
@@ -457,6 +547,28 @@ impl LiveOps {
     }
 }
 
+/// The thread's TEB address, zero until the thread has started, or `None` if the
+/// query failed. Never blocks.
+fn teb(handle: HANDLE) -> Option<usize> {
+    // x64 THREAD_BASIC_INFORMATION is 0x30 bytes; TebBaseAddress is at +8.
+    let mut information = [0u64; 6];
+    let mut returned = 0u32;
+    // SAFETY: the handle has THREAD_QUERY_INFORMATION and the buffer is 0x30 bytes.
+    let status = unsafe {
+        NtQueryInformationThread(
+            handle,
+            ThreadBasicInformation,
+            information.as_mut_ptr().cast(),
+            u32::try_from(size_of_val(&information)).ok()?,
+            &raw mut returned,
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    usize::try_from(information[1]).ok()
+}
+
 fn query_processes(buffer: &mut [u64], needed: &mut u32) -> windows::Win32::Foundation::NTSTATUS {
     let length = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
     // SAFETY: `buffer` is writable for `length` bytes and `needed` is a valid out-pointer.
@@ -494,7 +606,10 @@ impl ThreadOps for LiveOps {
         match unsafe {
             OpenThread(
                 THREAD_ACCESS_RIGHTS(
-                    THREAD_SUSPEND_RESUME.0 | THREAD_GET_CONTEXT.0 | THREAD_QUERY_INFORMATION.0,
+                    THREAD_SUSPEND_RESUME.0
+                        | THREAD_GET_CONTEXT.0
+                        | THREAD_QUERY_INFORMATION.0
+                        | THREAD_SYNCHRONIZE.0,
                 ),
                 false,
                 id,
@@ -502,12 +617,18 @@ impl ThreadOps for LiveOps {
         } {
             Ok(handle) => {
                 // SAFETY: `handle` was opened with THREAD_QUERY_INFORMATION.
-                if unsafe { GetProcessIdOfThread(handle) } == self.process_id {
-                    Ok(handle)
-                } else {
+                match unsafe { GetProcessIdOfThread(handle) } {
+                    owner if owner == self.process_id => Ok(handle),
+                    // Zero means the query failed, which proves nothing.
+                    0 => {
+                        self.close(handle);
+                        Err(OpenError::Failed)
+                    }
                     // The id was reused by another process's thread: ours is gone.
-                    self.close(handle);
-                    Err(OpenError::Gone)
+                    _ => {
+                        self.close(handle);
+                        Err(OpenError::Gone)
+                    }
                 }
             }
             Err(_error) => {
@@ -534,10 +655,17 @@ impl ThreadOps for LiveOps {
         unsafe { ResumeThread(handle) != u32::MAX }
     }
 
-    fn exited(&mut self, handle: HANDLE) -> bool {
-        let mut code = 0u32;
-        // SAFETY: `handle` is an open thread handle and `code` is a valid out-buffer.
-        unsafe { GetExitCodeThread(handle, &raw mut code) }.is_ok() && code != STILL_ACTIVE_CODE
+    fn liveness(&mut self, handle: HANDLE) -> Liveness {
+        // SAFETY: `handle` was opened with SYNCHRONIZE; a zero timeout never blocks.
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => Liveness::Exited,
+            WAIT_TIMEOUT => Liveness::Running,
+            _ => Liveness::Unknown,
+        }
+    }
+
+    fn started(&mut self, handle: HANDLE) -> Option<bool> {
+        teb(handle).map(|teb| teb != 0)
     }
 
     fn registers(&mut self, handle: HANDLE) -> Option<(usize, usize)> {
@@ -554,23 +682,7 @@ impl ThreadOps for LiveOps {
     }
 
     fn stack_base(&mut self, handle: HANDLE) -> Option<usize> {
-        // x64 THREAD_BASIC_INFORMATION is 0x30 bytes; TebBaseAddress is at +8.
-        let mut information = [0u64; 6];
-        let mut returned = 0u32;
-        // SAFETY: the handle has THREAD_QUERY_INFORMATION and the buffer is 0x30 bytes.
-        let status = unsafe {
-            NtQueryInformationThread(
-                handle,
-                ThreadBasicInformation,
-                information.as_mut_ptr().cast(),
-                u32::try_from(size_of_val(&information)).ok()?,
-                &raw mut returned,
-            )
-        };
-        if status.is_err() {
-            return None;
-        }
-        let teb = usize::try_from(information[1]).ok()?;
+        let teb = teb(handle)?;
         // NT_TIB.StackBase is the second word of the TEB.
         let mut base = [0u64; 1];
         (teb != 0 && self.read_words(teb + 8, &mut base))
@@ -860,6 +972,8 @@ mod tests {
         Resume,
         Rip,
         Stack,
+        Started,
+        Wait,
     }
 
     #[derive(Clone, Copy)]
@@ -880,13 +994,17 @@ mod tests {
         /// Threads that appear after the given enumeration call.
         spawn_after: Vec<(usize, u32)>,
         fail: Vec<(Op, usize, bool)>,
-        calls: [usize; 6],
+        calls: [usize; 8],
         /// Words on each thread's stack, lowest address first; RSP is at 0x10000 * (index + 1).
         stacks: Vec<Vec<u64>>,
         /// The enumerate error to inject.
         enumerate_error: FreezeError,
         /// Marks a thread exited when its resume fails.
         exit_on_failed_resume: bool,
+        /// Marks a thread exited when its suspend fails, as a terminating thread.
+        exit_on_failed_suspend: bool,
+        /// Keeps listing exited threads, as an enumeration may for a moment.
+        list_exited: bool,
     }
 
     impl Fake {
@@ -904,10 +1022,12 @@ mod tests {
                     .collect(),
                 spawn_after: Vec::new(),
                 fail: Vec::new(),
-                calls: [0; 6],
+                calls: [0; 8],
                 stacks: Vec::new(),
                 enumerate_error: FreezeError::Enumerate,
                 exit_on_failed_resume: false,
+                exit_on_failed_suspend: false,
+                list_exited: false,
             }
         }
 
@@ -953,7 +1073,16 @@ mod tests {
                 .map(|(_, id)| *id)
                 .collect();
             for id in spawned {
-                if !self.threads.iter().any(|thread| thread.id == id) {
+                // An exited thread's id may be given to a new thread.
+                if let Some(old) = self
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.id == id && !thread.alive && !thread.open)
+                {
+                    old.alive = true;
+                    old.suspend_count = 0;
+                    old.synced = false;
+                } else if !self.threads.iter().any(|thread| thread.id == id) {
                     self.threads.push(FakeThread {
                         id,
                         alive: true,
@@ -964,7 +1093,7 @@ mod tests {
                 }
             }
             for thread in &self.threads {
-                if thread.alive {
+                if thread.alive || self.list_exited {
                     ids.insert(thread.id)?;
                 }
             }
@@ -987,6 +1116,9 @@ mod tests {
 
         fn suspend(&mut self, handle: usize) -> bool {
             if self.should_fail(Op::Suspend) {
+                if self.exit_on_failed_suspend {
+                    self.thread(handle).alive = false;
+                }
                 return false;
             }
             let thread = self.thread(handle);
@@ -1009,8 +1141,18 @@ mod tests {
             true
         }
 
-        fn exited(&mut self, handle: usize) -> bool {
-            !self.thread(handle).alive
+        fn liveness(&mut self, handle: usize) -> Liveness {
+            if self.should_fail(Op::Wait) {
+                Liveness::Unknown
+            } else if self.thread(handle).alive {
+                Liveness::Running
+            } else {
+                Liveness::Exited
+            }
+        }
+
+        fn started(&mut self, _handle: usize) -> Option<bool> {
+            Some(!self.should_fail(Op::Started))
         }
 
         fn registers(&mut self, handle: usize) -> Option<(usize, usize)> {
@@ -1084,27 +1226,113 @@ mod tests {
     }
 
     #[test]
-    fn every_single_acquire_failure_aborts_and_releases() {
-        // Three threads, so each op runs several times; fail each call in turn.
-        for op in [Op::Enumerate, Op::Open, Op::Suspend, Op::Rip] {
-            for nth in 0..4 {
-                let mut fake = Fake::new(&[1, 2, 3]);
-                fake = fake.failing(op, nth, false);
-                let outcome = Freeze::acquire(&mut fake).map(Freeze::thaw);
-                let reached = fake.calls[op as usize] > nth;
-                match outcome {
-                    Ok(thawed) => {
-                        assert!(!reached, "{op:?} #{nth} failure was ignored");
-                        thawed.expect("thaw");
-                    }
-                    Err(error) => {
-                        assert!(reached);
-                        assert!(matches!(error, AcquireError::Aborted(_)), "{op:?} #{nth}");
-                    }
-                }
+    fn every_enumeration_failure_aborts_and_releases() {
+        // The snapshot and the check after suspending.
+        for nth in 0..2 {
+            let mut fake = Fake::new(&[1, 2, 3]).failing(Op::Enumerate, nth, false);
+            let error = Freeze::acquire(&mut fake).err().expect("abort");
+            assert_eq!(
+                error,
+                AcquireError::Aborted(FreezeError::Enumerate),
+                "#{nth}"
+            );
+            assert_released(&fake);
+        }
+    }
+
+    #[test]
+    fn every_single_disturbance_is_retried() {
+        // Three threads, so each op runs several times; disturb each call in turn.
+        for op in [Op::Open, Op::Suspend, Op::Rip, Op::Started] {
+            for nth in 0..3 {
+                let mut fake = Fake::new(&[1, 2, 3]).failing(op, nth, false);
+                let freeze = Freeze::acquire(&mut fake).expect("a retry succeeds");
+                assert_eq!(freeze.threads.len(), 3, "{op:?} #{nth}");
+                freeze.thaw().expect("thaw");
+                assert_eq!(fake.calls[Op::Enumerate as usize], 3, "{op:?} #{nth}");
                 assert_released(&fake);
             }
         }
+    }
+
+    #[test]
+    fn persistent_disturbances_fail_closed() {
+        for (op, expected) in [
+            (Op::Open, FreezeError::Open),
+            (Op::Suspend, FreezeError::Suspend),
+            (Op::Rip, FreezeError::Context),
+            (Op::Started, FreezeError::Starting),
+        ] {
+            let mut fake = Fake::new(&[1, 2, 3]).failing(op, 0, true);
+            let error = Freeze::acquire(&mut fake).err().expect("abort");
+            assert_eq!(error, AcquireError::Aborted(expected), "{op:?}");
+            assert_eq!(fake.calls[Op::Enumerate as usize], FREEZE_ATTEMPTS);
+            assert_released(&fake);
+        }
+    }
+
+    #[test]
+    fn a_thread_refused_because_it_exited_is_skipped() {
+        let mut fake = Fake::new(&[1, 2, 3]).failing(Op::Suspend, 1, false);
+        fake.exit_on_failed_suspend = true;
+        let freeze = Freeze::acquire(&mut fake).expect("freeze");
+        assert_eq!(freeze.threads.len(), 2);
+        freeze.thaw().expect("thaw");
+        // One attempt: the exited thread is gone, not a disturbance.
+        assert_eq!(fake.calls[Op::Enumerate as usize], 2);
+        assert_released(&fake);
+    }
+
+    #[test]
+    fn a_refused_suspension_with_an_unknown_state_fails_closed() {
+        let mut fake =
+            Fake::new(&[1, 2])
+                .failing(Op::Suspend, 0, false)
+                .failing(Op::Wait, 0, false);
+        let error = Freeze::acquire(&mut fake).err().expect("abort");
+        assert_eq!(error, AcquireError::Aborted(FreezeError::Wait));
+        assert_eq!(fake.calls[Op::Enumerate as usize], 1);
+        assert_released(&fake);
+    }
+
+    #[test]
+    fn a_listed_exited_thread_is_rechecked_and_skipped() {
+        let mut fake = Fake::new(&[1, 2, 3]).failing(Op::Suspend, 1, false);
+        fake.exit_on_failed_suspend = true;
+        fake.list_exited = true;
+        let freeze = Freeze::acquire(&mut fake).expect("freeze");
+        assert_eq!(freeze.threads.len(), 2);
+        freeze.thaw().expect("thaw");
+        // The check lists it again; reopening confirms it exited, so one attempt.
+        assert_eq!(fake.calls[Op::Enumerate as usize], 2);
+        assert_eq!(fake.calls[Op::Wait as usize], 2);
+        assert_released(&fake);
+    }
+
+    #[test]
+    fn a_failed_wait_on_the_recheck_fails_closed() {
+        let mut fake = Fake::new(&[1, 2, 3])
+            .failing(Op::Suspend, 1, false)
+            .failing(Op::Wait, 1, false);
+        fake.exit_on_failed_suspend = true;
+        fake.list_exited = true;
+        let error = Freeze::acquire(&mut fake).err().expect("abort");
+        assert_eq!(error, AcquireError::Aborted(FreezeError::Wait));
+        assert_eq!(fake.calls[Op::Enumerate as usize], 2);
+        assert_released(&fake);
+    }
+
+    #[test]
+    fn a_recycled_id_that_names_a_live_thread_restarts_the_attempt() {
+        let mut fake = Fake::new(&[1, 2, 3]).failing(Op::Suspend, 1, false);
+        fake.exit_on_failed_suspend = true;
+        fake.list_exited = true;
+        // The exited thread's id is given to a new, live thread before the check.
+        fake.spawn_after = vec![(0, 2)];
+        let freeze = Freeze::acquire(&mut fake).expect("freeze");
+        freeze.thaw().expect("thaw");
+        assert_eq!(fake.calls[Op::Enumerate as usize], 4);
+        assert_released(&fake);
     }
 
     #[test]
@@ -1117,19 +1345,22 @@ mod tests {
     }
 
     #[test]
-    fn late_threads_are_suspended() {
+    fn a_late_thread_restarts_the_attempt_rather_than_being_suspended() {
         let mut fake = Fake::new(&[1]);
         fake.spawn_after = vec![(0, 7)];
         let freeze = Freeze::acquire(&mut fake).expect("freeze");
+        // The first attempt's check finds thread 7 and retries; the second attempt's
+        // snapshot holds both.
         assert_eq!(freeze.threads.len(), 2);
         freeze.thaw().expect("thaw");
+        assert_eq!(fake.calls[Op::Enumerate as usize], 4);
         assert_released(&fake);
     }
 
     #[test]
     fn threads_that_keep_appearing_abort_the_freeze() {
         let mut fake = Fake::new(&[1]);
-        fake.spawn_after = (0..10)
+        fake.spawn_after = (0..2 * FREEZE_ATTEMPTS)
             .map(|call| (call, 100 + u32::try_from(call).unwrap()))
             .collect();
         let error = Freeze::acquire(&mut fake).err().expect("abort");

@@ -88,6 +88,12 @@ pointer, and a fixed crash queue with a safe stack probe. Further hardening:
 - Code writes freeze threads through `NtQuerySystemInformation`, with no
   allocation after the first suspend. A thread that cannot be resumed keeps
   its handle and disables further code writes (terminal).
+- Each freeze, here and in the vendored hook library, is a bounded run of
+  attempts. A thread created during the freeze is never suspended; it, a
+  thread with no TEB yet (one Wine has not started, whose context read would
+  block), or a thread that cannot be suspended and whose handle is not
+  signaled (Windows refuses a terminating thread) thaws the attempt and
+  retries it. A thread counts as exited only when its handle is signaled.
 - Page protections are journaled and restored. Pointer slots are swapped with
   an aligned compare-and-swap.
 - The Arxan bypass is restored last on rollback, and kept while dependent
@@ -102,8 +108,8 @@ pointer, and a fixed crash queue with a safe stack probe. Further hardening:
 The full patch has been exercised in game under Proton: it hosts a lobby and
 plays rounds ([`docs/in-game-run-log.md`](docs/in-game-run-log.md)). That
 does not mean every protection, campaign or Lua path has been verified. It is
-untested on Windows. The tests pass under Wine, including live freeze and
-stack-scan tests. How to run and diagnose the patch in game is in
+untested in game on Windows. The tests pass under Wine and on native Windows 11
+(a VM), including live freeze and stack-scan tests. How to run and diagnose the patch in game is in
 [`docs/testing-under-proton.md`](docs/testing-under-proton.md).
 
 Known limits, also listed in `docs/upstream-differences.md`: the exception

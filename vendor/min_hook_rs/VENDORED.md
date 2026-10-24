@@ -12,7 +12,8 @@
 
 - `Cargo.toml` is upstream's `Cargo.toml.orig`, minus its `[profile.release]`
   section (profiles of a non-root package are ignored and Cargo warns about them).
-  It adds the `Wdk_System_SystemInformation` feature of `windows-sys` for patch 9.
+  It adds the `Wdk_System_SystemInformation` and `Wdk_System_Threading` features of
+  `windows-sys` for patch 9.
 - The registry files `.cargo-ok`, `.cargo_vcs_info.json`, `.gitignore` and
   `Cargo.lock` are not copied.
 
@@ -24,15 +25,23 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    (14) and `HookError::ThreadResume` (15) are new, with `as_str` and `from_code`
    entries. Codes 1 to 12 still match `MH_STATUS`.
 2. **Fail-closed freeze.** `FrozenThreads::freeze` suspends every thread of the
-   process or none. If `OpenThread` or `SuspendThread` fails for a live thread of
-   this process, the threads already suspended are resumed and `ThreadSuspend` is
+   process or none. If `OpenThread` or `SuspendThread` fails for a thread not
+   confirmed to have exited, the threads already suspended are resumed and the
+   attempt is retried (patch 9); when every attempt fails, `ThreadSuspend` is
    returned. Upstream zeroed the failed entry and reported success. A failed
    enumeration also returns `ThreadSuspend` (upstream: `MemoryAlloc`).
    Three cases are skipped as "thread is gone", because a thread that no longer
    exists cannot be parked in a patched range:
    - `OpenThread` fails with `ERROR_INVALID_PARAMETER` (the id no longer exists);
-   - `GetProcessIdOfThread` names another process (the id was reused);
-   - `SuspendThread` fails and `GetExitCodeThread` reports the thread exited.
+   - `GetProcessIdOfThread` names another process (the id was reused); zero means
+     the query failed and is retried, not skipped;
+   - `SuspendThread` fails and the thread's handle is signaled (a zero-timeout
+     wait; the handle is opened with `SYNCHRONIZE`). The exit code cannot tell:
+     Windows refuses to suspend a terminating thread
+     (`STATUS_THREAD_IS_TERMINATING`, reported as `ERROR_ACCESS_DENIED`) while its
+     exit code still reads `STILL_ACTIVE`, and such a thread may still run DLL
+     detach code. A handle that is not signaled retries the attempt; a failed
+     wait fails closed at once.
    `SuspendThread`'s failure value is compared as `u32::MAX`.
 3. **Handles stay open until resume.** `FrozenThreads` owns the handles of the
    threads it suspended. Upstream closed each handle after suspending and reopened
@@ -45,8 +54,9 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    `Get/SetThreadContext` require; upstream's stack `CONTEXT` could fail silently.
 6. **Transactional enable/disable** (`HookManager::transact`). One code path serves
    single hooks, `ALL_HOOKS`, `apply_queued`, `remove_hook` and `uninitialize`:
-   1. read each thread's context and compute its new RIP with the pure `plan_ip`
-      (no writes);
+   1. compute each thread's new RIP with the pure `plan_ip`, from the context
+      the freeze read while confirming its suspension (no writes, and no second
+      context read);
    2. `VirtualProtect` every page of every patch range first, one call per page,
       journaling each page's original protection and restoring them all if one
       fails, then write the bytes, which can no longer fail;
@@ -72,29 +82,41 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    its hooks intact.
 9. **Threads created during the freeze are caught.** Upstream enumerated once
    with Toolhelp, so a thread created after the snapshot kept running while code
-   was patched. Now each freeze attempt suspends every thread of a snapshot, reads
-   their contexts (which waits for `SuspendThread` to take effect), and enumerates
-   again. If the second list has a thread the first did not, the attempt is thawed
-   and retried after a 1 ms pause. That thread is never suspended: under Wine a
-   thread caught mid-startup may never reach its suspension, and reading its
-   context then hangs with every other thread frozen. (Suspending such threads
-   deadlocked the T7Patch-rs test binary in 4 of 6 runs.) An attempt whose context
-   read fails is retried the same way, since under Wine that happens to a thread
-   that is starting or exiting. An id whose thread had exited and that is listed
-   again is opened once more: if it now names a live thread of this process (a new
-   thread given the recycled id), the attempt is retried too. After 16 disturbed attempts the freeze gives up
-   with `ThreadSuspend`, or `ThreadContext` if the last one failed a context read.
+   was patched. Now each freeze attempt suspends every thread of a snapshot,
+   checks that each has started, reads their contexts (which waits for
+   `SuspendThread` to take effect), and enumerates again. If the second list has a
+   thread the first did not, the attempt is thawed and retried after a 1 ms
+   pause. That thread is never suspended.
+   Under Wine a thread whose creator was suspended between registering it and
+   starting it never reaches its suspension, so `GetThreadContext` on it waits
+   forever with every other thread frozen. (A `winedbg` capture of the T7Patch-rs
+   test binary showed exactly that; suspending late threads hung it in 4 of 6
+   runs.) Such a thread has no TEB yet: Wine sets it when the thread starts. So a
+   context is read only once `NtQueryInformationThread(ThreadBasicInformation)`
+   shows a TEB; a thread without one retries the attempt. That check eliminated
+   the hang in a build that still suspended late threads (0 of 14 runs hung, 9
+   of 14 without it). On Windows the TEB is set when the thread is created.
+   An attempt whose context read fails, or whose open or suspend was disturbed
+   (patch 2), is retried the same way. An id whose thread had exited and that is
+   listed again is opened once more: if it now names a live thread of this
+   process (a new thread given the recycled id), or its owner cannot be read, the
+   attempt is retried too; if the wait that would confirm its exit fails, the
+   freeze fails closed.
+   After 16 disturbed attempts the freeze gives up with `ThreadSuspend`, or
+   `ThreadContext` if the last one failed a context read.
    Enumeration uses `NtQuerySystemInformation(SystemProcessInformation)` into a
    buffer sized with headroom before the freeze, and ids go into fixed arrays, so
-   nothing allocates while threads are suspended. Toolhelp is not used: Wine's
-   `CreateToolhelp32Snapshot` allocates from the process heap, which a suspended
-   thread may hold locked. Every buffer is sized for 512 threads before the first
-   suspension; more fails closed. The enumeration and the parser are ports of
-   `src/threads.rs` in T7Patch-rs. This needs the `Wdk_System_SystemInformation`
-   feature of `windows-sys`.
+   nothing allocates on the Rust side while threads are suspended. Toolhelp is
+   not used: Wine's `CreateToolhelp32Snapshot` allocates from the process heap,
+   which a suspended thread may hold locked. Every buffer, including the saved
+   contexts, is sized for 512 threads before the first suspension; more fails
+   closed. The enumeration and the parser are ports of `src/threads.rs` in
+   T7Patch-rs, which applies the same policy. This needs the
+   `Wdk_System_SystemInformation` and `Wdk_System_Threading` features of
+   `windows-sys`.
 10. **Resume failures are terminal.** `FrozenThreads::thaw` resumes each thread
-   once, retrying a failed `ResumeThread` up to three times; a thread that has
-   exited counts as resumed. Every error path thaws explicitly, and drop thaws as a
+   once, retrying a failed `ResumeThread` up to three times; a thread whose handle
+   is signaled counts as resumed. Every error path thaws explicitly, and drop thaws as a
    safety net, so nothing is resumed twice. A thread that stays suspended keeps its
    handle open (its id cannot be reused) and sets a process-wide latch,
    `thaw_failed()`. The call then returns `ThreadResume` in place of any other
@@ -111,13 +133,14 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
     are process-wide latches. The other pages and ranges are still restored and
     flushed, and the call's result is unchanged: the hook change itself applied.
 12. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
-   `fault` module. It can fail chosen calls to `OpenThread` (with a chosen last
-   error), `SuspendThread`, the context read that synchronizes a new suspension,
+   `fault` module. It can fail chosen calls to `OpenThread`, make a chosen thread
+   look gone to it, `SuspendThread`, the started (TEB) check, the zero-timeout wait,
    `Get/SetThreadContext`, `VirtualProtect` (making a page
    writable and restoring it separately) or `FlushInstructionCache`, fail the
    resumes of one chosen thread, and force a no-op context write for every thread so
    the rollback path runs. It can also hide trailing ids from chosen enumerations,
-   so a thread seems to appear mid-freeze. Plans for different calls combine. A test resumes a
+   so a thread seems to appear mid-freeze. Plans for different calls combine, and
+   bit 63 of a mask covers every later call. A test resumes a
    thread the thaw left suspended itself (`fault::release_stuck`), which also clears
    that latch; `fault::reset_latches` clears the other two. Production code cannot
    clear any of them. Tests: `hook::tests`.
@@ -142,9 +165,9 @@ removed. Neither changes behaviour.
   deadlock. `src/threads.rs` in T7Patch-rs has the same exposure. Wine's
   `NtQuerySystemInformation` may allocate on its Unix side, from an allocator a
   suspended thread could hold (not verified); `src/threads.rs` shares that too.
-- A thread already starting up when the first snapshot is taken is suspended like
-  any other, and its context read can block under Wine for the same reason a late
-  thread's did. Retries cannot bound a call that blocks. Upstream had the same
-  exposure in its single context read, and `src/threads.rs` shares it.
+- A thread that has started (has a TEB) but cannot reach its suspension point
+  would still make `GetThreadContext` block under Wine; nothing bounds that call.
+  No such case has been observed. A bounded design would read contexts on a
+  pre-created helper thread with a timeout.
 - Only RIP is checked (unchanged from upstream). A return address into a trampoline (from a relocated
   `call` in the prologue) on some thread's stack is not detected.
