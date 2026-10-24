@@ -2057,7 +2057,6 @@ mod rw {
 ///
 /// `this` must address a [`REQUEST_OUT_LEN`]-byte scratch buffer and
 /// `lobby_msg` a live copy of the lobby message.
-#[allow(clippy::too_many_lines)]
 pub unsafe fn msg_join_party_package_inspect(this: *mut u8, lobby_msg: *mut c_void) -> i32 {
     let Some(g) = game() else {
         return NOT_INSTALLED;
@@ -2125,7 +2124,6 @@ pub unsafe fn msg_join_party_package_inspect(this: *mut u8, lobby_msg: *mut c_vo
 /// # Safety
 ///
 /// As [`msg_join_party_package_inspect`], with `this` read and written as `__int32*`.
-#[allow(clippy::too_many_lines)]
 pub unsafe fn msg_lobby_state_package_inspect(this: *mut u8, lobby_msg: *mut c_void) -> i32 {
     let Some(g) = game() else {
         return NOT_INSTALLED;
@@ -2443,7 +2441,6 @@ pub unsafe fn msg_host_heartbeat_inspect(this: *mut u8, lobby_msg: *mut c_void) 
 /// # Safety
 ///
 /// `info` must be writable and `lm` a live lobby message.
-#[allow(clippy::too_many_lines)]
 pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyMsg) -> i32 {
     let Some(g) = game() else {
         return NOT_INSTALLED;
