@@ -751,7 +751,7 @@ impl HookManager {
         if !self.heap {
             return Err(HookError::NotInitialized);
         }
-        if !is_executable_address(target) || !is_executable_address(detour) {
+        if !is_executable_address(target as usize) || !is_executable_address(detour as usize) {
             return Err(HookError::NotExecutable);
         }
         let pos = self.find_hook_entry(target);

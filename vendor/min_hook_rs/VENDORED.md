@@ -2,9 +2,9 @@
 
 - Upstream: [`min_hook_rs`](https://github.com/Rukkhadevata123/min_hook_rs) 2.2.1 from crates.io,
   by Rukkhadevata123, MIT (see `LICENSE`). A pure-Rust port of MinHook.
-- Copied from the cargo registry source. `src/buffer.rs`, `src/disasm.rs`,
-  `src/instruction.rs`, `src/trampoline.rs`, `src/lib.rs`, `README.md` and `LICENSE`
-  are unchanged.
+- Copied from the cargo registry source. `src/disasm.rs`, `src/instruction.rs`,
+  `README.md` and `LICENSE` are unchanged. `src/buffer.rs`, `src/trampoline.rs` and
+  `src/lib.rs` carry only the lint and format changes listed under "Lint changes".
 - T7Patch-rs reaches it only through `src/ffi.rs`. It is a workspace member, so
   `cargo test --workspace` and `cargo clippy --workspace` cover it.
 
@@ -17,7 +17,7 @@
 
 ## Patches
 
-All code patches are in `src/hook.rs` and `src/error.rs`.
+All behaviour patches are in `src/hook.rs` and `src/error.rs`.
 
 1. **Error codes.** `HookError::ThreadSuspend` (13) and `HookError::ThreadContext`
    (14) are new, with `as_str` and `from_code` entries. Codes 1 to 12 still match
@@ -74,6 +74,19 @@ All code patches are in `src/hook.rs` and `src/error.rs`.
    error), `SuspendThread`, `Get/SetThreadContext` or `VirtualProtect`, and it can
    force a no-op context write for every thread so the rollback path runs. Tests:
    `hook::tests`.
+
+## Lint changes
+
+T7Patch-rs keeps no lint or format exceptions, so the vendored crate's own two are
+removed. Neither changes behaviour.
+
+- `buffer::is_executable_address` takes `address: usize` instead of `*mut c_void`.
+  It only passes the address to `VirtualQuery` and never dereferences it, so the
+  `#[allow(clippy::not_unsafe_ptr_arg_deref)]` is gone. The callers in
+  `src/trampoline.rs` and `src/hook.rs` pass `ptr as usize`; a null pointer is
+  still rejected (address 0).
+- `src/lib.rs` drops `#[rustfmt::skip]` on the `pub use hook::{...}` list, which
+  rustfmt now formats.
 
 ## Known limits (unchanged from upstream)
 

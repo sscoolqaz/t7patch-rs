@@ -232,7 +232,7 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
 
             // Try to use hot patch area above the function
             let hot_patch_addr = (ct.target as usize - size_of::<JmpRel>()) as *mut c_void;
-            if !is_executable_address(hot_patch_addr) {
+            if !is_executable_address(hot_patch_addr as usize) {
                 return Err(HookError::UnsupportedFunction);
             }
 

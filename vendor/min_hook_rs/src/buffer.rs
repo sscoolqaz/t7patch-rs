@@ -364,16 +364,19 @@ pub fn free_buffer(buffer: *mut c_void) {
     BUFFER_MANAGER.lock().unwrap().free_buffer(buffer);
 }
 
-/// Check if address is executable
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn is_executable_address(address: *mut c_void) -> bool {
-    if address.is_null() {
+/// Check if address is executable. The address is only queried, never dereferenced.
+pub fn is_executable_address(address: usize) -> bool {
+    if address == 0 {
         return false;
     }
 
     unsafe {
         let mut mi = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
-        VirtualQuery(address, &mut mi, size_of::<MEMORY_BASIC_INFORMATION>());
+        VirtualQuery(
+            address as *const c_void,
+            &mut mi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
 
         mi.State == MEM_COMMIT && (mi.Protect & PAGE_EXECUTE_FLAGS) != 0
     }
