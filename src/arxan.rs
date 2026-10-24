@@ -4,7 +4,7 @@
 //! code for known checksum instruction sequences. The sequences are stored
 //! XOR-encrypted here and rewritten in memory so the scan no longer matches.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::System::Diagnostics::Debug::FlushInstructionCache;
@@ -359,14 +359,72 @@ impl PointerWrite {
     }
 }
 
-/// Atomically replaces the pointer at `slot` with `new` if it still holds
-/// `expected`. The swap is one aligned `lock cmpxchg`, so a reader on another
-/// thread sees either the old or the new pointer, never a torn mix. Anything
-/// `new` points at must be fully initialized before this is called.
+/// Bytes in an x86 cache line. A misaligned locked access that stays inside one
+/// line is atomic; one that crosses a line is a split lock.
+const CACHE_LINE: usize = 64;
+
+/// Whether the 8 bytes at `slot` sit inside one cache line.
+const fn within_cache_line(slot: usize) -> bool {
+    slot % CACHE_LINE + size_of::<usize>() <= CACHE_LINE
+}
+
+/// One 8-byte load from `slot`, which need not be aligned.
 ///
-/// Nothing is written when `slot` is not 8-byte aligned, when its page cannot be
-/// made writable, or when it no longer holds `expected`. Page-protection
-/// changes are serialized with code writes by the patch transaction.
+/// # Safety
+///
+/// `slot` must be readable for 8 bytes.
+unsafe fn load_word(slot: usize) -> usize {
+    let value: usize;
+    // SAFETY: the caller guarantees the 8 bytes are readable. A single `mov` is
+    // atomic on x86 for an access inside one cache line, aligned or not.
+    unsafe {
+        std::arch::asm!(
+            "mov {value}, qword ptr [{slot}]",
+            slot = in(reg) slot,
+            value = out(reg) value,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    value
+}
+
+/// `lock cmpxchg` on `slot`, which need not be aligned. Returns the value the
+/// slot held: `expected` exactly when the swap happened.
+///
+/// # Safety
+///
+/// `slot` must be writable for 8 bytes and lie within one cache line.
+unsafe fn compare_exchange_word(slot: usize, expected: usize, new: usize) -> usize {
+    let previous: usize;
+    // SAFETY: the caller guarantees the 8 bytes are writable and inside one cache
+    // line, where x86 performs a locked misaligned access atomically.
+    unsafe {
+        std::arch::asm!(
+            "lock cmpxchg qword ptr [{slot}], {new}",
+            slot = in(reg) slot,
+            new = in(reg) new,
+            inout("rax") expected => previous,
+            options(nostack),
+        );
+    }
+    previous
+}
+
+/// Atomically replaces the pointer at `slot` with `new` if it still holds
+/// `expected`. The swap is one `lock cmpxchg`, so a reader on another thread
+/// sees either the old or the new pointer, never a torn mix. Anything `new`
+/// points at must be fully initialized before this is called.
+///
+/// The slot need not be 8-byte aligned. The game's own import table is only
+/// 4-byte aligned (`IsProcessorFeaturePresent` sits at RVA `0x1AA69E94`), and
+/// upstream writes it with a plain `memcpy`. A misaligned locked access is
+/// atomic while it stays inside one cache line. A slot that crosses a line falls
+/// back to upstream's behaviour: compare, then a plain write, still under the
+/// patch transaction.
+///
+/// Nothing is written when the slot is unmapped, when its page cannot be made
+/// writable, or when it no longer holds `expected`. Page-protection changes are
+/// serialized with code writes by the patch transaction.
 ///
 /// # Safety
 ///
@@ -378,7 +436,7 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
         protection_restored: true,
         observed: 0,
     };
-    if slot == 0 || !slot.is_multiple_of(align_of::<usize>()) {
+    if slot == 0 {
         return result;
     }
     // SAFETY: the range is only queried. An unmapped slot (a freed interface, say)
@@ -387,9 +445,8 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
         return result;
     }
     let _transaction = crate::threads::lock_transaction();
-    // SAFETY: the slot is committed, aligned and read as a `usize` by other code.
-    let atomic = unsafe { AtomicUsize::from_ptr(slot as *mut usize) };
-    result.observed = atomic.load(Ordering::Acquire);
+    // SAFETY: the slot is committed and readable, checked above.
+    result.observed = unsafe { load_word(slot) };
     if result.observed != expected {
         return result;
     }
@@ -398,9 +455,18 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
     if !journal.make_writable(&mut ops, slot, slot + size_of::<usize>()) {
         return result;
     }
-    match atomic.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => result.written = true,
-        Err(actual) => result.observed = actual,
+    if within_cache_line(slot) {
+        // SAFETY: the page was made writable above and the slot is inside one line.
+        let previous = unsafe { compare_exchange_word(slot, expected, new) };
+        if previous == expected {
+            result.written = true;
+        } else {
+            result.observed = previous;
+        }
+    } else {
+        // SAFETY: the page was made writable above; this is upstream's plain write.
+        unsafe { (slot as *mut usize).write_unaligned(new) };
+        result.written = true;
     }
     result.protection_restored = journal.restore(&mut ops);
     result
@@ -885,6 +951,7 @@ pub fn active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// Fake pages: `protections[page]` is the current protection, and `fail`
     /// fails the given 0-based calls.
@@ -982,8 +1049,25 @@ mod tests {
         let swapped = unsafe { swap_usize(address, 5, 9) };
         assert!(swapped.complete());
         assert_eq!(slot.load(Ordering::Acquire), 9);
-        // SAFETY: as above; a misaligned address is refused before any access.
-        assert!(!unsafe { swap_usize(address + 1, 9, 1) }.written);
+        // A misaligned slot, as in the game's import table, is swapped too.
+        let mut words = Box::new([0u64; 16]);
+        let base = words.as_mut_ptr().addr();
+        let line = (base + CACHE_LINE - 1) & !(CACHE_LINE - 1);
+        let misaligned = line + 4;
+        if misaligned + 8 <= base + 16 * 8 {
+            // SAFETY: `misaligned` lies inside the live heap array, within one line.
+            unsafe { (misaligned as *mut usize).write_unaligned(7) };
+            // SAFETY: as above.
+            let swapped = unsafe { swap_usize(misaligned, 7, 11) };
+            assert!(swapped.complete());
+            // SAFETY: as above.
+            assert_eq!(unsafe { (misaligned as *const usize).read_unaligned() }, 11);
+            // SAFETY: as above; a stale expected value writes nothing.
+            assert!(!unsafe { swap_usize(misaligned, 7, 13) }.written);
+        }
+        assert!(within_cache_line(0x1000 + 0x14));
+        assert!(within_cache_line(0x1000 + 0x38));
+        assert!(!within_cache_line(0x1000 + 0x3C));
         // SAFETY: an unmapped slot is refused by the VirtualQuery check, not read.
         let unmapped = unsafe { swap_usize(0x10, 0, 1) };
         assert!(!unmapped.written);
