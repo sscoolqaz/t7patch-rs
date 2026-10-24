@@ -21,6 +21,7 @@ use crate::instruction::*;
 use crate::trampoline::create_trampoline;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
@@ -41,6 +42,17 @@ const INVALID_HOOK_POS: usize = usize::MAX;
 /// Thread access rights for suspending/resuming threads.
 const THREAD_ACCESS: u32 =
     THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT;
+/// How many times a failed `ResumeThread` is retried before the thread is declared stuck.
+const RESUME_ATTEMPTS: usize = 3;
+
+/// Set once a frozen thread could not be resumed. Its handle is leaked on purpose
+/// and every later hook change is refused with [`HookError::ThreadResume`].
+static THAW_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// True once a freeze left a live thread suspended. Terminal for the process.
+pub fn thaw_failed() -> bool {
+    THAW_FAILED.load(Ordering::Acquire)
+}
 
 /// Represents a single hook entry.
 #[derive(Debug, Clone)]
@@ -232,9 +244,12 @@ struct ThreadMove {
 }
 
 /// Threads suspended by [`FrozenThreads::freeze`]. Each handle stays open until its
-/// thread is resumed, which happens on drop, so every early return resumes them.
+/// thread is resumed by [`FrozenThreads::thaw`]. Drop thaws too, as a safety net
+/// for an early return, but cannot report a failure, so error paths thaw
+/// explicitly through [`FrozenThreads::abort`].
 struct FrozenThreads {
     handles: Vec<HANDLE>,
+    active: bool,
 }
 
 impl FrozenThreads {
@@ -245,7 +260,15 @@ impl FrozenThreads {
         // Allocate before suspending: a suspended thread may hold the heap lock.
         let mut frozen = Self {
             handles: Vec::with_capacity(ids.len()),
+            active: true,
         };
+        if let Err(error) = frozen.suspend(ids) {
+            return Err(frozen.abort(error));
+        }
+        Ok(frozen)
+    }
+
+    fn suspend(&mut self, ids: &[u32]) -> Result<()> {
         // SAFETY: plain Win32 calls on handles this function opens and owns.
         unsafe {
             let process_id = GetCurrentProcessId();
@@ -268,32 +291,85 @@ impl FrozenThreads {
                     return Err(HookError::ThreadSuspend);
                 }
                 if !sys::suspend_thread(handle) {
-                    let mut exit_code = 0u32;
-                    let exited = GetExitCodeThread(handle, &mut exit_code) != 0
-                        && exit_code != STILL_ACTIVE.cast_unsigned();
+                    let exited = exited(handle);
                     CloseHandle(handle);
                     if exited {
                         continue;
                     }
                     return Err(HookError::ThreadSuspend);
                 }
-                frozen.handles.push(handle);
+                self.handles.push(handle);
             }
         }
-        Ok(frozen)
+        Ok(())
+    }
+
+    /// Thaws after `error` and returns the error to report: `error` itself, or
+    /// [`HookError::ThreadResume`] when a thread stayed suspended.
+    fn abort(&mut self, error: HookError) -> HookError {
+        if self.thaw() {
+            error
+        } else {
+            HookError::ThreadResume
+        }
+    }
+
+    /// Resumes every suspended thread exactly once. A thread that stays suspended
+    /// keeps its handle open, so its id cannot be reused under us, and sets
+    /// [`THAW_FAILED`]. Returns `false` in that case. Allocation-free.
+    fn thaw(&mut self) -> bool {
+        if !self.active {
+            return true;
+        }
+        self.active = false;
+        let mut thawed = true;
+        for &handle in &self.handles {
+            if resume_one(handle) {
+                // SAFETY: `handle` was opened by `freeze` and its thread is running or gone.
+                unsafe { CloseHandle(handle) };
+            } else {
+                thawed = false;
+                #[cfg(test)]
+                fault::stuck(handle);
+            }
+        }
+        self.handles.clear();
+        if !thawed {
+            THAW_FAILED.store(true, Ordering::Release);
+        }
+        thawed
     }
 }
 
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
-        for &handle in &self.handles {
-            // SAFETY: `handle` was opened and suspended by `freeze` and is still open.
-            unsafe {
-                ResumeThread(handle);
-                CloseHandle(handle);
-            }
+        // Safety net for an early return or panic: never leave the process suspended.
+        let _ = self.thaw();
+    }
+}
+
+/// Resumes a thread `freeze` suspended, retrying a failure. A thread that has
+/// exited counts as resumed.
+fn resume_one(handle: HANDLE) -> bool {
+    for attempt in 0..RESUME_ATTEMPTS {
+        if attempt > 0 {
+            // SAFETY: Sleep takes a plain duration.
+            unsafe { Sleep(1) };
+        }
+        // SAFETY: `handle` is open with THREAD_SUSPEND_RESUME and was suspended by `freeze`.
+        if unsafe { sys::resume_thread(handle) } {
+            return true;
         }
     }
+    exited(handle)
+}
+
+/// True when the thread behind `handle` has exited.
+fn exited(handle: HANDLE) -> bool {
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is an open thread handle and `exit_code` a valid out-pointer.
+    let read = unsafe { GetExitCodeThread(handle, &mut exit_code) != 0 };
+    read && exit_code != STILL_ACTIVE.cast_unsigned()
 }
 
 /// Enumerates all threads in the current process except the current thread.
@@ -362,6 +438,15 @@ mod sys {
         unsafe { SuspendThread(handle) != u32::MAX }
     }
 
+    pub(super) unsafe fn resume_thread(handle: HANDLE) -> bool {
+        #[cfg(test)]
+        if fault::resume_fails(handle) {
+            return false;
+        }
+        // SAFETY: the caller passes an open thread handle it suspended.
+        unsafe { ResumeThread(handle) != u32::MAX }
+    }
+
     pub(super) unsafe fn get_context(handle: HANDLE, context: &mut AlignedContext) -> bool {
         #[cfg(test)]
         if fault::hit(fault::Call::GetContext) {
@@ -404,6 +489,9 @@ mod sys {
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{GetThreadId, ResumeThread};
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) enum Call {
@@ -414,17 +502,30 @@ pub(crate) mod fault {
         Protect,
     }
 
+    const CALLS: usize = 5;
+    /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
+    const MAX_STUCK: usize = 8;
+
     thread_local! {
-        /// The call to fail, a bitmask of which calls (by index) fail, and the next index.
-        static PLAN: Cell<Option<(Call, u64, u32)>> = const { Cell::new(None) };
+        /// Per call: a bitmask of which calls (by zero-based index) fail, and the next index.
+        static PLAN: Cell<[(u64, u32); CALLS]> = const { Cell::new([(0, 0); CALLS]) };
         /// The last-error value an injected `OpenThread` failure reports.
         static OPEN_ERROR: Cell<u32> = const { Cell::new(5) };
         static FORCE_MOVES: Cell<bool> = const { Cell::new(false) };
+        /// A thread id whose resumes fail, and how many more of them fail.
+        static STICK: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+        /// Handles the thaw left suspended, for the test to resume itself.
+        static STUCK: Cell<[usize; MAX_STUCK]> = const { Cell::new([0; MAX_STUCK]) };
     }
 
-    /// Fails the calls to `call` whose zero-based index is set in `mask`.
+    /// Fails the calls to `call` whose zero-based index is set in `mask`. Plans for
+    /// different calls combine.
     pub(crate) fn fail(call: Call, mask: u64) {
-        PLAN.with(|plan| plan.set(Some((call, mask, 0))));
+        PLAN.with(|plan| {
+            let mut plans = plan.get();
+            plans[call as usize] = (mask, 0);
+            plan.set(plans);
+        });
     }
 
     /// Sets the last error an injected `OpenThread` failure reports.
@@ -436,20 +537,65 @@ pub(crate) mod fault {
         FORCE_MOVES.with(|value| value.set(force));
     }
 
+    /// Fails the next `times` resumes of thread `id`.
+    pub(crate) fn stick(id: u32, times: u32) {
+        STICK.with(|stick| stick.set((id, times)));
+    }
+
+    /// Resumes and closes every handle the thaw left suspended, then clears the
+    /// terminal latches. Returns how many threads it resumed.
+    pub(crate) fn release_stuck() -> usize {
+        let handles = STUCK.with(|stuck| stuck.replace([0; MAX_STUCK]));
+        let mut released = 0;
+        for handle in handles.into_iter().filter(|&handle| handle != 0) {
+            // SAFETY: the thaw kept this handle open and its thread suspended.
+            unsafe {
+                ResumeThread(handle as HANDLE);
+                CloseHandle(handle as HANDLE);
+            }
+            released += 1;
+        }
+        super::THAW_FAILED.store(false, Ordering::Release);
+        released
+    }
+
     pub(crate) fn clear() {
-        PLAN.with(|plan| plan.set(None));
+        PLAN.with(|plan| plan.set([(0, 0); CALLS]));
         OPEN_ERROR.with(|value| value.set(5));
         FORCE_MOVES.with(|value| value.set(false));
+        STICK.with(|stick| stick.set((0, 0)));
     }
 
     pub(super) fn hit(call: Call) -> bool {
-        PLAN.with(|plan| match plan.get() {
-            Some((planned, mask, index)) if planned == call => {
-                plan.set(Some((planned, mask, index + 1)));
-                index < 64 && mask & (1 << index) != 0
-            }
-            _ => false,
+        PLAN.with(|plan| {
+            let mut plans = plan.get();
+            let (mask, index) = plans[call as usize];
+            plans[call as usize].1 = index + 1;
+            plan.set(plans);
+            index < 64 && mask & (1 << index) != 0
         })
+    }
+
+    pub(super) fn resume_fails(handle: HANDLE) -> bool {
+        STICK.with(|stick| {
+            let (id, times) = stick.get();
+            // SAFETY: `handle` is an open thread handle.
+            if times == 0 || unsafe { GetThreadId(handle) } != id {
+                return false;
+            }
+            stick.set((id, times - 1));
+            true
+        })
+    }
+
+    pub(super) fn stuck(handle: HANDLE) {
+        STUCK.with(|stuck| {
+            let mut handles = stuck.get();
+            if let Some(slot) = handles.iter_mut().find(|slot| **slot == 0) {
+                *slot = handle as usize;
+            }
+            stuck.set(handles);
+        });
     }
 
     pub(super) fn open_thread() -> Option<u32> {
@@ -532,9 +678,17 @@ impl HookManager {
     /// disabled (a moved thread is then either in a kept trampoline or at original
     /// code), the trampoline buffers are retained for good, and an error is returned.
     ///
+    /// If a thread cannot be resumed afterwards, the hook state is still recorded as
+    /// it ended up, the buffers are retained, [`THAW_FAILED`] is set, and
+    /// [`HookError::ThreadResume`] is returned in place of any other result. Every
+    /// later call is then refused with it.
+    ///
     /// Returns whether every thread was verified to be outside the trampoline slots
     /// of the hooks in `watch` once the batch applied.
     fn transact(&mut self, batch: &[(usize, bool)], watch: &[usize]) -> Result<bool> {
+        if thaw_failed() {
+            return Err(HookError::ThreadResume);
+        }
         if batch.is_empty() && watch.is_empty() {
             return Ok(true);
         }
@@ -542,16 +696,17 @@ impl HookManager {
         // Allocate before freezing: a suspended thread may hold the heap lock.
         let mut moves: Vec<ThreadMove> = Vec::with_capacity(ids.len());
         let mut protections: Vec<u32> = Vec::with_capacity(batch.len());
-        let frozen = FrozenThreads::freeze(&ids)?;
+        let mut frozen = FrozenThreads::freeze(&ids)?;
         let hooks = &self.hooks.items;
 
         // Step 1: read contexts and plan the moves.
         let mut clear = true;
-        for &handle in &frozen.handles {
+        for index in 0..frozen.handles.len() {
+            let handle = frozen.handles[index];
             let mut context = AlignedContext::control();
             // SAFETY: `handle` is an open, suspended thread of this process.
             if !unsafe { sys::get_context(handle, &mut context) } {
-                return Err(HookError::ThreadContext);
+                return Err(frozen.abort(HookError::ThreadContext));
             }
             let ip = context.0.Rip;
             let new_ip = plan_ip(hooks, batch, ip as usize);
@@ -575,7 +730,7 @@ impl HookManager {
             // SAFETY: the patch range lies in the hooked, mapped function.
             if !unsafe { sys::protect(address, size, PAGE_EXECUTE_READWRITE, &mut old_protect) } {
                 Self::reprotect(hooks, batch, &protections);
-                return Err(HookError::MemoryProtect);
+                return Err(frozen.abort(HookError::MemoryProtect));
             }
             protections.push(old_protect);
         }
@@ -612,20 +767,28 @@ impl HookManager {
         }
 
         Self::reprotect(hooks, batch, &protections);
-        drop(frozen);
+        let thawed = frozen.thaw();
 
+        // Record what the image now holds before reporting any error.
         if end_disabled {
-            self.retain_buffers = true;
             for &(pos, _) in batch {
                 self.hooks.items[pos].is_enabled = false;
                 self.hooks.items[pos].queue_enable = false;
             }
+        } else if result.is_ok() {
+            for &(pos, enable) in batch {
+                self.hooks.items[pos].is_enabled = enable;
+                self.hooks.items[pos].queue_enable = enable;
+            }
+        }
+        if end_disabled || !thawed {
+            // A moved or still-suspended thread may resume inside a trampoline.
+            self.retain_buffers = true;
+        }
+        if !thawed {
+            return Err(HookError::ThreadResume);
         }
         result?;
-        for &(pos, enable) in batch {
-            self.hooks.items[pos].is_enabled = enable;
-            self.hooks.items[pos].queue_enable = enable;
-        }
         Ok(clear)
     }
 
@@ -1008,6 +1171,8 @@ mod tests {
         stop: Arc<AtomicBool>,
         count: Arc<AtomicU64>,
         threads: Vec<JoinHandle<()>>,
+        /// The spinners' thread ids, for [`fault::stick`].
+        spinners: Vec<u32>,
         _guard: MutexGuard<'static, ()>,
     }
 
@@ -1024,10 +1189,13 @@ mod tests {
             }
             let stop = Arc::new(AtomicBool::new(false));
             let count = Arc::new(AtomicU64::new(0));
+            let (ids, spinner_ids) = std::sync::mpsc::channel();
             let threads = (0..2)
                 .map(|_| {
-                    let (stop, count) = (stop.clone(), count.clone());
+                    let (stop, count, ids) = (stop.clone(), count.clone(), ids.clone());
                     std::thread::spawn(move || {
+                        // SAFETY: reads the calling thread's id.
+                        let _ = ids.send(unsafe { GetCurrentThreadId() });
                         while !stop.load(Ordering::Relaxed) {
                             count.fetch_add(1, Ordering::Relaxed);
                             std::hint::spin_loop();
@@ -1036,10 +1204,14 @@ mod tests {
                 })
                 .collect();
             // Make sure the spinners exist before the test freezes anything.
+            let spinners = (0..2)
+                .map(|_| spinner_ids.recv().expect("spinner id"))
+                .collect();
             let fixture = Self {
                 stop,
                 count,
                 threads,
+                spinners,
                 _guard: guard,
             };
             fixture.assert_threads_run();
@@ -1060,6 +1232,9 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fault::clear();
+            // A stranded spinner would hang the join below.
+            fault::release_stuck();
+            get_manager().lock().unwrap().retain_buffers = false;
             self.stop.store(true, Ordering::Relaxed);
             for thread in self.threads.drain(..) {
                 let _ = thread.join();
@@ -1248,5 +1423,61 @@ mod tests {
         assert!(hooked(mix_a));
         uninitialize().expect("uninitialize");
         assert!(!hooked(mix_a));
+    }
+
+    #[test]
+    fn transient_resume_failure_is_retried() {
+        let fixture = Fixture::new();
+        fault::stick(fixture.spinners[0], 1);
+        enable_hook(target(mix_a)).expect("a retried resume succeeds");
+        assert!(!thaw_failed());
+        fixture.assert_threads_run();
+        assert!(hooked(mix_a));
+    }
+
+    #[test]
+    fn stuck_thread_is_terminal_and_records_the_applied_change() {
+        let fixture = Fixture::new();
+        fault::stick(fixture.spinners[0], u32::MAX);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadResume));
+        assert!(thaw_failed());
+        // The jump was written, so the hook is recorded as enabled.
+        assert!(hooked(mix_a));
+        assert!(retain_buffers());
+        assert_eq!(enable_hook(target(mix_b)), Err(HookError::ThreadResume));
+        assert!(!hooked(mix_b));
+        assert_eq!(fault::release_stuck(), 1);
+        fixture.assert_threads_run();
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::Enabled));
+    }
+
+    #[test]
+    fn stuck_thread_on_an_early_abort_reports_the_resume_failure() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        fault::fail(Call::GetContext, 0b1);
+        fault::stick(fixture.spinners[0], u32::MAX);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadResume));
+        assert!(thaw_failed());
+        assert_eq!(bytes(mix_a), before);
+        assert_eq!(fault::release_stuck(), 1);
+        fault::clear();
+        fixture.assert_threads_run();
+        enable_hook(target(mix_a)).expect("nothing was applied");
+    }
+
+    #[test]
+    fn stuck_thread_after_a_rolled_back_change_reports_the_resume_failure() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        fault::set_force_moves(true);
+        fault::fail(Call::SetContext, 0b10);
+        fault::stick(fixture.spinners[0], u32::MAX);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadResume));
+        assert_eq!(bytes(mix_a), before);
+        assert_eq!(fault::release_stuck(), 1);
+        fault::clear();
+        fixture.assert_threads_run();
+        enable_hook(target(mix_a)).expect("the change was rolled back");
     }
 }

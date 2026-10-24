@@ -61,9 +61,9 @@ static PATCH_TRANSACTION: Mutex<()> = Mutex::new(());
 /// no further code write is attempted; the lifecycle treats this as terminal.
 static THAW_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// True once a freeze left a live thread suspended.
+/// True once a freeze, here or in the hooking library, left a live thread suspended.
 pub(crate) fn thaw_failed() -> bool {
-    THAW_FAILED.load(Ordering::Acquire)
+    THAW_FAILED.load(Ordering::Acquire) || min_hook_rs::thaw_failed()
 }
 
 /// One code patch and the bytes to write.

@@ -4,31 +4,52 @@
 //! The port keeps `MinHook`'s design: the HDE64 length decoder, trampolines
 //! allocated within 2 GB of the target, and thread suspension while patching.
 //! The vendored copy freezes fail closed and applies each change as one
-//! transaction: on any error no hook changes state.
+//! transaction: on any error except [`HookError::ThreadResume`] no hook changes state.
+//!
+//! Every wrapper holds [`crate::threads::lock_transaction`], so a hook change never
+//! runs alongside the crate's own code writes: two freezes at once could suspend each
+//! other. The lock order is the patch transaction, then the library's own lock. Once
+//! any freeze has left a thread suspended, every wrapper refuses.
 //! Its functions are safe to call in Rust's type system, but hooking arbitrary
 //! addresses is not, so the wrappers below keep `unsafe` contracts. They take
 //! addresses as `usize`, as the rest of the port does.
 
 use std::ffi::c_void;
 
+use std::sync::MutexGuard;
+
 use min_hook_rs::{ALL_HOOKS, HookError};
 
 /// Failure reported by the hooking library. Codes 1 to 12 match `MH_STATUS`.
-/// The vendored copy adds two, both reported with nothing changed:
+/// The vendored copy adds three:
 ///
 /// - [`HookError::ThreadSuspend`] (13): a thread could not be enumerated,
 ///   opened or suspended, so nothing was patched.
 /// - [`HookError::ThreadContext`] (14): a suspended thread's context could not
 ///   be read or written, and the change was rolled back.
+/// - [`HookError::ThreadResume`] (15): a frozen thread could not be resumed. The
+///   change may have applied. Terminal: every later call is refused with it.
 pub type MinHookError = HookError;
+
+/// Takes the patch transaction for one library call, or refuses once a freeze has
+/// left a thread suspended.
+fn transaction() -> Result<MutexGuard<'static, ()>, MinHookError> {
+    let guard = crate::threads::lock_transaction();
+    if crate::threads::thaw_failed() {
+        return Err(HookError::ThreadResume);
+    }
+    Ok(guard)
+}
 
 /// Initializes the hooking library. Call once before creating hooks.
 ///
 /// # Errors
 ///
 /// Returns the hooking library's error when it is already initialized or its internal
-/// lock is poisoned.
+/// lock is poisoned, and [`HookError::ThreadResume`] once a freeze has left a thread
+/// suspended.
 pub fn initialize() -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::initialize()
 }
 
@@ -40,6 +61,7 @@ pub fn initialize() -> Result<(), MinHookError> {
 ///
 /// Returns the hooking library's error when a hook cannot be disabled or threads cannot be frozen. The library then stays initialized.
 pub fn uninitialize() -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::uninitialize()
 }
 
@@ -55,6 +77,7 @@ pub fn uninitialize() -> Result<(), MinHookError> {
 ///
 /// Returns the hooking library's error when `target` is already hooked, is not executable, or its prologue cannot be relocated into a trampoline.
 pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHookError> {
+    let _transaction = transaction()?;
     let original = min_hook_rs::create_hook(target as *mut c_void, detour as *mut c_void)?;
     Ok(original as usize)
 }
@@ -69,6 +92,7 @@ pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHook
 ///
 /// Returns the hooking library's error when the hook does not exist or its jump cannot be written safely.
 pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::enable_hook(target as *mut c_void)
 }
 
@@ -82,6 +106,7 @@ pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
 ///
 /// Returns the hooking library's error when the hook does not exist or the original bytes cannot be written back safely.
 pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::disable_hook(target as *mut c_void)
 }
 
@@ -96,6 +121,7 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
 ///
 /// Returns the hooking library's error when the hook does not exist or cannot be disabled. The hook is then kept.
 pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::remove_hook(target as *mut c_void)
 }
 
@@ -105,6 +131,7 @@ pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
 ///
 /// Returns the hooking library's error when a jump cannot be written safely. Hooks enabled before the failure may stay enabled.
 pub fn enable_all_hooks() -> Result<(), MinHookError> {
+    let _transaction = transaction()?;
     min_hook_rs::enable_hook(ALL_HOOKS)
 }
 
@@ -160,6 +187,12 @@ mod tests {
         assert_eq!(MinHookError::ThreadContext as i32, 14);
         assert_eq!(MinHookError::from_code(13), MinHookError::ThreadSuspend);
         assert_eq!(MinHookError::from_code(14), MinHookError::ThreadContext);
+        assert_eq!(MinHookError::ThreadResume as i32, 15);
+        assert_eq!(MinHookError::from_code(15), MinHookError::ThreadResume);
+        assert_eq!(
+            MinHookError::ThreadResume.to_string(),
+            "Thread resume failed"
+        );
         assert_eq!(
             MinHookError::ThreadSuspend.to_string(),
             "Thread suspension failed"

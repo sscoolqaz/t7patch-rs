@@ -44,7 +44,7 @@ pub use error::{HookError, Result};
 pub use hook::{
     ALL_HOOKS, apply_queued, create_hook, create_hook_api, create_hook_api_ex, disable_hook,
     enable_hook, initialize, queue_disable_hook, queue_enable_hook, remove_hook, status_to_string,
-    uninitialize,
+    thaw_failed, uninitialize,
 };
 
 /// Library version

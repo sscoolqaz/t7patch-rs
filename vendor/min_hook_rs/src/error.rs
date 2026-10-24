@@ -55,6 +55,10 @@ pub enum HookError {
 
     /// A suspended thread's context could not be read or written; the change was rolled back
     ThreadContext = 14,
+
+    /// A frozen thread could not be resumed. Terminal: the change may have applied, and
+    /// every later hook change is refused
+    ThreadResume = 15,
 }
 
 impl HookError {
@@ -76,6 +80,7 @@ impl HookError {
             HookError::FunctionNotFound => "Function not found",
             HookError::ThreadSuspend => "Thread suspension failed",
             HookError::ThreadContext => "Thread context access failed",
+            HookError::ThreadResume => "Thread resume failed",
         }
     }
 
@@ -97,6 +102,7 @@ impl HookError {
             12 => HookError::FunctionNotFound,
             13 => HookError::ThreadSuspend,
             14 => HookError::ThreadContext,
+            15 => HookError::ThreadResume,
             _ => HookError::Unknown,
         }
     }

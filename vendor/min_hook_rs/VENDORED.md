@@ -19,9 +19,9 @@
 
 All behaviour patches are in `src/hook.rs` and `src/error.rs`.
 
-1. **Error codes.** `HookError::ThreadSuspend` (13) and `HookError::ThreadContext`
-   (14) are new, with `as_str` and `from_code` entries. Codes 1 to 12 still match
-   `MH_STATUS`.
+1. **Error codes.** `HookError::ThreadSuspend` (13), `HookError::ThreadContext`
+   (14) and `HookError::ThreadResume` (15) are new, with `as_str` and `from_code`
+   entries. Codes 1 to 12 still match `MH_STATUS`.
 2. **Fail-closed freeze.** `FrozenThreads::freeze` suspends every enumerated thread
    or none. If `OpenThread` or `SuspendThread` fails for a live thread of this
    process, the threads already suspended are resumed and `ThreadSuspend` is
@@ -34,10 +34,9 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    - `SuspendThread` fails and `GetExitCodeThread` reports the thread exited.
    `SuspendThread`'s failure value is compared as `u32::MAX`.
 3. **Handles stay open until resume.** `FrozenThreads` owns the handles of the
-   threads it suspended and resumes and closes them on drop, so every early return
-   resumes. Upstream closed each handle after suspending and reopened by id to
-   resume. This also fixes upstream `remove_hook`, which returned on a patch error
-   without resuming the frozen threads.
+   threads it suspended. Upstream closed each handle after suspending and reopened
+   by id to resume. This also fixes upstream `remove_hook`, which returned on a
+   patch error without resuming the frozen threads.
 4. **Context errors propagate.** `GetThreadContext` and `SetThreadContext` failures
    return `ThreadContext`. Upstream ignored both.
 5. **Aligned contexts.** Contexts live in `#[repr(C, align(16))] AlignedContext`.
@@ -69,11 +68,22 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    are kept, and `retain_buffers` stays set so later calls never free them either.
    On error, `remove_hook` keeps the hook and `uninitialize` stays initialized with
    its hooks intact.
-9. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
+9. **Resume failures are terminal.** `FrozenThreads::thaw` resumes each thread
+   once, retrying a failed `ResumeThread` up to three times; a thread that has
+   exited counts as resumed. Every error path thaws explicitly, and drop thaws as a
+   safety net, so nothing is resumed twice. A thread that stays suspended keeps its
+   handle open (its id cannot be reused) and sets a process-wide latch,
+   `thaw_failed()`. The call then returns `ThreadResume` in place of any other
+   result, after recording the hook state the image actually holds, and the
+   trampoline buffers are retained. Every later hook change is refused with
+   `ThreadResume`. Upstream ignored `ResumeThread` failures.
+10. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
    `fault` module. It can fail chosen calls to `OpenThread` (with a chosen last
-   error), `SuspendThread`, `Get/SetThreadContext` or `VirtualProtect`, and it can
-   force a no-op context write for every thread so the rollback path runs. Tests:
-   `hook::tests`.
+   error), `SuspendThread`, `Get/SetThreadContext` or `VirtualProtect`, fail the
+   resumes of one chosen thread, and force a no-op context write for every thread so
+   the rollback path runs. Plans for different calls combine. A test resumes a
+   thread the thaw left suspended itself (`fault::release_stuck`), which also clears
+   the latch; production code cannot clear it. Tests: `hook::tests`.
 
 ## Lint changes
 
@@ -88,8 +98,11 @@ removed. Neither changes behaviour.
 - `src/lib.rs` drops `#[rustfmt::skip]` on the `pub use hook::{...}` list, which
   rustfmt now formats.
 
-## Known limits (unchanged from upstream)
+## Known limits
 
-- Threads created after the Toolhelp snapshot are not frozen.
-- Only RIP is checked. A return address into a trampoline (from a relocated
+- Threads created after the Toolhelp snapshot are not frozen (unchanged from upstream).
+- A thread left suspended by a failed resume may hold the process heap lock. The
+  vectors dropped after the thaw, and the caller formatting the error, may then
+  deadlock. `src/threads.rs` in T7Patch-rs has the same exposure.
+- Only RIP is checked (unchanged from upstream). A return address into a trampoline (from a relocated
   `call` in the prologue) on some thread's stack is not detected.
