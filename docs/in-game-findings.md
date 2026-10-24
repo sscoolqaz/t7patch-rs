@@ -49,6 +49,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 12 | `9bf9835`, `detours,trace` | The log confirms `trace: true` and the trace hook was created. 40 s after load: the same PackageUInt fault, the fourth time. The trace hook on `LobbyMsg_HandleIM` logged **no** calls, although its body was on the crash stack. |
 | 13 | `8715fa0`, `detours,trace` | 32 s after load: the same fault, the fifth time. The 0x2000-byte stack dump shows `t7patch+C71B` above the zeroed buffer: the return point of `protection::check_pending_info_requests` in `hk_dw_instant_dispatch_message`. The live capture shows the trace hook's `jmp` in place at `HandleIM`'s entry. Root cause found (see "Root cause: PrepReadData pointed into HandleIM"). |
 | 14 | `7cc3f5a` (PrepReadData fix), `detours,trace` | Ran 93 s after load and shut down cleanly (modules unloaded, NvAPI session destroyed). Zero `c0000005`, no `crashes.log` entry, 659 Arxan int3 (the C++ run had 651). The trace hook logged two `HandleIM` calls from our IM detour (`t7patch+C7DF`) with a valid stack buffer and size `0x14`, from the same sender that used to crash. |
+| 15 | `cee873f` (verdict trace), `detours,trace` | The user could click into a lobby, but hosting failed. Our own client's info response was dropped: `info-check: xuid=<local-xuid> DROP reason=info-response-rejected detail=2`. Code 2 is a failure to read the `valid` bool of the first lobby element. The sender is the local player (P_USER_DATA). Exited after 80 s with zero `c0000005`. |
 
 ## Findings
 
@@ -251,6 +252,35 @@ enabled-detour runs crashed.
 The capture script now also saves the first 16 live bytes of every constant
 in `src/offsets.rs` (`offset_prologues.json`). Any other constant that points
 into a function body can be found the same way.
+
+### Hosting fails: our info-response parser rejects the game's own format (run 15)
+
+Upstream's `CheckPendingInfoRequests` never parses an info response, because of
+the garbage size (see above). Ours does, and drops the message when
+`msg_info_response_safe` fails. While hosting, the local client sends itself
+an info response, and run 15 dropped it with code 2 (`valid` unreadable).
+
+The game's own reader, `MSG_InfoResponse` (Feb `0x1ED5B40`, live
+`0x1ED5480`), disassembled live:
+
+```
+PackageUInt("nonce"); PackageInt("uiscreen"); PackageUChar("nattype")
+ArrayStart("lobbies")
+i = 0; more = PackageElement(lm, true)
+while more && i < 2:
+    if ok: ok = read_lobby(&info->lobby[i], lm)   // live 0x1ECE5B0
+    i += 1
+    more = PackageElement(lm, i < 2)
+return ok
+```
+
+So the array is flat, with zero, one or two elements and no second
+`ArrayStart`. Upstream's nested loop does not model it. Our `read_lobby_pair`
+differs as well: it requires exactly two elements, rejects a third, and
+passes `true` on the final `PackageElement` call where the game passes
+`false`. The per-lobby fields come from upstream, starting with a `valid`
+bool, and code 2 shows that they do not match the helper at live
+`0x1ECE5B0`. Its body is captured on the next run.
 
 ### The execute fault is not caused by our patching (run 10)
 
