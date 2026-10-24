@@ -83,6 +83,64 @@ struct SavedException {
     address: i64,
     context: CONTEXT,
     code: i32,
+    flags: u32,
+    /// How many `ExceptionInformation` words the record carried.
+    parameters: u32,
+    /// The first two `ExceptionInformation` words: for an access violation, the
+    /// access type (0 read, 1 write, 8 execute) and the inaccessible address.
+    info: [usize; 2],
+    /// Code bytes around RIP when the fault was taken; see [`read_code_window`].
+    code_window: CodeWindow,
+}
+
+/// Bytes read before RIP in a [`CodeWindow`].
+const CODE_WINDOW_BEFORE: usize = 0x10;
+/// Bytes in a full [`CodeWindow`].
+const CODE_WINDOW_LEN: usize = 0x30;
+
+/// Instruction bytes around a faulting RIP, starting at `start`. `len` is 0 when
+/// nothing there was readable.
+#[derive(Clone, Copy)]
+struct CodeWindow {
+    start: usize,
+    len: usize,
+    bytes: [u8; CODE_WINDOW_LEN],
+}
+
+/// Reads the code around `rip` without faulting: `CODE_WINDOW_BEFORE` bytes before
+/// it and the rest after, or only from `rip` when the bytes before are unreadable.
+/// Read at fault time because Arxan may re-encrypt the code afterwards.
+fn read_code_window(rip: usize) -> CodeWindow {
+    let mut window = CodeWindow {
+        start: rip,
+        len: 0,
+        bytes: [0; CODE_WINDOW_LEN],
+    };
+    let attempts = [
+        (rip.checked_sub(CODE_WINDOW_BEFORE), CODE_WINDOW_LEN),
+        (Some(rip), CODE_WINDOW_LEN - CODE_WINDOW_BEFORE),
+    ];
+    for (start, len) in attempts {
+        let Some(start) = start else { continue };
+        let mut copied = 0usize;
+        // SAFETY: `ReadProcessMemory` validates the source range and fails instead of
+        // faulting; the destination is the window's own buffer of at least `len` bytes.
+        let read = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                start as *const c_void,
+                window.bytes.as_mut_ptr().cast(),
+                len,
+                Some(&raw mut copied),
+            )
+        };
+        if read.is_ok() && copied == len {
+            window.start = start;
+            window.len = len;
+            break;
+        }
+    }
+    window
 }
 
 static SAVED_EXCEPTIONS: CrashQueue<SavedException, MAX_SAVED_EXCEPTIONS> = CrashQueue::new();
@@ -267,13 +325,16 @@ fn emergency_exception(address: i64, code: u32) {
 /// With `lookup_module` false the module lookup is skipped. `RtlPcToFileHeader`
 /// and `GetModuleFileNameA` take loader locks that a second faulting thread may
 /// hold, so they run only while this is the only fault in flight.
-fn dump_exception(
-    log: &mut std::fs::File,
-    address: i64,
-    context: &CONTEXT,
-    code: i32,
-    lookup_module: bool,
-) {
+fn dump_exception(log: &mut std::fs::File, saved: &SavedException, lookup_module: bool) {
+    let SavedException {
+        address,
+        ref context,
+        code,
+        flags,
+        parameters,
+        info: [access, target],
+        code_window,
+    } = *saved;
     let image_base = build::image_base() as u64;
 
     let mut module_base: *mut c_void = std::ptr::null_mut();
@@ -302,6 +363,26 @@ fn dump_exception(
         context.Rip,
         context.Rsp
     );
+    let _ = writeln!(
+        log,
+        "[{key:016x}]Code: ({:08x}) Flags: ({flags:x}) Parameters: ({parameters})",
+        code.cast_unsigned()
+    );
+    if code == EXCEPTION_ACCESS_VIOLATION && parameters >= 2 {
+        let _ = writeln!(
+            log,
+            "[{key:016x}]Access: ({access:x}) Target: ({target:016x})"
+        );
+    }
+    if code_window.len == 0 {
+        let _ = writeln!(log, "[{key:016x}]Code bytes: unreadable");
+    } else {
+        let _ = write!(log, "[{key:016x}]Code bytes at {:016x}:", code_window.start);
+        for byte in &code_window.bytes[..code_window.len] {
+            let _ = write!(log, " {byte:02x}");
+        }
+        let _ = writeln!(log);
+    }
     let _ = writeln!(
         log,
         "[{key:016x}]Rcx: ({:016x}) Rdx: ({:016x}) R8: ({:016x}) R9: ({:016x})",
@@ -381,7 +462,7 @@ fn write_crash_session(address: i64, code: u32) {
         while consumed < SAVED_EXCEPTIONS.count() {
             if let Some(saved) = wait_published(consumed) {
                 let alone = SAVED_EXCEPTIONS.count() == 1;
-                dump_exception(&mut log, saved.address, &saved.context, saved.code, alone);
+                dump_exception(&mut log, &saved, alone);
             } else {
                 let _ = writeln!(
                     log,
@@ -702,12 +783,28 @@ unsafe fn handle_general_exception(record: *mut EXCEPTION_RECORD, context: *mut 
     if let Some(reservation) = SAVED_EXCEPTIONS.reserve() {
         // SAFETY: `context` is valid for the current exception.
         let context_value = unsafe { *context };
+        // SAFETY: `record` is valid. The words past `NumberParameters` are kept but
+        // printed only for an access violation that carries both.
+        let (parameters, info) = unsafe {
+            (
+                (*record).NumberParameters,
+                [
+                    (*record).ExceptionInformation[0],
+                    (*record).ExceptionInformation[1],
+                ],
+            )
+        };
+        let rip = usize::try_from(context_value.Rip).unwrap_or(usize::MAX);
         SAVED_EXCEPTIONS.publish(
             reservation,
             SavedException {
                 address: at,
                 context: context_value,
                 code,
+                flags,
+                parameters,
+                info,
+                code_window: read_code_window(rip),
             },
         );
     } else {
@@ -1083,6 +1180,17 @@ mod tests {
         assert_eq!(read_stack_line(base, 0), Some(words));
         assert_eq!(read_stack_line(0, 0), None);
         assert_eq!(read_stack_line(usize::MAX - 8, 0), None);
+    }
+
+    #[test]
+    fn code_window_reads_around_rip_and_tolerates_bad_addresses() {
+        let code: [u8; 0x40] = std::array::from_fn(|index| u8::try_from(index).unwrap());
+        let rip = code.as_ptr() as usize + 0x10;
+        let window = read_code_window(rip);
+        assert_eq!(window.start, rip - CODE_WINDOW_BEFORE);
+        assert_eq!(&window.bytes[..window.len], &code[..CODE_WINDOW_LEN]);
+        assert_eq!(read_code_window(0).len, 0);
+        assert_eq!(read_code_window(8).len, 0);
     }
 
     #[test]

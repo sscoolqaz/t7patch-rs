@@ -43,6 +43,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | C++ | upstream `T7Patch-src` (MSVC, `t7patch.dll.bak`) | Reached a lobby; quit by the user after 64 s. Zero `c0000005`; 651 Arxan int3, which is normal. |
 | 7 | `6f44075`, `T7PATCH_ONLY=arxan,dispatcher,protection` (hooks off) | The log confirms `hooks: false`. Ran 148 s after load and was quit by the user. Zero `c0000005`, zero `c0000409`, 1576 Arxan int3. Nothing written to `crashes.log`. |
 | 8 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,create` | The log confirms `create_hooks: true, enable_hooks: false, vmt_hook: false`. Ran 211 s after load, then exited cleanly. Zero `c0000005`, zero `c0000409`, 1800 Arxan int3. Nothing written to `crashes.log`. |
+| 9 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,detours` | The log confirms `enable_hooks: true, vmt_hook: false`. 38 s after load our handler logged a fatal fault at live RVA `0x20FC9CF` and terminated the process. The registers and stack match run 2 exactly. Wine logged no `c0000005`, because the handler runs in the `Wow64PrepareForException` slot before Wine traces the exception. |
 
 ## Findings
 
@@ -158,10 +159,34 @@ fault. Building trampolines, allocating the hook buffer and running
 detours or the VMT hook. Enabling covers the vendored `transact`, its thread
 freeze and RIP moves, the prologue writes, and the hook bodies running.
 
+### Enabled detours fault through `LobbyMsgRW_PackageUInt` (runs 2 and 9)
+
+Runs 2 and 9 crashed at the same place, with identical registers (`Rcx=1`,
+`Rdx=0x16`, `Rax=0`) and stack. The fault is at live RVA `0x20FC9CF`, with
+the return address `game+0x1EEA9C5` at RSP. Deeper in the stack is
+`t7patch+0xBCE8` (`t7patch+0xC158` in run 2's build). That address is the
+return point after `call *ORIG_PACKAGE_UINT` in
+`hk_lobby_msg_rw_package_uint`. So the detour had called the trampoline, and
+the original `LobbyMsgRW_PackageUInt` was running when the fault happened.
+The game frames above the detour are `+0x1EE214B`, `+0x1EE9E45` and
+`+0x1EE9B1B`. The hook body matches upstream's `hkLobbyMsgRW_PackageUInt`,
+and upstream treats the same fault as fatal, so the C++ build never reaches
+this fault.
+
+This crash is deterministic. The execute fault at base + `0x428xxxxx` is
+intermittent, and it did not occur in run 9. Whether the two share a cause is
+open.
+
+The on-disk exe is encrypted at all these addresses. The crash log now also
+records the exception code and, for an access violation, the access type and
+target address.
+
 ## Next step
 
-- Run `detours` (no VMT) and `vmt` (no detours) to find which part triggers
-  the crash.
-- If `detours` crashes, compare the live hooked prologues and relay jumps
-  with a C++ run through `/proc/<pid>/mem`, and check whether the enable
-  path's freeze or RIP moves disturb Arxan threads that are mid-handler.
+- Repeat the `detours` run while
+  `t7patch-debug/scripts/capture_hooks.py` reads, from `/proc/<pid>/mem`, the
+  live code at the fault site and its callers, the hooked `PackageUInt`
+  prologue and its trampoline.
+- Compare that trampoline with the one C MinHook builds for the same function
+  in a C++ run.
+- The `vmt` run is still to do.
