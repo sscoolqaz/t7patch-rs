@@ -54,31 +54,44 @@ static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 /// enables every hook that was created.
 /// Proton passes launch-option variables through to the game, so a component
 /// can be switched off without a rebuild.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "one independent on/off switch per patch component"
-)]
-struct Components {
-    arxan: bool,
-    dispatcher: bool,
-    create_hooks: bool,
-    enable_hooks: bool,
-    vmt_hook: bool,
-    protection: bool,
-    trace: bool,
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Components(u8);
 
 impl Components {
-    const ALL: Self = Self {
-        arxan: true,
-        dispatcher: true,
-        create_hooks: true,
-        enable_hooks: true,
-        vmt_hook: true,
-        protection: true,
-        trace: false,
-    };
+    const NONE: Self = Self(0);
+    const ARXAN: Self = Self(1 << 0);
+    const DISPATCHER: Self = Self(1 << 1);
+    const CREATE_HOOKS: Self = Self(1 << 2);
+    const ENABLE_HOOKS: Self = Self(1 << 3);
+    const VMT_HOOK: Self = Self(1 << 4);
+    const PROTECTION: Self = Self(1 << 5);
+    const TRACE: Self = Self(1 << 6);
+    /// Everything upstream installs. `TRACE` is diagnostic and never part of it.
+    const ALL: Self = Self::ARXAN
+        .with(Self::DISPATCHER)
+        .with(Self::CREATE_HOOKS)
+        .with(Self::ENABLE_HOOKS)
+        .with(Self::VMT_HOOK)
+        .with(Self::PROTECTION);
+
+    /// The named components, in the order the diagnostic line prints them.
+    const NAMES: [(&'static str, Self); 7] = [
+        ("arxan", Self::ARXAN),
+        ("dispatcher", Self::DISPATCHER),
+        ("create_hooks", Self::CREATE_HOOKS),
+        ("enable_hooks", Self::ENABLE_HOOKS),
+        ("vmt_hook", Self::VMT_HOOK),
+        ("protection", Self::PROTECTION),
+        ("trace", Self::TRACE),
+    ];
+
+    const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 
     /// Parses a `T7PATCH_ONLY` value. Unknown names are ignored. Enabled detours imply
     /// created ones.
@@ -88,17 +101,22 @@ impl Components {
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case(name))
         };
+        let mut components = Self::NONE;
+        let mut add = |present: bool, component: Self| {
+            if present {
+                components = components.with(component);
+            }
+        };
         let all_hooks = has("hooks");
         let enable_hooks = all_hooks || has("detours");
-        Self {
-            arxan: has("arxan"),
-            dispatcher: has("dispatcher"),
-            create_hooks: enable_hooks || has("create"),
-            enable_hooks,
-            vmt_hook: all_hooks || has("vmt"),
-            protection: has("protection"),
-            trace: has("trace"),
-        }
+        add(has("arxan"), Self::ARXAN);
+        add(has("dispatcher"), Self::DISPATCHER);
+        add(enable_hooks || has("create"), Self::CREATE_HOOKS);
+        add(enable_hooks, Self::ENABLE_HOOKS);
+        add(all_hooks || has("vmt"), Self::VMT_HOOK);
+        add(has("protection"), Self::PROTECTION);
+        add(has("trace"), Self::TRACE);
+        components
     }
 
     fn current() -> Self {
@@ -114,6 +132,18 @@ impl Components {
     }
 }
 
+/// Prints the same `Components { arxan: true, ... }` form as the earlier struct, so the
+/// diagnostic line in the Proton log keeps its format.
+impl std::fmt::Debug for Components {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("Components");
+        for (name, component) in Self::NAMES {
+            out.field(name, &self.contains(component));
+        }
+        out.finish()
+    }
+}
+
 /// Port of the fork's `PatchOperations`. Its state lives in the statics above, so every
 /// transition sees what earlier ones did.
 struct PatchOps;
@@ -125,7 +155,7 @@ impl Operations for PatchOps {
 
     fn prepare(&mut self) -> Result<(), String> {
         let components = Components::current();
-        if components.arxan {
+        if components.contains(Components::ARXAN) {
             arxan::install()?;
         }
         // SAFETY: runs inside the game process once its executable is mapped.
@@ -136,17 +166,18 @@ impl Operations for PatchOps {
         }
         protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
 
-        if (components.create_hooks || components.trace) && !HOOKS_PREPARED.load(Ordering::Acquire)
+        if (components.contains(Components::CREATE_HOOKS) || components.contains(Components::TRACE))
+            && !HOOKS_PREPARED.load(Ordering::Acquire)
         {
             if !HOOK_LIB_INITIALIZED.load(Ordering::Acquire) {
                 ffi::initialize()
                     .map_err(|error| format!("T7 Patch: MinHook initialize failed: {error}"))?;
                 HOOK_LIB_INITIALIZED.store(true, Ordering::Release);
             }
-            if components.create_hooks {
+            if components.contains(Components::CREATE_HOOKS) {
                 hooks::create_all()?;
             }
-            if components.trace {
+            if components.contains(Components::TRACE) {
                 diag::create_trace_hook()?;
             }
             HOOKS_PREPARED.store(true, Ordering::Release);
@@ -155,7 +186,7 @@ impl Operations for PatchOps {
     }
 
     fn install_dispatcher(&mut self) -> Result<(), String> {
-        if !Components::current().dispatcher {
+        if !Components::current().contains(Components::DISPATCHER) {
             return Ok(());
         }
         // SAFETY: runs inside the game process, after ntdll is loaded.
@@ -163,7 +194,7 @@ impl Operations for PatchOps {
     }
 
     fn install_protection(&mut self) -> Result<(), String> {
-        if !Components::current().protection {
+        if !Components::current().contains(Components::PROTECTION) {
             return Ok(());
         }
         // SAFETY: `prepare` ran `protection::initialize` in this process.
@@ -183,10 +214,11 @@ impl Operations for PatchOps {
             .map_err(|_| "T7 Patch: cannot set process priority".to_owned())?;
 
         let components = Components::current();
-        if components.vmt_hook {
+        if components.contains(Components::VMT_HOOK) {
             hooks::apply_vmt()?;
         }
-        if !components.enable_hooks && !components.trace {
+        if !components.contains(Components::ENABLE_HOOKS) && !components.contains(Components::TRACE)
+        {
             return Ok(());
         }
         // Enabling can fail after a subset of hooks is live, so mark them first.
@@ -195,7 +227,7 @@ impl Operations for PatchOps {
     }
 
     fn start_worker(&mut self) -> Result<(), String> {
-        if !Components::current().protection {
+        if !Components::current().contains(Components::PROTECTION) {
             return Ok(());
         }
         protection::start_worker()
@@ -386,55 +418,30 @@ mod tests {
 
     #[test]
     fn diagnostic_components_parse_a_subset() {
-        const NONE: Components = Components {
-            arxan: false,
-            dispatcher: false,
-            create_hooks: false,
-            enable_hooks: false,
-            vmt_hook: false,
-            protection: false,
-            trace: false,
-        };
-        assert_eq!(
-            Components::parse("dispatcher"),
-            Components {
-                dispatcher: true,
-                ..NONE
-            }
-        );
-        assert!(Components::parse(" Arxan , DISPATCHER,bogus").arxan);
+        assert_eq!(Components::parse("dispatcher"), Components::DISPATCHER);
+        assert!(Components::parse(" Arxan , DISPATCHER,bogus").contains(Components::ARXAN));
         assert_eq!(
             Components::parse("arxan,dispatcher,hooks,protection"),
             Components::ALL
         );
-        assert_eq!(Components::parse(""), NONE);
+        assert_eq!(Components::parse(""), Components::NONE);
     }
 
     #[test]
     fn diagnostic_components_split_the_hook_stage() {
         let base = Components::parse("arxan,dispatcher,protection");
-        let create = Components::parse("arxan,dispatcher,protection,create");
         assert_eq!(
-            create,
-            Components {
-                create_hooks: true,
-                ..base
-            }
+            Components::parse("arxan,dispatcher,protection,create"),
+            base.with(Components::CREATE_HOOKS)
         );
         assert_eq!(
             Components::parse("arxan,dispatcher,protection,detours"),
-            Components {
-                create_hooks: true,
-                enable_hooks: true,
-                ..base
-            }
+            base.with(Components::CREATE_HOOKS)
+                .with(Components::ENABLE_HOOKS)
         );
         assert_eq!(
             Components::parse("arxan,dispatcher,protection,vmt"),
-            Components {
-                vmt_hook: true,
-                ..base
-            }
+            base.with(Components::VMT_HOOK)
         );
         assert_eq!(
             Components::parse("arxan,dispatcher,protection,detours,vmt"),
@@ -442,12 +449,21 @@ mod tests {
         );
         assert_eq!(
             Components::parse("arxan,dispatcher,protection,detours,trace"),
-            Components {
-                create_hooks: true,
-                enable_hooks: true,
-                trace: true,
-                ..base
-            }
+            base.with(Components::CREATE_HOOKS)
+                .with(Components::ENABLE_HOOKS)
+                .with(Components::TRACE)
+        );
+        // `trace` alone stays independent of the hook stages.
+        assert_eq!(Components::parse("trace"), Components::TRACE);
+        assert!(!Components::ALL.contains(Components::TRACE));
+    }
+
+    #[test]
+    fn diagnostic_components_keep_the_logged_format() {
+        assert_eq!(
+            format!("{:?}", Components::parse("arxan,detours,trace")),
+            "Components { arxan: true, dispatcher: false, create_hooks: true, \
+             enable_hooks: true, vmt_hook: false, protection: false, trace: true }"
         );
     }
 }
