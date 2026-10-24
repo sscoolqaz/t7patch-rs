@@ -2461,7 +2461,7 @@ pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyM
 
         rw::array_start(g, lobby_msg, c"lobbies");
         let mut lobbies = LiveLobbies { g, lobby_msg, info };
-        if let Err(code) = read_lobby_pair(&mut lobbies) {
+        if let Err(code) = read_info_lobbies(&mut lobbies) {
             return code;
         }
         if (*lm).msg.overflowed {
@@ -2475,23 +2475,44 @@ pub unsafe fn msg_info_response_safe(info: *mut MsgInfoResponse, lm: *mut LobbyM
 trait LobbyPairReader {
     /// Advances to the next array element; `false` when there is none.
     fn next_element(&mut self) -> bool;
-    /// Parses one lobby into output slot `index`, or returns the error code.
+    /// Starts a nested `lobbies` array.
+    fn array_start(&mut self);
+    /// Parses one inner element into output slot `index`, or returns the error code.
     fn lobby(&mut self, index: usize) -> Result<(), i32>;
 }
 
-/// The `lobbies` array holds exactly two elements, one per output slot. A slot
-/// counts only once its element parsed. Fewer than two elements (6) or more
-/// than two (5) rejects the response. This replaces upstream's nested loop,
-/// which re-read the array header for each response and could fill a slot twice.
-fn read_lobby_pair(reader: &mut impl LobbyPairReader) -> Result<(), i32> {
-    for index in 0..2 {
-        if !reader.next_element() {
-            return Err(6);
+/// Port of upstream's nested `lobbies` loop, which matches the game's own reader.
+/// `MSG_InfoResponse` (Feb `0x1ED5B40`) reads up to two outer elements after the
+/// outer `ArrayStart`. Each outer element is read by a helper (live `0x1ECE5B0`)
+/// that starts a nested `lobbies` array and reads up to two inner elements into
+/// the same output slot (`valid`, then the lobby fields when it is set). Both
+/// were checked in a live September dump. The game stops after two elements of
+/// either kind; like upstream, a third inner element (5) or a third outer
+/// element (4) rejects the response instead. Fewer elements are accepted, as
+/// the game accepts them. In read mode `PackageElement` ignores its flag, so it
+/// is always passed as `true`.
+fn read_info_lobbies(reader: &mut impl LobbyPairReader) -> Result<(), i32> {
+    let mut more = reader.next_element();
+    for response in 0..2 {
+        if !more {
+            break;
         }
-        reader.lobby(index)?;
+        reader.array_start();
+        let mut inner = reader.next_element();
+        for _ in 0..2 {
+            if !inner {
+                break;
+            }
+            reader.lobby(response)?;
+            inner = reader.next_element();
+        }
+        if inner {
+            return Err(5);
+        }
+        more = reader.next_element();
     }
-    if reader.next_element() {
-        return Err(5);
+    if more {
+        return Err(4);
     }
     Ok(())
 }
@@ -2506,6 +2527,11 @@ impl LobbyPairReader for LiveLobbies<'_> {
     fn next_element(&mut self) -> bool {
         // SAFETY: `lobby_msg` is the live message `msg_info_response_safe` was given.
         unsafe { rw::element(self.g, self.lobby_msg, true) }
+    }
+
+    fn array_start(&mut self) {
+        // SAFETY: as above.
+        unsafe { rw::array_start(self.g, self.lobby_msg, c"lobbies") };
     }
 
     fn lobby(&mut self, index: usize) -> Result<(), i32> {
@@ -3440,19 +3466,25 @@ mod tests {
         assert_eq!(state, [5, 9, 200]);
     }
 
-    /// A fake `lobbies` array of `elements` entries; `bad` fails that lobby's parse.
+    /// A fake `lobbies` array: `markers` are the successive `PackageElement`
+    /// results (past the end, `false`); `bad` fails slot `index` with a code.
     struct FakeLobbies {
-        elements: usize,
+        markers: Vec<bool>,
         cursor: usize,
+        arrays: usize,
         bad: Option<(usize, i32)>,
         parsed: Vec<usize>,
     }
 
     impl LobbyPairReader for FakeLobbies {
         fn next_element(&mut self) -> bool {
-            let present = self.cursor < self.elements;
+            let present = self.markers.get(self.cursor).copied().unwrap_or(false);
             self.cursor += 1;
             present
+        }
+
+        fn array_start(&mut self) {
+            self.arrays += 1;
         }
 
         fn lobby(&mut self, index: usize) -> Result<(), i32> {
@@ -3465,25 +3497,46 @@ mod tests {
         }
     }
 
-    fn lobbies(elements: usize, bad: Option<(usize, i32)>) -> (Result<(), i32>, Vec<usize>) {
+    fn lobbies(
+        markers: &[bool],
+        bad: Option<(usize, i32)>,
+    ) -> (Result<(), i32>, Vec<usize>, usize) {
         let mut fake = FakeLobbies {
-            elements,
+            markers: markers.to_vec(),
             cursor: 0,
+            arrays: 0,
             bad,
             parsed: Vec::new(),
         };
-        (read_lobby_pair(&mut fake), fake.parsed)
+        (read_info_lobbies(&mut fake), fake.parsed, fake.arrays)
     }
 
+    /// What the game's own writer emits: two outer elements, each a nested array
+    /// of two inner elements, each array closed by a `false` marker.
+    const GAME_WRITER: [bool; 9] = [true, true, true, false, true, true, true, false, false];
+
     #[test]
-    fn info_response_needs_exactly_two_lobbies() {
-        assert_eq!(lobbies(0, None), (Err(6), vec![]));
-        assert_eq!(lobbies(1, None), (Err(6), vec![0]));
-        assert_eq!(lobbies(2, None), (Ok(()), vec![0, 1]));
-        assert_eq!(lobbies(3, None), (Err(5), vec![0, 1]));
-        // A truncated field in either lobby rejects the response at once.
-        assert_eq!(lobbies(2, Some((0, 3))), (Err(3), vec![]));
-        assert_eq!(lobbies(2, Some((1, 2))), (Err(2), vec![0]));
+    fn info_response_reads_the_games_nested_layout() {
+        assert_eq!(lobbies(&GAME_WRITER, None), (Ok(()), vec![0, 0, 1, 1], 2));
+        // Fewer elements are accepted, as the game accepts them.
+        assert_eq!(lobbies(&[false], None), (Ok(()), vec![], 0));
+        assert_eq!(
+            lobbies(&[true, true, false, false], None),
+            (Ok(()), vec![0], 1)
+        );
+        // An outer element whose nested array is empty.
+        assert_eq!(lobbies(&[true, false, false], None), (Ok(()), vec![], 1));
+        // A third inner element, or a third outer one, rejects the response.
+        assert_eq!(
+            lobbies(&[true, true, true, true], None),
+            (Err(5), vec![0, 0], 1)
+        );
+        let mut extra_outer = GAME_WRITER;
+        extra_outer[8] = true;
+        assert_eq!(lobbies(&extra_outer, None), (Err(4), vec![0, 0, 1, 1], 2));
+        // A field error in either response rejects it at once.
+        assert_eq!(lobbies(&GAME_WRITER, Some((0, 3))), (Err(3), vec![], 1));
+        assert_eq!(lobbies(&GAME_WRITER, Some((1, 2))), (Err(2), vec![0, 0], 2));
     }
 
     #[test]

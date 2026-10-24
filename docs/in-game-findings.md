@@ -282,6 +282,20 @@ passes `true` on the final `PackageElement` call where the game passes
 bool, and code 2 shows that they do not match the helper at live
 `0x1ECE5B0`. Its body is captured on the next run.
 
+The capture (run 16, hooks off) showed the helper at live `0x1ECE5B0`. It calls
+`ArrayStart("lobbies")` again and reads up to two inner elements into the
+**same** output slot: `valid`, then, when that is set, `hostxuid`,
+`hostname`(0x20), `networkmode`, `mainmode`, `secid`(8), `seckey`(0x10),
+`addrbuff`(0x25), `ugcName`(0x20) and `ugcVersion`. So upstream's nested loop,
+including writing `lobby[cResponse]` twice, is a faithful decompile, and our
+flat rewrite was wrong. The flat reader read the inner element marker as
+`valid`, which gave code 2. In read mode (`[lm+0x40] == 2`) `PackageElement`
+ignores its flag, so upstream's always-`true` flags are harmless. Read-mode
+`ArrayStart` does consume input. The parser is now `read_info_lobbies`, a
+port of upstream's loop with its error codes (5 for an extra inner element,
+4 for an extra outer element or overflow). A Codex review found it
+equivalent to upstream.
+
 ### The execute fault is not caused by our patching (run 10)
 
 In run 10 the loader thread mapped `t7patch.dll` at 83191.746, then made no
@@ -299,6 +313,7 @@ loaded the same DLL without faulting.
 
 ## Next step
 
+- Verify hosting with the nested parser (`detours,trace`, or the full patch).
 - Run 14 confirmed the fix: the same sender's messages now reach
   `HandleIM` through its entry, and the game survived past the old crash
   window. The prologue audit of all 92 constants in `src/offsets.rs` found
