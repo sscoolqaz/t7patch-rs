@@ -29,9 +29,9 @@ use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, ReadProcessMemory,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread, OpenThread,
-    ResumeThread, Sleep, SuspendThread, THREAD_ACCESS_RIGHTS, THREAD_GET_CONTEXT,
-    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread,
+    GetProcessIdOfThread, OpenThread, ResumeThread, Sleep, SuspendThread, THREAD_ACCESS_RIGHTS,
+    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::arxan::WriteReport;
@@ -86,7 +86,7 @@ pub(crate) enum CodeWriteError {
     /// written; it is empty when the freeze failed before any write.
     Thaw {
         reports: Vec<WriteReport>,
-        message: String,
+        message: &'static str,
     },
 }
 
@@ -94,7 +94,8 @@ impl fmt::Display for CodeWriteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => formatter.write_str("a game thread is executing the patch site"),
-            Self::Freeze(message) | Self::Thaw { message, .. } => formatter.write_str(message),
+            Self::Freeze(message) => formatter.write_str(message),
+            Self::Thaw { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -236,41 +237,43 @@ impl<O: ThreadOps> Freeze<O> {
         if let Err(error) = freeze.suspend_rounds(&mut seen, &mut fresh) {
             return Err(freeze.abort(error));
         }
-        for index in 0..freeze.threads.len() {
-            let handle = freeze.threads[index].handle;
-            match freeze.ops.registers(handle) {
-                Some((rip, rsp)) => {
-                    freeze.threads[index].rip = rip;
-                    freeze.threads[index].rsp = rsp;
-                }
-                None => return Err(freeze.abort(FreezeError::Context)),
-            }
-        }
         Ok(freeze)
     }
 
     // An enumeration is a snapshot, not a creation barrier. Suspend any thread
     // that appeared after the first one, within a bounded number of rounds.
-    // Thread ids are assumed not to be reused during the freeze: an opened
-    // thread keeps its handle (and so its id) alive, and a thread that exited
-    // before `OpenThread` cannot execute. A kill-and-reuse inside the short
-    // freeze window is accepted as a residual risk rather than guessed around.
+    //
+    // `SuspendThread` is asynchronous: a thread told to suspend may still run,
+    // and create a thread, until it is synchronized. Each round therefore reads
+    // the context of every thread it suspended (which waits for the suspension
+    // to take effect) before enumerating again, so the final "nothing new"
+    // enumeration happens with every known thread really stopped.
+    //
+    // An id enters `seen` only once its thread is held open and suspended. An
+    // opened thread keeps its id alive, so it cannot be reused under us. An id
+    // that was gone or exited is looked at again if it reappears, in case a new
+    // thread was given the recycled id.
     fn suspend_rounds(&mut self, seen: &mut IdSet, fresh: &mut IdSet) -> Result<(), FreezeError> {
         for _pass in 0..=ENUMERATION_ROUNDS {
             fresh.clear();
             self.ops.enumerate(fresh)?;
-            let mut added = false;
+            let first_new = self.threads.len();
             for &id in fresh.as_slice() {
                 if seen.contains(id) {
                     continue;
                 }
-                seen.insert(id)?;
                 if self.open_suspend(id)? {
-                    added = true;
+                    seen.insert(id)?;
                 }
             }
-            if !added {
+            if self.threads.len() == first_new {
                 return Ok(());
+            }
+            for index in first_new..self.threads.len() {
+                let handle = self.threads[index].handle;
+                let (rip, rsp) = self.ops.registers(handle).ok_or(FreezeError::Context)?;
+                self.threads[index].rip = rip;
+                self.threads[index].rsp = rsp;
             }
         }
         Err(FreezeError::KeptAppearing)
@@ -497,7 +500,16 @@ impl ThreadOps for LiveOps {
                 id,
             )
         } {
-            Ok(handle) => Ok(handle),
+            Ok(handle) => {
+                // SAFETY: `handle` was opened with THREAD_QUERY_INFORMATION.
+                if unsafe { GetProcessIdOfThread(handle) } == self.process_id {
+                    Ok(handle)
+                } else {
+                    // The id was reused by another process's thread: ours is gone.
+                    self.close(handle);
+                    Err(OpenError::Gone)
+                }
+            }
             Err(_error) => {
                 // SAFETY: reads this thread's last-error value.
                 let last = unsafe { GetLastError() };
@@ -680,9 +692,12 @@ fn freeze_live() -> Result<Freeze<LiveOps>, CodeWriteError> {
         Err(AcquireError::Aborted(error)) => Err(CodeWriteError::Freeze(error.as_str().to_owned())),
         Err(AcquireError::Terminal(error)) => {
             THAW_FAILED.store(true, Ordering::Release);
+            // A thread stays suspended and may hold the heap lock, so nothing
+            // here allocates: `Vec::new` does not, and the message is static.
+            let _ = error;
             Err(CodeWriteError::Thaw {
                 reports: Vec::new(),
-                message: format!("{}; {}", error.as_str(), FreezeError::Resume.as_str()),
+                message: FreezeError::Resume.as_str(),
             })
         }
     }
@@ -770,7 +785,7 @@ unsafe fn write_code_batch_guarded(
                     THAW_FAILED.store(true, Ordering::Release);
                     Err(CodeWriteError::Thaw {
                         reports: Vec::new(),
-                        message: thaw.as_str().to_owned(),
+                        message: thaw.as_str(),
                     })
                 }
             };
@@ -780,7 +795,7 @@ unsafe fn write_code_batch_guarded(
                 THAW_FAILED.store(true, Ordering::Release);
                 return Err(CodeWriteError::Thaw {
                     reports: Vec::new(),
-                    message: error.as_str().to_owned(),
+                    message: error.as_str(),
                 });
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -804,7 +819,7 @@ unsafe fn write_code_batch_guarded(
                 THAW_FAILED.store(true, Ordering::Release);
                 return Err(CodeWriteError::Thaw {
                     reports,
-                    message: error.as_str().to_owned(),
+                    message: error.as_str(),
                 });
             }
         }
@@ -853,6 +868,9 @@ mod tests {
         alive: bool,
         suspend_count: u32,
         open: bool,
+        /// Its context was read since it was last suspended, so the suspension
+        /// has taken effect.
+        synced: bool,
     }
 
     /// A fake process. `fail` fails the `nth` call (0-based) of `op`, or every
@@ -881,6 +899,7 @@ mod tests {
                         alive: true,
                         suspend_count: 0,
                         open: false,
+                        synced: false,
                     })
                     .collect(),
                 spawn_after: Vec::new(),
@@ -916,6 +935,14 @@ mod tests {
 
         fn enumerate(&mut self, ids: &mut IdSet) -> Result<(), FreezeError> {
             let call = self.calls[Op::Enumerate as usize];
+            // SuspendThread is asynchronous: a later enumeration is only meaningful
+            // once every suspended thread has really stopped.
+            assert!(
+                self.threads
+                    .iter()
+                    .all(|thread| thread.suspend_count == 0 || thread.synced),
+                "enumerated again before every suspend was synchronized"
+            );
             if self.should_fail(Op::Enumerate) {
                 return Err(self.enumerate_error);
             }
@@ -932,6 +959,7 @@ mod tests {
                         alive: true,
                         suspend_count: 0,
                         open: false,
+                        synced: false,
                     });
                 }
             }
@@ -961,7 +989,9 @@ mod tests {
             if self.should_fail(Op::Suspend) {
                 return false;
             }
-            self.thread(handle).suspend_count += 1;
+            let thread = self.thread(handle);
+            thread.suspend_count += 1;
+            thread.synced = false;
             true
         }
 
@@ -987,6 +1017,7 @@ mod tests {
             if self.should_fail(Op::Rip) {
                 return None;
             }
+            self.thread(handle).synced = true;
             Some((0x1000 + handle, 0x10000 * (handle + 1)))
         }
 

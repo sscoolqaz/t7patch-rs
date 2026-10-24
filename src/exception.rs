@@ -435,9 +435,10 @@ unsafe extern "system" fn exception_hook(record: *mut EXCEPTION_RECORD, context:
     if unsafe { protection::repair_induced_exception(record, context) } {
         return;
     }
-    if !HANDLER_ACTIVE.load(Ordering::Acquire)
-        && ORIGINAL_DISPATCH_CALLBACK.load(Ordering::Acquire) != 0
-    {
+    if !HANDLER_ACTIVE.load(Ordering::Acquire) {
+        // Deactivated, or not yet active. On native x64 the slot is
+        // `Wow64PrepareForException`, which is null, so there is usually nothing to
+        // forward to. Returning lets the dispatcher continue normal SEH dispatch.
         // SAFETY: `record` and `context` are valid for the duration of the call.
         unsafe { forward_to_original(record, context) };
         return;
@@ -579,9 +580,11 @@ fn read_game_string(address: usize, out: &mut [u8]) -> Option<usize> {
     Some(out.len())
 }
 
-/// The VM a `SCRVM_Error` call names, if it is inside the VM tables.
+/// The VM a `SCRVM_Error` call names, if it is inside the VM tables. The index
+/// is a 32-bit `scriptInstance_t` argument, so only ECX is defined; the upper
+/// half of RCX is ignored, as upstream's `(BYTE)Rcx` ignores it.
 fn script_vm_index(rcx: u64) -> Option<usize> {
-    usize::try_from(rcx)
+    usize::try_from(rcx & 0xFFFF_FFFF)
         .ok()
         .filter(|&index| index < MAX_SCRIPT_VMS)
 }
@@ -764,15 +767,20 @@ unsafe fn install_pointer_hook(dispatcher: usize, handler: usize) -> Result<(), 
     let Some(slot) = rip_relative_target(dispatcher + 8, displacement) else {
         return Err("T7 Patch: exception dispatcher slot is out of range".to_owned());
     };
-    FN_PTR_HOOK.store(slot, Ordering::Release);
     // SAFETY: `slot` is the 8-byte callback pointer the dispatcher loads RIP-relatively.
     let original = unsafe { (slot as *const usize).read_unaligned() };
+    // Published before the swap: once the slot holds the handler it may forward.
     ORIGINAL_DISPATCH_CALLBACK.store(original, Ordering::Release);
-    DISPATCHER_INSTALLED.store(true, Ordering::Release);
 
     // SAFETY: the slot is an 8-byte pointer inside ntdll's data; nothing is written if it
-    // cannot be made writable.
-    if !unsafe { crate::arxan::swap_usize(slot, original, handler) }.complete() {
+    // cannot be made writable or no longer holds `original`.
+    let write = unsafe { crate::arxan::swap_usize(slot, original, handler) };
+    if write.written {
+        // Only a slot that now holds the handler needs restoring.
+        FN_PTR_HOOK.store(slot, Ordering::Release);
+        DISPATCHER_INSTALLED.store(true, Ordering::Release);
+    }
+    if !write.complete() {
         return Err("T7 Patch: cannot write the exception dispatcher slot".to_owned());
     }
     Ok(())
@@ -993,7 +1001,7 @@ pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
             let handler = exception_hook as *const () as usize;
             // SAFETY: `slot` is the pointer slot written by `install_pointer_hook`, and
             // `original` is the value it held before. Only our own handler is replaced.
-            if !unsafe { crate::arxan::swap_usize(slot, handler, original) }.complete() {
+            if !unsafe { crate::arxan::restore_usize(slot, handler, original) } {
                 return Err("T7 Patch: cannot restore the exception dispatcher slot".to_owned());
             }
         }
@@ -1085,6 +1093,8 @@ mod tests {
         // The old low-byte truncation would have mapped these to 0 and 1.
         assert_eq!(script_vm_index(0x100), None);
         assert_eq!(script_vm_index(0xFFFF_FFFF_FFFF_FF01), None);
+        // Garbage in the undefined upper half of RCX does not hide a valid ECX.
+        assert_eq!(script_vm_index(0xDEAD_BEEF_0000_0001), Some(1));
     }
 
     #[test]

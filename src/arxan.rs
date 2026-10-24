@@ -406,6 +406,29 @@ pub(crate) unsafe fn swap_usize(slot: usize, expected: usize, new: usize) -> Poi
     result
 }
 
+/// Puts `original` back in `slot` if the slot still holds `ours`. Returns `true`
+/// when the slot is restored or is no longer ours. A slot that someone else has
+/// rewritten since, or that is no longer mapped, is left alone. Returns `false`
+/// only when the slot still holds `ours` and could not be written.
+///
+/// # Safety
+///
+/// As for [`swap_usize`].
+pub(crate) unsafe fn restore_usize(slot: usize, ours: usize, original: usize) -> bool {
+    // SAFETY: forwarded from the caller.
+    let write = unsafe { swap_usize(slot, ours, original) };
+    if write.written {
+        return write.protection_restored;
+    }
+    if write.observed != ours {
+        crate::dllmain::debug_print(
+            "T7 Patch: a pointer slot changed since install; left as is.\n",
+        );
+        return true;
+    }
+    false
+}
+
 /// Finds all occurrences of `pattern` in the executable sections of the image.
 ///
 /// # Safety

@@ -1790,7 +1790,7 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
     }
     if current[0] == ours {
         // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
-        if !unsafe { arxan::swap_usize(slot, ours, original) }.complete() {
+        if !unsafe { arxan::restore_usize(slot, ours, original) } {
             return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
         }
     }

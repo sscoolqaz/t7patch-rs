@@ -3088,17 +3088,18 @@ pub unsafe fn install() -> Result<(), String> {
     let preload = address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN);
     // SAFETY: the update-preload pointer is a game global.
     ORIGINAL_PRELOAD.store(unsafe { read_usize(preload) }, Ordering::Release);
-    PRELOAD_INSTALLED.store(true, Ordering::Release);
     // SAFETY: as above; nothing is written if it cannot be made writable.
-    if !unsafe {
+    let write = unsafe {
         crate::arxan::swap_usize(
             preload,
             ORIGINAL_PRELOAD.load(Ordering::Acquire),
             cl_switch_state_idle_update as *const () as usize,
         )
+    };
+    if write.written {
+        PRELOAD_INSTALLED.store(true, Ordering::Release);
     }
-    .complete()
-    {
+    if !write.complete() {
         return Err("T7 Patch: cannot write the update-preload pointer".to_owned());
     }
 
@@ -3170,18 +3171,10 @@ pub unsafe fn uninstall() -> Result<(), String> {
 
     let swapped: Vec<SwappedSlot> = lock(&STEAM_SWAPPED).clone();
     for record in swapped {
-        // SAFETY: `swap_usize` checks that the slot is still mapped, and writes only
-        // while it holds our replacement.
-        let write =
-            unsafe { crate::arxan::swap_usize(record.slot, record.replacement, record.original) };
-        if write.complete() || (!write.written && write.observed != record.replacement) {
-            if !write.written {
-                // The interface was replaced or rewritten since install: the slot
-                // is not ours any more, so it is left alone.
-                crate::dllmain::debug_print(
-                    "T7 Patch: a Steam vtable slot changed since install; left as is.\n",
-                );
-            }
+        // SAFETY: `restore_usize` checks that the slot is still mapped, and writes only
+        // while it holds our replacement. A replaced interface is left alone.
+        if unsafe { crate::arxan::restore_usize(record.slot, record.replacement, record.original) }
+        {
             lock(&STEAM_SWAPPED).retain(|kept| *kept != record);
         } else {
             failures.push("Steam vtable slot");
@@ -3192,14 +3185,12 @@ pub unsafe fn uninstall() -> Result<(), String> {
         let old = OLD_LOBBYMSG_PRINTS.load(Ordering::Acquire);
         // SAFETY: the print global is the game variable `install` wrote.
         if unsafe {
-            crate::arxan::swap_usize(
+            crate::arxan::restore_usize(
                 address(offsets::PTR_LOBBYMSGPRINTS),
                 word(LOBBY_MSG_MARKER),
                 word(old.cast_unsigned()),
             )
-        }
-        .complete()
-        {
+        } {
             LOBBY_MARKER_INSTALLED.store(false, Ordering::Release);
         } else {
             failures.push("lobby-message marker");
@@ -3210,14 +3201,12 @@ pub unsafe fn uninstall() -> Result<(), String> {
         let original = ORIGINAL_PRELOAD.load(Ordering::Acquire);
         // SAFETY: the update-preload pointer is the game global `install` wrote.
         if unsafe {
-            crate::arxan::swap_usize(
+            crate::arxan::restore_usize(
                 address(offsets::PTR_UPDATE_PRELOAD_IDLE_FN),
                 cl_switch_state_idle_update as *const () as usize,
                 original,
             )
-        }
-        .complete()
-        {
+        } {
             PRELOAD_INSTALLED.store(false, Ordering::Release);
         } else {
             failures.push("update-preload pointer");
@@ -3229,15 +3218,12 @@ pub unsafe fn uninstall() -> Result<(), String> {
         // SAFETY: the main module's import table was read by `install`.
         let restored = unsafe { iat_hook::find(c"IsProcessorFeaturePresent", 0) }.is_some_and(
             // SAFETY: `slot` is the IAT entry `install` replaced, and `original` its old value.
-            |slot| {
-                unsafe {
-                    crate::arxan::swap_usize(
-                        slot as usize,
-                        is_processor_feature_present as *const () as usize,
-                        original,
-                    )
-                }
-                .complete()
+            |slot| unsafe {
+                crate::arxan::restore_usize(
+                    slot as usize,
+                    is_processor_feature_present as *const () as usize,
+                    original,
+                )
             },
         );
         if restored {
