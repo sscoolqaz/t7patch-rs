@@ -194,6 +194,10 @@ pub fn trace(args: std::fmt::Arguments<'_>) {
 }
 
 /// Creates the trace hook. It is enabled with the other hooks.
+///
+/// # Errors
+///
+/// Returns an error when the hooking library cannot create the trace hook.
 pub fn create_trace_hook() -> Result<(), String> {
     // SAFETY: the thunk preserves the traced function's arguments and stack and
     // jumps to the trampoline stored below before the hook can be enabled.

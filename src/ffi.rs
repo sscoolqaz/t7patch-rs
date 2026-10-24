@@ -23,6 +23,10 @@ use min_hook_rs::{ALL_HOOKS, HookError};
 pub type MinHookError = HookError;
 
 /// Initializes the hooking library. Call once before creating hooks.
+///
+/// # Errors
+///
+/// Returns the hooking library's error, for example when it is already initialized or its memory cannot be allocated.
 pub fn initialize() -> Result<(), MinHookError> {
     min_hook_rs::initialize()
 }
@@ -30,6 +34,10 @@ pub fn initialize() -> Result<(), MinHookError> {
 /// Tears the hooking library down, disabling and removing every hook it created.
 /// The trampolines are freed only if no thread was found inside one; otherwise
 /// they are kept for the process lifetime. On error the library stays initialized.
+///
+/// # Errors
+///
+/// Returns the hooking library's error when a hook cannot be disabled or threads cannot be frozen. The library then stays initialized.
 pub fn uninitialize() -> Result<(), MinHookError> {
     min_hook_rs::uninitialize()
 }
@@ -41,6 +49,10 @@ pub fn uninitialize() -> Result<(), MinHookError> {
 ///
 /// `target` must be the entry point of a function whose signature matches
 /// `detour`. `detour` must stay valid for the lifetime of the hook.
+///
+/// # Errors
+///
+/// Returns the hooking library's error when `target` is already hooked, is not executable, or its prologue cannot be relocated into a trampoline.
 pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHookError> {
     let original = min_hook_rs::create_hook(target as *mut c_void, detour as *mut c_void)?;
     Ok(original as usize)
@@ -51,6 +63,10 @@ pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHook
 /// # Safety
 ///
 /// `target` must be the address passed to [`create_hook`].
+///
+/// # Errors
+///
+/// Returns the hooking library's error when the hook does not exist or its jump cannot be written safely.
 pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
     min_hook_rs::enable_hook(target as *mut c_void)
 }
@@ -60,6 +76,10 @@ pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
 /// # Safety
 ///
 /// `target` must be 0 or the address passed to [`create_hook`].
+///
+/// # Errors
+///
+/// Returns the hooking library's error when the hook does not exist or the original bytes cannot be written back safely.
 pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
     min_hook_rs::disable_hook(target as *mut c_void)
 }
@@ -70,11 +90,19 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
 /// # Safety
 ///
 /// `target` must be the address passed to [`create_hook`].
+///
+/// # Errors
+///
+/// Returns the hooking library's error when the hook does not exist or cannot be disabled. The hook is then kept.
 pub unsafe fn remove_hook(target: usize) -> Result<(), MinHookError> {
     min_hook_rs::remove_hook(target as *mut c_void)
 }
 
 /// Enables every hook created so far.
+///
+/// # Errors
+///
+/// Returns the hooking library's error when a jump cannot be written safely. Hooks enabled before the failure may stay enabled.
 pub fn enable_all_hooks() -> Result<(), MinHookError> {
     min_hook_rs::enable_hook(ALL_HOOKS)
 }

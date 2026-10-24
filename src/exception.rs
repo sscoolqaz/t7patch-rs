@@ -1006,6 +1006,10 @@ fn dispatcher_layout() -> Result<(usize, i32), String> {
 /// # Safety
 ///
 /// Must run inside the game process, after ntdll is loaded.
+///
+/// # Errors
+///
+/// Returns an error for an unknown `KiUserExceptionDispatcher` layout, or when the handler slot or stub cannot be written.
 pub unsafe fn install() -> Result<(), String> {
     if DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         // A retained dispatcher is reused; its saved original callback must not be
@@ -1049,6 +1053,10 @@ pub(crate) fn note_exception_producer() {
 /// # Safety
 ///
 /// Must run inside the game process.
+///
+/// # Errors
+///
+/// Returns an error when the original callback or Wine stub cannot be restored. The hook then stays installed.
 pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
     if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         return Ok(());

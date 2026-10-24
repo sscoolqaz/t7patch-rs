@@ -36,12 +36,41 @@ impl State {
 
 /// The install stages, in the order [`Lifecycle::install`] runs them, and the rollback.
 pub trait Operations {
+    /// Applies the Arxan bypass, resolves the game and creates the hooks, which stay disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the game or the hooking library could not be prepared.
     fn prepare(&mut self) -> Result<(), String>;
+    /// Installs the exception dispatcher hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the dispatcher could not be installed.
     fn install_dispatcher(&mut self) -> Result<(), String>;
+    /// Installs the protection writes and memory patches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason a write failed; earlier writes stay recorded for [`Operations::rollback`].
     fn install_protection(&mut self) -> Result<(), String>;
+    /// Raises the process priority, applies the VMT hook and enables the detours.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason enabling failed; hooks enabled before the failure may stay live until [`Operations::rollback`].
     fn activate(&mut self) -> Result<(), String>;
+    /// Starts the background settings worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the worker could not be started.
     fn start_worker(&mut self) -> Result<(), String>;
     /// Undoes whatever the stages applied. Must be safe after a failure at any stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns every restoration that failed. The state those failures leave behind is retained, and further lifecycle transitions are refused.
     fn rollback(&mut self) -> Result<(), String>;
     /// Reports the error that aborted an install.
     fn report_failure(&mut self, message: &str);

@@ -1145,6 +1145,10 @@ unsafe extern "system" fn lua_state_manager_error_hook(error: *const c_char, lua
 ///
 /// Port of `lua_symbols::InstallHooks`. As in the C++ source, the hooks are
 /// created but not enabled here. As in the fork, a failed create is an error.
+///
+/// # Errors
+///
+/// Returns an error when either hook cannot be created.
 pub fn install_hooks() -> Result<(), String> {
     // SAFETY: the target is the HksiLuaGetInfo entry point of the running build. The
     // detour has the same signature.

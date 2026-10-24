@@ -237,6 +237,10 @@ unsafe extern "system" fn scr_gsc_obj_link_hook(instance: i32, script_object: *m
 }
 
 /// Creates the `Scr_GscObjLink` detour. Hooks are enabled later with the rest.
+///
+/// # Errors
+///
+/// Returns the hooking library's error when the `Scr_GscObjLink` detour cannot be created.
 pub fn install_hooks() -> Result<(), MinHookError> {
     let target = offsets::address(SCR_GSC_OBJ_LINK_RVA);
     // SAFETY: the RVA is `Scr_GscObjLink`, whose signature matches `scr_gsc_obj_link_hook`.

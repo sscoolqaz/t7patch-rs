@@ -5,7 +5,7 @@
 //! `isModLoadedAddrs` list is credited in the C++ source to Scropts-QOL.
 //!
 //! Each detour that calls the original does so through the `MinHook` trampoline
-//! stored in an [`Original`] slot, as the C++ does through its globals. Game
+//! stored in an `Original` slot, as the C++ does through its globals. Game
 //! functions the C++ calls without a hook are resolved directly with
 //! [`offsets::function`].
 //!
@@ -1732,8 +1732,12 @@ static LOBBY_VTABLE_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// The vtable pointer the slot held before the VMT hook, or 0.
 static ORIGINAL_LOBBY_VTABLE: AtomicUsize = AtomicUsize::new(0);
 
-/// Port of `hooks::ApplyVMTHooks`. Copies the lobby object's vtable into [`LOBBY_VTABLE`],
-/// points slot 24 at [`global_instant_message`], and swaps the object onto the copy.
+/// Port of `hooks::ApplyVMTHooks`. Copies the lobby object's vtable into `LOBBY_VTABLE`,
+/// points slot 24 at `global_instant_message`, and swaps the object onto the copy.
+///
+/// # Errors
+///
+/// Returns an error when the lobby object or its vtable is not initialized or unreadable, or when the vtable pointer cannot be swapped.
 pub fn apply_vmt_hooks() -> Result<(), String> {
     // SAFETY: `DW_LOBBY` is the game's global lobby pointer, readable once the game runs.
     let lobby = unsafe { read_game::<usize>(offsets::address(offsets::DW_LOBBY)) };
@@ -1776,6 +1780,10 @@ pub fn apply_vmt_hooks() -> Result<(), String> {
 }
 
 /// Port of `hooks::RestoreVMTHooks`. Points the lobby object back at its original vtable.
+///
+/// # Errors
+///
+/// Returns an error when the lobby object's vtable slot cannot be read or written back. The ownership records are kept, so a later attempt can retry.
 pub fn restore_vmt_hooks() -> Result<(), String> {
     let slot = LOBBY_VTABLE_SLOT.load(Ordering::Acquire);
     let original = ORIGINAL_LOBBY_VTABLE.load(Ordering::Acquire);
@@ -1882,6 +1890,10 @@ fn pop_unjournaled_patch(address: usize, original: &[u8]) {
 
 /// Port of `hooks::ApplyMemoryPatches`. Applies the SL, movsx, process-priority and
 /// tokenizer byte patches to the game image, saving each original first.
+///
+/// # Errors
+///
+/// Returns an error when a patch site cannot be written. Patches applied before it stay applied and saved, for [`restore_memory_patches`] to undo.
 pub fn apply_memory_patches() -> Result<(), String> {
     // SL fix: nop out the calls to com_error.
     patch(offsets::address(0x1964766), &[0x90; 5])?;
@@ -1907,6 +1919,10 @@ pub fn apply_memory_patches() -> Result<(), String> {
 
 /// Port of `hooks::RestoreMemoryPatches`. Restores every saved patch in reverse order,
 /// trying all of them. The saved list is cleared only when every restore succeeds.
+///
+/// # Errors
+///
+/// Returns an error when any saved patch cannot be written back. The saved list is then kept for a retry.
 pub fn restore_memory_patches() -> Result<(), String> {
     let saved = MEMORY_PATCHES
         .lock()
@@ -1958,6 +1974,10 @@ fn hook<F: Copy>(rva: usize, detour: F, slot: Option<&Original<F>>) -> Result<()
 /// Port of `hooks::ApplyHooks`. Creates the campaign and Lua hooks, then every `MinHook`
 /// hook in the C++ order. Nothing is enabled here: the lifecycle enables every hook at once
 /// after the protection module is installed.
+///
+/// # Errors
+///
+/// Returns an error naming the first hook that cannot be created. Hooks created before it stay created and disabled.
 #[allow(clippy::too_many_lines)]
 pub fn create_hooks() -> Result<(), String> {
     // The campaign and Lua hooks are created by their own modules, as in the C++.
@@ -2169,6 +2189,10 @@ pub fn create_hooks() -> Result<(), String> {
 
 /// Port of `hooks::DestroyHooks`. Disables every hook. The hooks are not removed, so a
 /// callback still running through a trampoline stays valid.
+///
+/// # Errors
+///
+/// Returns an error when the hooking library cannot disable the hooks.
 pub fn destroy_hooks() -> Result<(), String> {
     // SAFETY: a null target is MinHook's `MH_ALL_HOOKS`, which disables every hook.
     unsafe { ffi::disable_hook(0) }

@@ -704,6 +704,10 @@ pub fn partial() -> bool {
 /// Installs the bypass, or detects one that another module already installed.
 ///
 /// Returns a status message on success. On failure, returns the reason.
+///
+/// # Errors
+///
+/// Returns the reason when the executable is not a supported build or a checksum patch cannot be written. A failed install leaves the bypass partially applied for the caller's rollback to undo.
 pub fn install() -> Result<String, String> {
     let mut state = lock_state();
     if ACTIVE.load(Ordering::Acquire) {
@@ -859,6 +863,10 @@ pub enum Removal {
 /// hook and code patch that the bypass hides is gone. With `dependents_live`
 /// set the bypass is kept, because the integrity checks would trip over the
 /// patches still in the image.
+///
+/// # Errors
+///
+/// Returns an error when a saved checksum site cannot be restored. The remaining sites are still attempted, and the bypass then counts as incompletely restored.
 pub fn uninstall(dependents_live: bool) -> Result<Removal, String> {
     let mut state = lock_state();
     if !ACTIVE.load(Ordering::Acquire) {

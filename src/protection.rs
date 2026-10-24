@@ -1016,6 +1016,10 @@ pub mod iat_hook {
 ///
 /// `library` must be the address of a loaded Steam interface global and `index`
 /// a valid slot of its vtable. `replacement` must match that slot's signature.
+///
+/// # Errors
+///
+/// Returns an error when the Steam originals were not prepared, the interface's vtable is unreadable, or the slot cannot be written.
 pub unsafe fn swap_steam_api_pointer(
     library: usize,
     index: usize,
@@ -1934,6 +1938,10 @@ static CONFIG_WORKER: Mutex<ManagedWorker> = Mutex::new(ManagedWorker::new());
 
 /// Port of `Protection::start_worker`. Starts the settings watcher on the injectorless path,
 /// unless it is already running.
+///
+/// # Errors
+///
+/// Returns an error when the settings watcher thread cannot be started.
 pub fn start_worker() -> Result<(), String> {
     let mut worker = lock(&CONFIG_WORKER);
     if IS_INJECTORLESS_INSTALL.load(Ordering::Relaxed) && !worker.running() {
@@ -1945,6 +1953,10 @@ pub fn start_worker() -> Result<(), String> {
 }
 
 /// Port of `Protection::stop_worker`. Stops and joins the settings watcher if it runs.
+///
+/// # Errors
+///
+/// Returns an error when the settings watcher cannot be stopped and joined. It may then still use patch state.
 pub fn stop_worker() -> Result<(), String> {
     lock(&CONFIG_WORKER).stop()
 }
@@ -2066,7 +2078,7 @@ mod rw {
 ///
 /// # Safety
 ///
-/// `this` must address a [`REQUEST_OUT_LEN`]-byte scratch buffer and
+/// `this` must address a `REQUEST_OUT_LEN`-byte scratch buffer and
 /// `lobby_msg` a live copy of the lobby message.
 pub unsafe fn msg_join_party_package_inspect(this: *mut u8, lobby_msg: *mut c_void) -> i32 {
     let Some(g) = game() else {
@@ -3063,6 +3075,10 @@ static DVAR_SETTINGS_APPLIED: AtomicBool = AtomicBool::new(false);
 /// # Safety
 ///
 /// Must run inside the game process after the executable is mapped and Steam is loaded.
+///
+/// # Errors
+///
+/// Returns an error when a game function or Steam interface cannot be resolved, or a Steam vtable slot cannot be read.
 pub unsafe fn initialize() -> Result<(), String> {
     if INITIALIZED.load(Ordering::Acquire) {
         return Ok(());
@@ -3097,6 +3113,10 @@ pub unsafe fn initialize() -> Result<(), String> {
 ///
 /// Must run inside the game process after [`initialize`], before any lobby message is
 /// dispatched.
+///
+/// # Errors
+///
+/// Returns an error when a game entry or Steam slot cannot be written. Writes made before it stay recorded, for [`uninstall`] to undo.
 pub unsafe fn install() -> Result<(), String> {
     // SAFETY: the game is running, so its name buffers are mapped.
     unsafe { copy_name_into_game() };
@@ -3223,6 +3243,10 @@ pub(crate) fn exception_producers_remaining() -> bool {
 /// # Safety
 ///
 /// Must run inside the game process while the game is still running.
+///
+/// # Errors
+///
+/// Returns an error listing every entry that could not be restored. Those entries stay recorded.
 pub unsafe fn uninstall() -> Result<(), String> {
     let mut failures: Vec<&str> = Vec::new();
 
