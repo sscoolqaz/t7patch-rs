@@ -314,7 +314,18 @@ loaded the same DLL without faulting.
 
 ## Next step
 
-- Verify hosting with the nested parser (`detours,trace`, or the full patch).
+- Run 17: the info response now parses, but hosting still failed. On
+  success we passed the **raw payload** to `dwInstantHandleLobbyMessage`. Its
+  live body (Feb `0x143A7A0`) treats the third argument as a `msg_t`: it copies
+  `cursize - readcount` bytes (at most 0x800) with `MSG_ReadData`, then,
+  unless the message overflowed, calls `LobbyMsg_HandleIM(controller, sender,
+  buf, size)`. With the raw payload it read a garbage size. It now gets our
+  local `msg`, positioned after the IM header, which is the same work as the
+  normal path. Upstream passes the raw pointer too, but never reaches that
+  line. Verify hosting again.
+- Open (also upstream): the normal path calls `LobbyMsg_HandleIM` without
+  checking `msg.overflowed` after `MSG_ReadData`. The game's own handler
+  skips dispatch on overflow.
 - Run 14 confirmed the fix: the same sender's messages now reach
   `HandleIM` through its entry, and the game survived past the old crash
   window. The prologue audit of all 92 constants in `src/offsets.rs` found

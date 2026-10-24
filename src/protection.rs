@@ -255,7 +255,11 @@ pub type PackageFloatFn = unsafe extern "system" fn(*mut c_void, *const c_char, 
 pub type PackageCharFn = unsafe extern "system" fn(*mut c_void, *const c_char, *mut c_char) -> bool;
 
 pub type ProbeLobbyInfoFn = unsafe extern "system" fn(i32, i32, i64) -> i32;
-pub type DwInstantHandleLobbyMessageFn = unsafe extern "system" fn(i64, i32, *mut c_char) -> i32;
+/// `dwInstantHandleLobbyMessage(sender, controller, msg)`. The third argument is a
+/// `msg_t` positioned after the IM header: the function (Feb `0x143A7A0`, read
+/// live) copies `cursize - readcount` bytes (at most 0x800) out of it with
+/// `MSG_ReadData` and, unless it overflowed, calls `LobbyMsg_HandleIM`.
+pub type DwInstantHandleLobbyMessageFn = unsafe extern "system" fn(i64, i32, *mut Msg) -> i32;
 pub type DwInstantSendMessageFn =
     unsafe extern "system" fn(i32, *mut i64, u32, i8, *const c_char, u32) -> i32;
 pub type NetOutOfBandPrintFn = unsafe extern "system" fn(i32, NetAdr, *const c_char) -> i32;
@@ -2609,12 +2613,14 @@ impl LobbyPairReader for LiveLobbies<'_> {
 ///
 /// # Safety
 ///
-/// `msg` must be a live `msg_t` owned by the caller, read from `payload`. `payload` is the
-/// raw message the game dispatched, forwarded unchanged to `dwInstantHandleLobbyMessage`
-/// exactly as the C++ does (`(char*)_msg`, which there is the raw payload pointer).
-pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mut c_char) -> bool {
+/// `msg` must be a live `msg_t` owned by the caller, positioned after the IM header. It is
+/// inspected through a copy; a valid info response is then handed to
+/// `dwInstantHandleLobbyMessage`, which reads the rest of `msg` itself. Upstream passes
+/// the raw payload pointer there, which only works by not being reached (see
+/// `docs/in-game-findings.md`).
+pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg) -> bool {
     // SAFETY: forwarded unchanged from the caller's contract.
-    let (drop, reason, detail) = unsafe { pending_info_decision(xuid, msg, payload) };
+    let (drop, reason, detail) = unsafe { pending_info_decision(xuid, msg) };
     crate::diag::trace(format_args!(
         "T7 Patch trace info-check: xuid={xuid:x} {} reason={reason} detail={detail}\n",
         if drop { "DROP" } else { "keep" },
@@ -2628,11 +2634,7 @@ pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mu
 /// # Safety
 ///
 /// As for [`check_pending_info_requests`].
-unsafe fn pending_info_decision(
-    xuid: i64,
-    msg: *mut Msg,
-    payload: *mut c_char,
-) -> (bool, &'static str, i64) {
+unsafe fn pending_info_decision(xuid: i64, msg: *mut Msg) -> (bool, &'static str, i64) {
     // SAFETY: `msg` is a live message, copied as the original does.
     let mut copy = unsafe { *msg };
     let size = copy.cursize.wrapping_sub(copy.readcount);
@@ -2667,9 +2669,9 @@ unsafe fn pending_info_decision(
         if result != 0 {
             return (true, "info-response-rejected", i64::from(result));
         }
-        // SAFETY: the handler gets the game's own payload pointer, as in the C++; only the
-        // inspection above reads through the local `msg`.
-        unsafe { (g.dw_instant_handle_lobby_message)(xuid, 0, payload) };
+        // SAFETY: `msg` is the caller's live message, still positioned after the header,
+        // because the inspection above read only `copy`.
+        unsafe { (g.dw_instant_handle_lobby_message)(xuid, 0, msg) };
         return (true, "info-response-handled", 0);
     }
 

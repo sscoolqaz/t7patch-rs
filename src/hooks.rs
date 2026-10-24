@@ -1399,13 +1399,10 @@ unsafe extern "system" fn hk_dw_instant_dispatch_message(
         }
     }
 
-    // SAFETY: `msg` is the local message over the payload, and the callee reads a copy of
-    // it; `message` is forwarded to the game's handler unchanged, as in the C++.
+    // SAFETY: `msg` is the local message over the payload, positioned after the header.
     if is_valid
         && packet_type == PACKET_TYPE_INFO_REQUEST_PENDING
-        && unsafe {
-            protection::check_pending_info_requests(sender_xuid, &raw mut msg, message.cast_mut())
-        }
+        && unsafe { protection::check_pending_info_requests(sender_xuid, &raw mut msg) }
     {
         return 0;
     }
