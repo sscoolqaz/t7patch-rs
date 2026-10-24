@@ -42,7 +42,6 @@ const CRASH_LOG_NAME: &str = "crashes.log";
 const CRASH_LOG_NAME_C: &CStr = c"crashes.log";
 const LOG_FAILED_EXIT_CODE: i32 = -444;
 
-const STATUS_ILLEGAL_INSTRUCTION: i32 = 0xC000_001D_u32.cast_signed();
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC000_0005_u32.cast_signed();
 const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 
@@ -411,11 +410,10 @@ fn dump_exception(log: &mut std::fs::File, saved: &SavedException, lookup_module
     // Preserve the exception and registers even if reading the stack fails.
     let _ = log.flush();
 
-    let span = if code == STATUS_ILLEGAL_INSTRUCTION {
-        0x1200
-    } else {
-        0x400
-    };
+    // Upstream dumps 0x1200 bytes for an illegal instruction and 0x400 otherwise.
+    // The in-game PackageUInt fault needs the frames above a 2048-byte stack
+    // buffer, so every fault dumps 0x2000 (docs/in-game-findings.md).
+    let span = 0x2000;
     let rsp = usize::try_from(context.Rsp).unwrap_or(usize::MAX);
     for offset in (0..span).step_by(0x10) {
         let Some([first_word, second_word]) = read_stack_line(rsp, offset) else {

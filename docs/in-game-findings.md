@@ -46,6 +46,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 9 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,detours` | The log confirms `enable_hooks: true, vmt_hook: false`. 38 s after load our handler logged a fatal fault at live RVA `0x20FC9CF` and terminated the process. The registers and stack match run 2 exactly. Wine logged no `c0000005`, because the handler runs in the `Wow64PrepareForException` slot before Wine traces the exception. |
 | 10 | `d2ac9e4`, `detours` | Died about 1.5 s after `prepare` began. The execute AV at `0x70002250BDD0` (base + `0x4281BDD0`) came 0.28 s after `t7patch.dll` was mapped and 1.7 s **before** `prepare` ran. See "The execute fault is not caused by our patching". |
 | 11 | `d2ac9e4`, `detours` | 54 s after load: the same fault as runs 2 and 9, with identical registers. The new log fields show a read AV at address 0. Live hook bytes were captured about 25 s in. |
+| 12 | `9bf9835`, `detours,trace` | The log confirms `trace: true` and the trace hook was created. 40 s after load: the same PackageUInt fault, the fourth time. The trace hook on `LobbyMsg_HandleIM` logged **no** calls, although its body was on the crash stack. |
 
 ## Findings
 
@@ -205,8 +206,19 @@ So `F` was handed a NULL buffer with a size of 22 bytes, and the original
 reader faults on it whether or not it is hooked. Our detour only passes the
 message through. `F`'s caller is not visible: past `F`'s frame the stack holds
 encoded values (Arxan call obfuscation), not return addresses. Every string `F`
-uses is encrypted on disk. Still open: why only enabled-detour runs hand `F` a
-NULL buffer. Candidates are a Rust detour on an outer path passing a wrong
+uses is encrypted on disk. `F` is `LobbyMsg_HandleIM` (`offsets.h`: `OFFSET(0x1EEA130)`), with the
+signature `(targetController, senderXuid, buff, len)`. Our
+`hk_dw_instant_dispatch_message` calls it, as upstream does, with a zeroed
+2048-byte stack buffer, so that call cannot pass NULL. The sender XUID in
+`F`'s frame is a real Steam ID (`0x<local-xuid>`). Everything above `F`'s
+frame, as far as the 0x400-byte dump reaches, is zeros: a large zeroed local
+buffer like that detour's. In run 12 the trace hook on `F`'s entry recorded
+no call at all, so the crashing call did not pass through `F`'s entry
+`jmp`. Either the entry bytes were no longer patched, or execution entered
+`F` past its entry. The crash log now dumps 0x2000 bytes of stack (upstream
+dumps 0x400) to reach the frames above that buffer. The capture script also
+reads `F`'s live entry bytes. Still open: why only enabled-detour runs hand
+`F` a NULL buffer. Candidates are a Rust detour on an outer path passing a wrong
 argument or return value, or the C++ run never having reached the same event.
 
 ### The execute fault is not caused by our patching (run 10)
