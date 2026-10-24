@@ -47,6 +47,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 10 | `d2ac9e4`, `detours` | Died about 1.5 s after `prepare` began. The execute AV at `0x70002250BDD0` (base + `0x4281BDD0`) came 0.28 s after `t7patch.dll` was mapped and 1.7 s **before** `prepare` ran. See "The execute fault is not caused by our patching". |
 | 11 | `d2ac9e4`, `detours` | 54 s after load: the same fault as runs 2 and 9, with identical registers. The new log fields show a read AV at address 0. Live hook bytes were captured about 25 s in. |
 | 12 | `9bf9835`, `detours,trace` | The log confirms `trace: true` and the trace hook was created. 40 s after load: the same PackageUInt fault, the fourth time. The trace hook on `LobbyMsg_HandleIM` logged **no** calls, although its body was on the crash stack. |
+| 13 | `8715fa0`, `detours,trace` | 32 s after load: the same fault, the fifth time. The 0x2000-byte stack dump shows `t7patch+C71B` above the zeroed buffer: the return point of `protection::check_pending_info_requests` in `hk_dw_instant_dispatch_message`. The live capture shows the trace hook's `jmp` in place at `HandleIM`'s entry. Root cause found (see "Root cause: PrepReadData pointed into HandleIM"). |
 
 ## Findings
 
@@ -221,6 +222,35 @@ reads `F`'s live entry bytes. Still open: why only enabled-detour runs hand
 `F` a NULL buffer. Candidates are a Rust detour on an outer path passing a wrong
 argument or return value, or the C++ run never having reached the same event.
 
+### Root cause: PrepReadData pointed into HandleIM (fixed)
+
+`PTR_LOBBY_MSG_RW_PREP_READ_DATA` was `0x1EEA150`, copied from upstream
+(`offsets.h`: `REBASE(0x1EEA150)`). That address is not a function. It is the
+`call LobbyMsgRW_PrepReadData` instruction 0x20 bytes into
+`LobbyMsg_HandleIM` (`0x1EEA130`; live `0x1EE9A70` + 0x20 = `0x1EE9A90`).
+`check_pending_info_requests` called it for packet type `0x68`. The `call`
+ran the real PrepReadData with our arguments, then the rest of `HandleIM`
+ran on our stack frame. It took our `[rsp+0x30]` as its LobbyMsg (NULL
+data) and `[rsp+0x68]` as message type 0, then called PackageUInt, which
+faulted. That explains the invisible caller, the garbage return slot, and
+why the trace hook on `HandleIM`'s entry never fired.
+
+The real function is at live `0x1EE9E30`, which is Feb `0x1EEA4F0`. It calls
+`MSG_Init` (live `0x20FC4C0`, which is Feb `0x20FCB80` = `PTR_MSG_INIT`),
+stores the size at `msg+0x1c`, and tail-jumps to `LobbyMsgRW_PrepReadMsg`
+(live `0x1EEB210`, which is Feb `0x1EEB8D0`). The constant is now `0x1EEA4F0`.
+A Codex review agreed.
+
+Upstream has the same wrong constant, but rarely reaches it. Its
+`CheckPendingInfoRequests` copies a `msg_t` out of the raw payload pointer.
+So its size is usually garbage, and it returns before PrepReadData. Our port
+builds a proper local `msg`, which made the path reachable. That is why only
+enabled-detour runs crashed.
+
+The capture script now also saves the first 16 live bytes of every constant
+in `src/offsets.rs` (`offset_prologues.json`). Any other constant that points
+into a function body can be found the same way.
+
 ### The execute fault is not caused by our patching (run 10)
 
 In run 10 the loader thread mapped `t7patch.dll` at 83191.746, then made no
@@ -238,7 +268,10 @@ loaded the same DLL without faulting.
 
 ## Next step
 
-- PackageUInt: repeat what was done in-game in the 38 to 54 s window of runs
+- Run `detours,trace` again (the trace hook is harmless) to confirm the
+  PackageUInt crash is gone. Check `offset_prologues.json` for any other
+  constant that does not start a function.
+- Superseded by the fix: repeat what was done in-game in the 38 to 54 s window of runs
   2, 9 and 11 with the C++ build, to see whether upstream also receives the
   NULL-buffer message. Then look for the outer detour that differs: candidates
   are the lobby/IM dispatch hooks (`dwInstantDispatchMessage`,

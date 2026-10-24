@@ -74,7 +74,13 @@ pub const PTR_COM_LOCAL_CLIENT_GET_NETWORK_ID: usize = 0x20E3890;
 pub const PTR_NET_OUT_OF_BAND_DATA: usize = 0x211B200;
 pub const PTR_LOBBY_MSG_TRANSPORT_SEND_TO_ADR: usize = 0x1EEC740;
 pub const PTR_MSG_READ_DATA: usize = 0x20FD0B0;
-pub const PTR_LOBBY_MSG_RW_PREP_READ_DATA: usize = 0x1EEA150;
+/// Upstream has `0x1EEA150`, which is the `call LobbyMsgRW_PrepReadData`
+/// instruction 0x20 bytes into `LobbyMsg_HandleIM` (`0x1EEA130`), not the
+/// function. Calling it ran the rest of `HandleIM` on the caller's frame and
+/// crashed in `LobbyMsgRW_PackageUInt` (in-game runs 2, 9, 11 to 13). The
+/// function, verified in a live September dump at `0x1EE9E30`, is `MSG_Init`,
+/// then `msg+0x1c = size`, then a tail jump to `LobbyMsgRW_PrepReadMsg`.
+pub const PTR_LOBBY_MSG_RW_PREP_READ_DATA: usize = 0x1EEA4F0;
 pub const PTR_MSG_INFO_RESPONSE: usize = 0x1ED5B40;
 pub const PTR_LOBBY_MSG_RW_PACKAGE_CHAR: usize = 0x1EEA300;
 pub const PTR_LOBBY_MSG_RW_PACKAGE_FLOAT: usize = 0x1EEA390;
