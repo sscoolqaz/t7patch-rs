@@ -44,6 +44,8 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 7 | `6f44075`, `T7PATCH_ONLY=arxan,dispatcher,protection` (hooks off) | The log confirms `hooks: false`. Ran 148 s after load and was quit by the user. Zero `c0000005`, zero `c0000409`, 1576 Arxan int3. Nothing written to `crashes.log`. |
 | 8 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,create` | The log confirms `create_hooks: true, enable_hooks: false, vmt_hook: false`. Ran 211 s after load, then exited cleanly. Zero `c0000005`, zero `c0000409`, 1800 Arxan int3. Nothing written to `crashes.log`. |
 | 9 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,detours` | The log confirms `enable_hooks: true, vmt_hook: false`. 38 s after load our handler logged a fatal fault at live RVA `0x20FC9CF` and terminated the process. The registers and stack match run 2 exactly. Wine logged no `c0000005`, because the handler runs in the `Wow64PrepareForException` slot before Wine traces the exception. |
+| 10 | `d2ac9e4`, `detours` | Died about 1.5 s after `prepare` began. The execute AV at `0x70002250BDD0` (base + `0x4281BDD0`) came 0.28 s after `t7patch.dll` was mapped and 1.7 s **before** `prepare` ran. See "The execute fault is not caused by our patching". |
+| 11 | `d2ac9e4`, `detours` | 54 s after load: the same fault as runs 2 and 9, with identical registers. The new log fields show a read AV at address 0. Live hook bytes were captured about 25 s in. |
 
 ## Findings
 
@@ -177,16 +179,60 @@ This crash is deterministic. The execute fault at base + `0x428xxxxx` is
 intermittent, and it did not occur in run 9. Whether the two share a cause is
 open.
 
-The on-disk exe is encrypted at all these addresses. The crash log now also
-records the exception code and, for an access violation, the access type and
-target address.
+Run 11 reproduced it a third time. The extended crash log gives
+`c0000005`, read, target `0`. Live bytes captured with
+`t7patch-debug/scripts/capture_hooks.py` show:
+
+- **The trampoline is correct.** The entry `jmp` at live `0x1EE9DD0` stole
+  exactly `mov eax,[rcx+0x40]; test eax,eax` (5 bytes). The trampoline runs
+  those two instructions, then `jmp [rip]` back to `0x1EE9DD5`, whose `jne`
+  uses the preserved flags. The relay is in the RWX page at image base -
+  `0x10000`.
+- **`LobbyMsgRW_PackageUInt`** checks the mode at `msg+0x40`. Mode 0 returns,
+  mode 1 tail-jumps to the writer at live `0x1EEB030`, and any other mode
+  tail-jumps to the reader at live `0x1EEA9A0`. The reader calls the byte
+  reader at live `0x20FC990`.
+- **The byte reader** loads `movzx eax, byte [msg->data + msg->cursor]`, with
+  `data` at `msg+8`, the first buffer's size at `msg+0x1c` and the cursor at
+  `msg+0x24`. At the fault, `data` is NULL, the size is `0x16` and the
+  cursor is 0. The faulting instruction is at `0x20FC9CF`.
+- **The caller** is a game function at live `0x1EE9A70` (Feb `0x1EEA130`),
+  `F(ecx, rdx, data = r8, size = r9d)`. It builds the LobbyMsg on its own
+  stack through live `0x1EE9E30` (Feb `0x1EEA4F0`). When the message type at
+  `msg+0x38` is 0, it calls `PackageUInt(&msg, key@0x2FA0248, &local)`.
+
+So `F` was handed a NULL buffer with a size of 22 bytes, and the original
+reader faults on it whether or not it is hooked. Our detour only passes the
+message through. `F`'s caller is not visible: past `F`'s frame the stack holds
+encoded values (Arxan call obfuscation), not return addresses. Every string `F`
+uses is encrypted on disk. Still open: why only enabled-detour runs hand `F` a
+NULL buffer. Candidates are a Rust detour on an outer path passing a wrong
+argument or return value, or the C++ run never having reached the same event.
+
+### The execute fault is not caused by our patching (run 10)
+
+In run 10 the loader thread mapped `t7patch.dll` at 83191.746, then made no
+call into it for exactly 2.0 s (the same 2.0 s gap as run 9), until `prepare`
+at 83193.747. Our `DllMain` only calls `DisableThreadLibraryCalls`. A game
+thread created at 83192.002 took Arxan int3s at once. Arxan's VEH handlers,
+inside the exe image, returned `EXCEPTION_CONTINUE_EXECUTION`. At 83192.027
+the thread executed at the unmapped `0x70002250BDD0`. No patch of ours was
+installed then. So the base + `0x428xxxxx` fault is not caused by anything the
+DLL patches. It is inherent to the game under this Proton, induced by an
+extra module being loaded, or a side effect of `+seh` tracing slowing
+Arxan's int3/VEH flow (for example, tripping a timing check). A Codex review
+agreed, and ranked tracing first and module presence last, since runs 7 and 8
+loaded the same DLL without faulting.
 
 ## Next step
 
-- Repeat the `detours` run while
-  `t7patch-debug/scripts/capture_hooks.py` reads, from `/proc/<pid>/mem`, the
-  live code at the fault site and its callers, the hooked `PackageUInt`
-  prologue and its trampoline.
-- Compare that trampoline with the one C MinHook builds for the same function
-  in a C++ run.
+- PackageUInt: repeat what was done in-game in the 38 to 54 s window of runs
+  2, 9 and 11 with the C++ build, to see whether upstream also receives the
+  NULL-buffer message. Then look for the outer detour that differs: candidates
+  are the lobby/IM dispatch hooks (`dwInstantDispatchMessage`,
+  `LobbyMsgRW_PrepReadMsg`, `Sys_VerifyPacketChecksum`). `F`'s caller can be
+  found by hooking `F` (Feb `0x1EEA130`) for diagnosis and logging its return
+  address and arguments.
+- Execute fault: run the vanilla game three or four times with the same
+  `+seh` logging, and the full patch three times without `+seh`.
 - The `vmt` run is still to do.
