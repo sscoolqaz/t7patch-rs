@@ -42,6 +42,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | ref 2 | old DLL | **Same crash**: execute AV at `0x7000224F3980` (image base + `0x42803980`), logged by the old DLL's own handler. The first reference run only survived because the game was quit at the lobby. |
 | C++ | upstream `T7Patch-src` (MSVC, `t7patch.dll.bak`) | Reached a lobby; quit by the user after 64 s. Zero `c0000005`; 651 Arxan int3, which is normal. |
 | 7 | `6f44075`, `T7PATCH_ONLY=arxan,dispatcher,protection` (hooks off) | The log confirms `hooks: false`. Ran 148 s after load and was quit by the user. Zero `c0000005`, zero `c0000409`, 1576 Arxan int3. Nothing written to `crashes.log`. |
+| 8 | `eabdd62`, `T7PATCH_ONLY=arxan,dispatcher,protection,create` | The log confirms `create_hooks: true, enable_hooks: false, vmt_hook: false`. Ran 211 s after load, then exited cleanly. Zero `c0000005`, zero `c0000409`, 1800 Arxan int3. Nothing written to `crashes.log`. |
 
 ## Findings
 
@@ -147,15 +148,20 @@ crash, so it is strong but not conclusive. It puts the cause in the hook
 stage: `min_hook_rs` creating or enabling hooks, the VMT hooks, or the hook
 bodies themselves.
 
+### Creating hooks without enabling them survives (run 8)
+
+`T7PATCH_ONLY` can split the hook stage: `create` builds the `MinHook`
+detours without enabling them, `detours` builds and enables them, and `vmt`
+applies the lobby VMT hook alone. With `create`, the game ran 211 s with no
+fault. Building trampolines, allocating the hook buffer and running
+`ffi::initialize` are therefore not the trigger. What is left is enabling the
+detours or the VMT hook. Enabling covers the vendored `transact`, its thread
+freeze and RIP moves, the prologue writes, and the hook bodies running.
+
 ## Next step
 
-Narrow the hook stage down:
-
-- Repeat the hooks-off run once or twice to firm up the result.
-- Compare live hook state between a C++ run and a Rust run through
-  `/proc/<pid>/mem`: the hooked prologue bytes, relay and trampoline
-  locations, and the VMT slots.
-- Check whether the vendored enable path (`transact`, its thread freeze and
-  RIP moves) disturbs Arxan threads that are mid-handler. One way to test it
-  is a toggle that creates hooks but leaves them disabled, or that enables
-  only the VMT hooks.
+- Run `detours` (no VMT) and `vmt` (no detours) to find which part triggers
+  the crash.
+- If `detours` crashes, compare the live hooked prologues and relay jumps
+  with a C++ run through `/proc/<pid>/mem`, and check whether the enable
+  path's freeze or RIP moves disturb Arxan threads that are mid-handler.
