@@ -48,6 +48,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 11 | `d2ac9e4`, `detours` | 54 s after load: the same fault as runs 2 and 9, with identical registers. The new log fields show a read AV at address 0. Live hook bytes were captured about 25 s in. |
 | 12 | `9bf9835`, `detours,trace` | The log confirms `trace: true` and the trace hook was created. 40 s after load: the same PackageUInt fault, the fourth time. The trace hook on `LobbyMsg_HandleIM` logged **no** calls, although its body was on the crash stack. |
 | 13 | `8715fa0`, `detours,trace` | 32 s after load: the same fault, the fifth time. The 0x2000-byte stack dump shows `t7patch+C71B` above the zeroed buffer: the return point of `protection::check_pending_info_requests` in `hk_dw_instant_dispatch_message`. The live capture shows the trace hook's `jmp` in place at `HandleIM`'s entry. Root cause found (see "Root cause: PrepReadData pointed into HandleIM"). |
+| 14 | `7cc3f5a` (PrepReadData fix), `detours,trace` | Ran 93 s after load and shut down cleanly (modules unloaded, NvAPI session destroyed). Zero `c0000005`, no `crashes.log` entry, 659 Arxan int3 (the C++ run had 651). The trace hook logged two `HandleIM` calls from our IM detour (`t7patch+C7DF`) with a valid stack buffer and size `0x14`, from the same sender that used to crash. |
 
 ## Findings
 
@@ -268,9 +269,14 @@ loaded the same DLL without faulting.
 
 ## Next step
 
-- Run `detours,trace` again (the trace hook is harmless) to confirm the
-  PackageUInt crash is gone. Check `offset_prologues.json` for any other
-  constant that does not start a function.
+- Run 14 confirmed the fix: the same sender's messages now reach
+  `HandleIM` through its entry, and the game survived past the old crash
+  window. The prologue audit of all 92 constants in `src/offsets.rs` found
+  no other call site. The 44 constants without a usual prologue are data,
+  deliberate mid-function patch sites, or leaf functions whose first
+  instructions handle their arguments.
+- Next, run the full patch (`T7PATCH_ONLY` unset), which adds the VMT hook,
+  ideally to a lobby.
 - Superseded by the fix: repeat what was done in-game in the 38 to 54 s window of runs
   2, 9 and 11 with the C++ build, to see whether upstream also receives the
   NULL-buffer message. Then look for the outer detour that differs: candidates
