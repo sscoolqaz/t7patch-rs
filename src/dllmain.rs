@@ -144,7 +144,7 @@ impl Operations for PatchOps {
                 HOOK_LIB_INITIALIZED.store(true, Ordering::Release);
             }
             if components.create_hooks {
-                hooks::create_hooks()?;
+                hooks::create_all()?;
             }
             if components.trace {
                 diag::create_trace_hook()?;
@@ -184,7 +184,7 @@ impl Operations for PatchOps {
 
         let components = Components::current();
         if components.vmt_hook {
-            hooks::apply_vmt_hooks()?;
+            hooks::apply_vmt()?;
         }
         if !components.enable_hooks && !components.trace {
             return Ok(());
@@ -208,12 +208,12 @@ impl Operations for PatchOps {
 
         let mut failures = Vec::new();
         if HOOKS_MAY_BE_ENABLED.load(Ordering::Acquire) {
-            match hooks::destroy_hooks() {
+            match hooks::disable_all() {
                 Ok(()) => HOOKS_MAY_BE_ENABLED.store(false, Ordering::Release),
                 Err(error) => failures.push(error),
             }
         }
-        if let Err(error) = hooks::restore_vmt_hooks() {
+        if let Err(error) = hooks::restore_vmt() {
             failures.push(error);
         }
         // SAFETY: runs inside the game process; uninstall undoes only what install recorded.

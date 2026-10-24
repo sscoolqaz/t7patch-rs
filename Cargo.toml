@@ -38,6 +38,5 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
 # Game addresses are kept in the IDA-style hex form they are recorded in.
 unreadable_literal = "allow"

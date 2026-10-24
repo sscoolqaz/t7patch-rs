@@ -1609,7 +1609,7 @@ unsafe extern "system" fn hk_mods_is_mods_loaded_1() -> bool {
     unsafe { ORIG_MODS_IS_MODS_LOADED_1.get()() }
 }
 
-/// Returns false for every instant message. Installed in the lobby VMT by [`apply_vmt_hooks`].
+/// Returns false for every instant message. Installed in the lobby VMT by [`apply_vmt`].
 unsafe extern "system" fn global_instant_message(
     _thisptr: usize,
     _sender_id: u64,
@@ -1738,7 +1738,7 @@ static ORIGINAL_LOBBY_VTABLE: AtomicUsize = AtomicUsize::new(0);
 /// # Errors
 ///
 /// Returns an error when the lobby object or its vtable is not initialized or unreadable, or when the vtable pointer cannot be swapped.
-pub fn apply_vmt_hooks() -> Result<(), String> {
+pub fn apply_vmt() -> Result<(), String> {
     // SAFETY: `DW_LOBBY` is the game's global lobby pointer, readable once the game runs.
     let lobby = unsafe { read_game::<usize>(offsets::address(offsets::DW_LOBBY)) };
     if lobby == 0 {
@@ -1784,7 +1784,7 @@ pub fn apply_vmt_hooks() -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error when the lobby object's vtable slot cannot be read or written back. The ownership records are kept, so a later attempt can retry.
-pub fn restore_vmt_hooks() -> Result<(), String> {
+pub fn restore_vmt() -> Result<(), String> {
     let slot = LOBBY_VTABLE_SLOT.load(Ordering::Acquire);
     let original = ORIGINAL_LOBBY_VTABLE.load(Ordering::Acquire);
     if slot == 0 || original == 0 {
@@ -1799,7 +1799,7 @@ pub fn restore_vmt_hooks() -> Result<(), String> {
         return Err("T7 Patch: cannot read the lobby VMT slot".to_owned());
     }
     if current[0] == ours {
-        // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt_hooks` replaced.
+        // SAFETY: `slot` is the lobby object's vtable pointer that `apply_vmt` replaced.
         if !unsafe { arxan::restore_usize(slot, ours, original) } {
             return Err("T7 Patch: cannot restore the lobby VMT".to_owned());
         }
@@ -1979,7 +1979,7 @@ fn hook<F: Copy>(rva: usize, detour: F, slot: Option<&Original<F>>) -> Result<()
 ///
 /// Returns an error naming the first hook that cannot be created. Hooks created before it stay created and disabled.
 #[allow(clippy::too_many_lines)]
-pub fn create_hooks() -> Result<(), String> {
+pub fn create_all() -> Result<(), String> {
     // The campaign and Lua hooks are created by their own modules, as in the C++.
     campaign::install_hooks()
         .map_err(|error| format!("T7 Patch: campaign hook creation failed: {error}"))?;
@@ -2193,7 +2193,7 @@ pub fn create_hooks() -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error when the hooking library cannot disable the hooks.
-pub fn destroy_hooks() -> Result<(), String> {
+pub fn disable_all() -> Result<(), String> {
     // SAFETY: a null target is MinHook's `MH_ALL_HOOKS`, which disables every hook.
     unsafe { ffi::disable_hook(0) }
         .map_err(|error| format!("T7 Patch: MinHook disable failed: {error}"))

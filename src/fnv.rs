@@ -7,9 +7,9 @@
 const OFFSET_BASIS: u32 = 0x4B9A_CE2F;
 const PRIME: u32 = 0x0100_0193;
 
-/// Hashes a NUL-free byte string.
+/// Hashes a NUL-free byte string with the game's FNV-1a variant (`fnv1a`).
 #[must_use]
-pub fn fnv1a(input: &[u8]) -> u32 {
+pub fn hash(input: &[u8]) -> u32 {
     let mut hash = OFFSET_BASIS;
     let mut index = 0;
     while index < input.len() {
@@ -27,6 +27,6 @@ mod tests {
 
     #[test]
     fn empty_input_applies_single_trailing_multiply() {
-        assert_eq!(fnv1a(b""), OFFSET_BASIS.wrapping_mul(PRIME));
+        assert_eq!(hash(b""), OFFSET_BASIS.wrapping_mul(PRIME));
     }
 }

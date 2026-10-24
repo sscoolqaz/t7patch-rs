@@ -61,7 +61,7 @@ pub const fn classify(timestamp: u32, image_size: u32) -> Build {
 /// Must be called from inside the game process, where the main module's PE
 /// headers are mapped and readable.
 #[must_use]
-pub unsafe fn detect_build() -> Build {
+pub unsafe fn detect() -> Build {
     // SAFETY: a null module name asks for the calling process's executable; no pointers are passed.
     let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
         return Build::Unknown;
@@ -101,7 +101,7 @@ pub fn image_base() -> usize {
 pub fn current() -> Build {
     static BUILD: OnceLock<Build> = OnceLock::new();
     // SAFETY: this runs inside the game process, which has its main module mapped.
-    *BUILD.get_or_init(|| unsafe { detect_build() })
+    *BUILD.get_or_init(|| unsafe { detect() })
 }
 
 /// Maps a February-2026 RVA to the RVA that exists in `build`.

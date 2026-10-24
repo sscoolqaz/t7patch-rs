@@ -32,7 +32,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-use crate::fnv::fnv1a;
+use crate::fnv;
 use crate::gscu_hash::notify_hash;
 use crate::offsets::{self, address};
 use crate::structs::{
@@ -1713,9 +1713,9 @@ impl PatchConfig {
         };
         let token = c_prefix(&line[..separator]);
         let value = &line[separator + 1..];
-        let key = fnv1a(token);
+        let key = fnv::hash(token);
 
-        if key == fnv1a(b"playername") {
+        if key == fnv::hash(b"playername") {
             if value.is_empty() {
                 return;
             }
@@ -1723,13 +1723,13 @@ impl PatchConfig {
             self.playername = [0; PLAYER_NAME_LEN];
             let text = c_prefix(trimmed);
             self.playername[..text.len()].copy_from_slice(text);
-        } else if key == fnv1a(b"isfriendsonly") {
+        } else if key == fnv::hash(b"isfriendsonly") {
             self.isfriendsonly = if value.is_empty() {
                 0
             } else {
                 parse_leading_int(value).unwrap_or(0)
             };
-        } else if key == fnv1a(b"autoinstallmods") {
+        } else if key == fnv::hash(b"autoinstallmods") {
             self.autoinstallmods = if value.is_empty() {
                 0
             } else {
@@ -1738,7 +1738,7 @@ impl PatchConfig {
                     None => 0,
                 }
             };
-        } else if key == fnv1a(b"networkpassword") {
+        } else if key == fnv::hash(b"networkpassword") {
             let trimmed = &value[..value.len().min(MAX_SETTINGS_VALUE)];
             self.networkpassword = c_prefix(trimmed).to_vec();
         }
