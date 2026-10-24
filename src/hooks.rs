@@ -1978,13 +1978,21 @@ fn hook<F: Copy>(rva: usize, detour: F, slot: Option<&Original<F>>) -> Result<()
 /// # Errors
 ///
 /// Returns an error naming the first hook that cannot be created. Hooks created before it stay created and disabled.
-#[allow(clippy::too_many_lines)]
 pub fn create_all() -> Result<(), String> {
     // The campaign and Lua hooks are created by their own modules, as in the C++.
     campaign::install_hooks()
         .map_err(|error| format!("T7 Patch: campaign hook creation failed: {error}"))?;
     lua_symbols::install_hooks()?;
 
+    create_lobby_message_hooks()?;
+    create_ui_and_menu_hooks()?;
+    create_network_hooks()?;
+    create_entitlement_hooks()?;
+    Ok(())
+}
+
+/// Part of [`create_all`], in the C++ order: lobby message packaging, build title, system info, message type names and string handling.
+fn create_lobby_message_hooks() -> Result<(), String> {
     hook(
         offsets::PTR_LOBBY_MSG_RW_PREP_WRITE_MSG,
         hk_lobby_msg_rw_prep_write_msg as PrepWriteMsgFn,
@@ -2036,6 +2044,11 @@ pub fn create_all() -> Result<(), String> {
         hk_lobby_msg_rw_package_uchar as PackageUCharFn,
         Some(&ORIG_PACKAGE_UCHAR),
     )?;
+    Ok(())
+}
+
+/// Part of [`create_all`], in the C++ order: UI models, menu responses, packet checksums, lobby message printing, Lua commands and the user name.
+fn create_ui_and_menu_hooks() -> Result<(), String> {
     hook(
         UI_DO_MODEL_STRING_REPLACEMENT,
         hk_ui_do_model_string_replacement as ModelStringFn,
@@ -2098,6 +2111,11 @@ pub fn create_all() -> Result<(), String> {
         hk_live_user_get_name as LiveUserGetNameFn,
         None,
     )?;
+    Ok(())
+}
+
+/// Part of [`create_all`], in the C++ order: instant messages, connectionless commands, presence, config strings, UGC and invites.
+fn create_network_hooks() -> Result<(), String> {
     // Not ported: the C++ hooks its own CRT's `__report_gsfailure` here, so that a
     // `/GS` stack-cookie failure in T7Patch.dll faults where the exception handler
     // can catch it. This DLL is Rust only and has no `/GS` checks to fail.
@@ -2142,6 +2160,11 @@ pub fn create_all() -> Result<(), String> {
         Some(&ORIG_LIVE_INVITES_JOIN_MESSAGE_ACTION),
     )?;
     hook(UI_BROWSER_OPEN, hk_ui_browser_open as BrowserOpenFn, None)?;
+    Ok(())
+}
+
+/// Part of [`create_all`], in the C++ order: licences, inventory, entitlements, info keys and the mods-loaded checks.
+fn create_entitlement_hooks() -> Result<(), String> {
     // The five BG_Cache hooks are commented out in the C++ and are not created here.
     hook(
         USER_HAS_LICENSE_FOR_APP,
@@ -2183,7 +2206,6 @@ pub fn create_all() -> Result<(), String> {
         hk_mods_is_mods_loaded_1 as ModsLoadedFn,
         Some(&ORIG_MODS_IS_MODS_LOADED_1),
     )?;
-
     Ok(())
 }
 
