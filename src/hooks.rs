@@ -1628,6 +1628,7 @@ unsafe extern "system" fn global_instant_message(
 /// # Safety
 ///
 /// Must run inside the game process.
+#[must_use]
 pub unsafe extern "system" fn bg_cache_get_script_menu_name_for_index(
     instance: u32,
     index: u32,
@@ -1644,6 +1645,7 @@ pub unsafe extern "system" fn bg_cache_get_script_menu_name_for_index(
 /// # Safety
 ///
 /// Must run inside the game process.
+#[must_use]
 pub unsafe extern "system" fn bg_cache_get_event_string_name_for_index(
     instance: u32,
     index: u32,
@@ -1660,6 +1662,7 @@ pub unsafe extern "system" fn bg_cache_get_event_string_name_for_index(
 /// # Safety
 ///
 /// Must run inside the game process.
+#[must_use]
 pub unsafe extern "system" fn bg_cache_get_loc_string_name_for_index(
     instance: u32,
     index: u32,
@@ -1678,6 +1681,7 @@ pub unsafe extern "system" fn bg_cache_get_loc_string_name_for_index(
 /// # Safety
 ///
 /// Must run inside the game process.
+#[must_use]
 pub unsafe extern "system" fn bg_cache_get_lui_menu_for_index(
     instance: u32,
     index: u32,
@@ -1696,6 +1700,7 @@ pub unsafe extern "system" fn bg_cache_get_lui_menu_for_index(
 /// # Safety
 ///
 /// Must run inside the game process.
+#[must_use]
 pub unsafe extern "system" fn bg_cache_get_lui_menu_data_for_index(
     instance: u32,
     index: u32,

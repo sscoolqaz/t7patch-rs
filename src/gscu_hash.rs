@@ -19,6 +19,7 @@ const fn to_lower(byte: u8) -> u8 {
 ///
 /// The C++ source feeds `char` (signed on MSVC) into the arithmetic, so bytes
 /// at or above 0x80 are sign-extended before mixing. That is reproduced here.
+#[must_use]
 pub fn canon_hash(input: &[u8]) -> u32 {
     let mut hash = CANON_SEED;
     for &byte in input {
@@ -35,6 +36,7 @@ pub fn canon_hash(input: &[u8]) -> u32 {
 ///
 /// The C++ `char` is signed, so bytes at or above 0x80 are sign-extended before
 /// the XOR. This matches `canon_hash64` in `Protection.cpp`.
+#[must_use]
 pub fn notify_hash(input: &[u8]) -> u64 {
     let hash = input.iter().fold(NOTIFY_OFFSET, |hash, &byte| {
         let widened = i64::from(to_lower(byte).cast_signed()).cast_unsigned();

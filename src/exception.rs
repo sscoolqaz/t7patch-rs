@@ -174,6 +174,7 @@ unsafe fn proc_address(module: PCSTR, name: PCSTR) -> usize {
 }
 
 /// Address of `ntdll!ZwContinue`, or 0 if it is missing.
+#[must_use]
 pub fn zw_continue_address() -> usize {
     // SAFETY: resolves an export of ntdll, which is always loaded in a Windows process.
     unsafe { proc_address(s!("ntdll.dll"), s!("ZwContinue")) }

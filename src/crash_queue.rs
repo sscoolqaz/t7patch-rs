@@ -65,6 +65,7 @@ pub struct Reservation<'q, T: Copy, const N: usize> {
 
 impl<T: Copy, const N: usize> Reservation<'_, T, N> {
     /// The reserved slot index.
+    #[must_use]
     pub fn slot(&self) -> usize {
         self.slot
     }
@@ -99,6 +100,7 @@ impl<T: Copy, const N: usize> CrashQueue<T, N> {
     const CAPACITY_FITS: () = assert!(N > 0 && N < CLOSED as usize);
 
     /// An empty, open queue. Usable in a `static`.
+    #[must_use]
     pub const fn new() -> Self {
         let () = Self::CAPACITY_FITS;
         Self {

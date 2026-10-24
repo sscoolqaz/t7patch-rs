@@ -102,6 +102,7 @@ fn read_u16(buffer: &[u8], offset: usize) -> Option<u16> {
 ///
 /// Returns `None` when the buffer is not a supported script, when the target
 /// function is absent, or when the condition is already replaced or unexpected.
+#[must_use]
 pub fn find_damage_patch(buffer: &[u8]) -> Option<PatchSite> {
     if buffer.len() < 0x40 || !buffer.starts_with(&COMPILED_SCRIPT_MAGIC) {
         return None;

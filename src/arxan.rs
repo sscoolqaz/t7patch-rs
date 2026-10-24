@@ -104,6 +104,7 @@ fn lock_state() -> MutexGuard<'static, State> {
 }
 
 /// Reports whether a page protection allows execution and is readable.
+#[must_use]
 pub fn executable_protection(protection: u32) -> bool {
     if protection & (PAGE_GUARD | PAGE_NOACCESS) != 0 {
         return false;
@@ -115,11 +116,13 @@ pub fn executable_protection(protection: u32) -> bool {
 }
 
 /// XORs an encrypted patch with the key, yielding the bytes to write.
+#[must_use]
 pub fn decrypt_patch(encrypted: &[u8]) -> Vec<u8> {
     encrypted.iter().map(|byte| byte ^ PATCH_KEY).collect()
 }
 
 /// Finds every (possibly overlapping) occurrence of `pattern` in `haystack`.
+#[must_use]
 pub fn find_all(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
     if pattern.is_empty() || haystack.len() < pattern.len() {
         return Vec::new();
@@ -693,6 +696,7 @@ fn restore_applied(state: &mut State, applied: usize) -> bool {
 }
 
 /// Reports whether an earlier restore left the image partially bypassed.
+#[must_use]
 pub fn partial() -> bool {
     lock_state().partial
 }

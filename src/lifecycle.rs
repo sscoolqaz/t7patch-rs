@@ -59,6 +59,7 @@ impl Default for Lifecycle {
 }
 
 impl Lifecycle {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             state: AtomicU8::new(State::Idle as u8),

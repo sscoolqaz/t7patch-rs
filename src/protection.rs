@@ -933,6 +933,7 @@ pub mod iat_hook {
     /// # Safety
     ///
     /// `module` must be a mapped PE image with a valid import directory.
+    #[must_use]
     pub unsafe fn find(function: &CStr, module: usize) -> Option<*mut usize> {
         let base = if module == 0 {
             crate::build::image_base()
@@ -984,6 +985,7 @@ pub mod iat_hook {
     ///
     /// `module` must be a mapped PE image. `new_function` must match the
     /// signature of the import it replaces.
+    #[must_use]
     pub unsafe fn detour_iat_ptr(function: &CStr, new_function: usize, module: usize) -> usize {
         // SAFETY: the caller's contract on `module` covers `find`.
         let Some(slot) = (unsafe { find(function, module) }) else {
@@ -1088,6 +1090,7 @@ fn steam_slots() -> [(usize, usize); 9] {
 /// # Safety
 ///
 /// Called by the game through the Steam vtable.
+#[must_use]
 pub unsafe extern "system" fn get_username_ptr(_this: i64) -> *const c_char {
     drain_pending_name();
     custom_name_ptr()
@@ -1098,6 +1101,7 @@ pub unsafe extern "system" fn get_username_ptr(_this: i64) -> *const c_char {
 /// # Safety
 ///
 /// Called by the game through the Steam vtable. `this` is the Steam user object.
+#[must_use]
 pub unsafe extern "system" fn get_username_xuid_ptr(this: i64, xuid: i64) -> *const c_char {
     drain_pending_name();
     // SAFETY: reads the local player's XUID from the game's player data.
@@ -1119,6 +1123,7 @@ pub unsafe extern "system" fn get_username_xuid_ptr(this: i64, xuid: i64) -> *co
 /// # Safety
 ///
 /// Called by the game through the Steam vtable.
+#[must_use]
 pub unsafe extern "system" fn is_vac_banned(_this: i64) -> bool {
     false
 }
@@ -1231,6 +1236,7 @@ unsafe fn read_friends_snapshot() -> Option<Vec<i64>> {
 /// # Safety
 ///
 /// Reads the game's UI-level byte and the Steam friends interface.
+#[must_use]
 pub unsafe fn is_friend_by_xuid_uncached(xuid: i64) -> bool {
     let now = tick_ms();
     // SAFETY: `OFF_s_runningUILevel` is a game byte global.
@@ -1256,6 +1262,7 @@ pub unsafe fn is_friend_by_xuid_uncached(xuid: i64) -> bool {
 /// # Safety
 ///
 /// Called by the game through the Steam vtable.
+#[must_use]
 pub unsafe extern "system" fn get_owns_content(interface: i64, item_id: i32) -> bool {
     let cached = lock(&INSTALLED_DLC).get(&item_id).copied();
     if let Some(value) = cached {
@@ -1279,6 +1286,7 @@ pub unsafe extern "system" fn get_owns_content(interface: i64, item_id: i32) -> 
 /// # Safety
 ///
 /// Called by the game through the Steam vtable.
+#[must_use]
 pub unsafe extern "system" fn get_owns_content2(interface: i64, item_id: i32) -> bool {
     let cached = lock(&SUBSCRIBED_APP).get(&item_id).copied();
     if let Some(value) = cached {
@@ -1373,6 +1381,7 @@ pub unsafe extern "system" fn get_dlc_download_progress(a: i64, b: i32, c: *mut 
 /// # Safety
 ///
 /// Called by the game through the Steam vtable with its own pointers.
+#[must_use]
 pub unsafe extern "system" fn get_lobby_chat_entry(
     api: i64,
     csteamid_lobby: i64,
@@ -1464,6 +1473,7 @@ pub unsafe extern "system" fn get_lobby_chat_entry(
 /// # Safety
 ///
 /// Called by the game through the Steam vtable.
+#[must_use]
 pub unsafe extern "system" fn create_lobby(
     api: i64,
     _lobby_create_type: i32,
@@ -1485,6 +1495,7 @@ pub unsafe extern "system" fn create_lobby(
 /// # Safety
 ///
 /// Called by the game through its update-preload function pointer.
+#[must_use]
 pub unsafe extern "system" fn cl_switch_state_idle_update(sw: i64) -> i32 {
     // SAFETY: the game function takes no arguments and returns a C string.
     let mode_name = unsafe {

@@ -37,6 +37,7 @@ pub enum Build {
 /// IDA's reconstructed memory images round `SizeOfImage` to the next page, while
 /// the retail executable keeps its 0x200 alignment. Both fingerprints are
 /// accepted because the timestamp and RVA layout are identical.
+#[must_use]
 pub const fn classify(timestamp: u32, image_size: u32) -> Build {
     if timestamp == SEPTEMBER_2026_TIMESTAMP
         && (image_size == SEPTEMBER_2026_RETAIL_IMAGE_SIZE
@@ -59,6 +60,7 @@ pub const fn classify(timestamp: u32, image_size: u32) -> Build {
 ///
 /// Must be called from inside the game process, where the main module's PE
 /// headers are mapped and readable.
+#[must_use]
 pub unsafe fn detect_build() -> Build {
     // SAFETY: a null module name asks for the calling process's executable; no pointers are passed.
     let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
@@ -103,6 +105,7 @@ pub fn current() -> Build {
 }
 
 /// Maps a February-2026 RVA to the RVA that exists in `build`.
+#[must_use]
 pub const fn live_rva(february_rva: usize, build: Build) -> usize {
     if matches!(build, Build::September2026)
         && february_rva >= SEPTEMBER_SHIFT_START_RVA
@@ -122,6 +125,7 @@ pub const fn live_rva(february_rva: usize, build: Build) -> usize {
 /// bytes `[START - DELTA, START)` were removed in September, so a live RVA there
 /// is always shifted code, never an unchanged February address. Live RVAs in
 /// `[END - DELTA, END)` and outside the code range pass through unchanged.
+#[must_use]
 pub const fn february_rva(live_rva: usize, build: Build) -> usize {
     if matches!(build, Build::September2026)
         && live_rva >= SEPTEMBER_SHIFT_START_RVA - SEPTEMBER_CODE_DELTA

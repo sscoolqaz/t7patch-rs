@@ -8,6 +8,7 @@ const OFFSET_BASIS: u32 = 0x4B9A_CE2F;
 const PRIME: u32 = 0x0100_0193;
 
 /// Hashes a NUL-free byte string.
+#[must_use]
 pub fn fnv1a(input: &[u8]) -> u32 {
     let mut hash = OFFSET_BASIS;
     let mut index = 0;

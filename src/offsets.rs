@@ -6,6 +6,7 @@
 use crate::build;
 
 /// Resolves a February-2026 RVA to a live address in the running executable.
+#[must_use]
 pub fn address(february_rva: usize) -> usize {
     let base = build::image_base();
     base + build::live_rva(february_rva, build::current())
@@ -17,6 +18,7 @@ pub fn address(february_rva: usize) -> usize {
 ///
 /// `F` must be a `extern "system"` function pointer whose signature matches the
 /// game function at `rva` in the running build.
+#[must_use]
 pub unsafe fn function<F: Copy>(rva: usize) -> F {
     const { assert!(size_of::<F>() == size_of::<usize>()) };
     // SAFETY: the caller guarantees `F` is a function pointer of the game function at `rva`.
