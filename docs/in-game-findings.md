@@ -41,6 +41,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 6 | `2aba7a2` | Execute AV at `0x7000225BDEF0`. A memory-map snapshot of the real game process shows the address unmapped, with nothing mapped within 256 MB. |
 | ref 2 | old DLL | **Same crash**: execute AV at `0x7000224F3980` (image base + `0x42803980`), logged by the old DLL's own handler. The first reference run only survived because the game was quit at the lobby. |
 | C++ | upstream `T7Patch-src` (MSVC, `t7patch.dll.bak`) | Reached a lobby; quit by the user after 64 s. Zero `c0000005`; 651 Arxan int3, which is normal. |
+| 7 | `6f44075`, `T7PATCH_ONLY=arxan,dispatcher,protection` (hooks off) | The log confirms `hooks: false`. Ran 148 s after load and was quit by the user. Zero `c0000005`, zero `c0000409`, 1576 Arxan int3. Nothing written to `crashes.log`. |
 
 ## Findings
 
@@ -137,9 +138,24 @@ absolute jump) and the relative `call`. MinHook's buffer in the game is a
 single RWX page at image base - `0x10000`. No bad jump target lies in any
 buffer or module.
 
+### Hooks off survives (run 7)
+
+With the Arxan bypass, the dispatcher and protection installed but no hooks
+created or enabled, the game ran 148 s with no fault. That is about 3.5 times the
+longest crash delay seen so far (42 s). This is one run of an intermittent
+crash, so it is strong but not conclusive. It puts the cause in the hook
+stage: `min_hook_rs` creating or enabling hooks, the VMT hooks, or the hook
+bodies themselves.
+
 ## Next step
 
-Run a Rust build with the hooks disabled (`T7PATCH_ONLY` without `hooks`). If it
-survives past the window in which it usually crashes, the hooking layer
-(`min_hook_rs` creating or enabling hooks) is implicated, and the next step is
-to compare its live hook state with C MinHook's.
+Narrow the hook stage down:
+
+- Repeat the hooks-off run once or twice to firm up the result.
+- Compare live hook state between a C++ run and a Rust run through
+  `/proc/<pid>/mem`: the hooked prologue bytes, relay and trampoline
+  locations, and the VMT slots.
+- Check whether the vendored enable path (`transact`, its thread freeze and
+  RIP moves) disturbs Arxan threads that are mid-handler. One way to test it
+  is a toggle that creates hooks but leaves them disabled, or that enables
+  only the VMT hooks.
