@@ -967,23 +967,48 @@ fn pin_module(address: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Puts the saved Wine stub back under a guarded freeze. Returns `false`, with
-/// the hook still in place, if a thread may still return into it or the write
-/// did not happen.
+/// Outcome of putting the saved Wine stub back.
+enum WineRestore {
+    /// The original bytes are back and the write completed.
+    Restored,
+    /// Nothing was written; the hook is still in place.
+    Kept,
+    /// The original bytes are back, so the hook is gone, but the write did not
+    /// complete (protection or cache flush, or a thread was not resumed).
+    RestoredIncomplete,
+}
+
+/// Puts the saved Wine stub back under a guarded freeze. Nothing is written while a
+/// thread may still return into the stub.
 ///
 /// # Safety
 ///
 /// `dispatcher` must be the Wine `KiUserExceptionDispatcher` that `install_wine_hook` patched.
-unsafe fn restore_wine_stub(dispatcher: usize) -> bool {
+unsafe fn restore_wine_stub(dispatcher: usize) -> WineRestore {
     let begin = dispatcher + WINE_KI_DISPATCH_OFFSET;
     let mut original = [0u8; WINE_HOOK_SIZE];
     for (byte, saved) in original.iter_mut().zip(&WINE_ORIGINAL) {
         *byte = saved.load(Ordering::Relaxed);
     }
     // SAFETY: as for the install; the guard covers the stub and the handler's return site.
-    match unsafe { crate::threads::write_code_guarded(begin, &original, wine_guard(begin)) } {
-        Ok(report) => report.complete(),
-        Err(_) => false,
+    let report =
+        match unsafe { crate::threads::write_code_guarded(begin, &original, wine_guard(begin)) } {
+            Ok(report) => report,
+            Err(crate::threads::CodeWriteError::Thaw { reports, .. }) => {
+                return if reports.first().is_some_and(|report| report.bytes_written) {
+                    WineRestore::RestoredIncomplete
+                } else {
+                    WineRestore::Kept
+                };
+            }
+            Err(_) => return WineRestore::Kept,
+        };
+    if report.complete() {
+        WineRestore::Restored
+    } else if report.bytes_written {
+        WineRestore::RestoredIncomplete
+    } else {
+        WineRestore::Kept
     }
 }
 
@@ -1047,8 +1072,9 @@ pub(crate) fn note_exception_producer() {
 
 /// Port of the fork's `UninstallHook`: restores the dispatcher's original callback when no
 /// exception producer was ever exposed. Once the lobby marker or the IAT detour has been
-/// written, or on the Wine stub layout while a thread is inside the stub, the hook is
-/// retained for the process lifetime.
+/// written, the hook is retained for the process lifetime. On the Wine stub layout the
+/// stub is kept while it cannot be restored yet (a thread is in or returning into it, or
+/// the guarded write fails), and a later call tries again.
 /// Does nothing if the hook was never installed.
 ///
 /// # Safety
@@ -1057,9 +1083,11 @@ pub(crate) fn note_exception_producer() {
 ///
 /// # Errors
 ///
-/// Returns an error when the dispatcher's layout is unknown or changed, or when its
-/// original callback slot cannot be written back. The hook then stays installed. A Wine
-/// stub that cannot be restored yet is kept and is not an error.
+/// Returns an error when the dispatcher export cannot be resolved, its layout is unknown
+/// or changed, or its original callback slot cannot be written back. The hook then stays
+/// installed. A Wine stub that cannot be restored yet is kept and is not an error; one whose
+/// original bytes went back but whose write did not complete is an error, and the hook is
+/// then gone.
 pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
     if !DISPATCHER_INSTALLED.load(Ordering::Acquire) {
         return Ok(());
@@ -1070,14 +1098,27 @@ pub unsafe fn uninstall(producers_remaining: bool) -> Result<(), String> {
         // back only when a frozen stack scan shows no thread inside or about to
         // return into it. Otherwise the stub and the handler are kept.
         // SAFETY: `dispatcher_layout` matched the Wine stub that `install_wine_hook` wrote.
-        if unsafe { restore_wine_stub(dispatcher) } {
-            HANDLER_ACTIVE.store(false, Ordering::Release);
-            DISPATCHER_INSTALLED.store(false, Ordering::Release);
-            return Ok(());
+        match unsafe { restore_wine_stub(dispatcher) } {
+            WineRestore::Restored => {
+                HANDLER_ACTIVE.store(false, Ordering::Release);
+                DISPATCHER_INSTALLED.store(false, Ordering::Release);
+                return Ok(());
+            }
+            WineRestore::RestoredIncomplete => {
+                // The stub no longer calls the handler, so a later install must
+                // write it again rather than reuse a dispatcher that is gone.
+                HANDLER_ACTIVE.store(false, Ordering::Release);
+                DISPATCHER_INSTALLED.store(false, Ordering::Release);
+                return Err(
+                    "T7 Patch: Wine exception stub restored, but the write did not complete"
+                        .to_owned(),
+                );
+            }
+            WineRestore::Kept => {}
         }
         HANDLER_ACTIVE.store(true, Ordering::Release);
         crate::dllmain::debug_print(
-            "T7 Patch: Wine exception stub is in use; retained for the process lifetime.\n",
+            "T7 Patch: Wine exception stub cannot be restored yet; retained.\n",
         );
         return Ok(());
     }

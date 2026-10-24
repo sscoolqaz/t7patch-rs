@@ -954,7 +954,7 @@ pub mod iat_hook {
                 let mut index = 0usize;
                 loop {
                     let slot = (first_thunk + index * 8) as *mut usize;
-                    if *slot == 0 {
+                    if slot.read_unaligned() == 0 {
                         break;
                     }
                     let thunk = ((original_thunk + index * 8) as *const u64).read_unaligned();
@@ -3117,6 +3117,8 @@ static DVAR_SETTINGS_APPLIED: AtomicBool = AtomicBool::new(false);
 /// # Errors
 ///
 /// Returns an error when a Steam interface pointer or its vtable pointer is still null.
+/// The function table, network password and packet callbacks are already set by then,
+/// and a retry runs those steps again.
 pub unsafe fn initialize() -> Result<(), String> {
     if INITIALIZED.load(Ordering::Acquire) {
         return Ok(());

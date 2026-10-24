@@ -761,12 +761,19 @@ pub fn install() -> Result<String, String> {
                     state.patches[applied].state = PatchState::Written;
                 }
             }
-            if attempted.is_empty() {
+            let restored = if attempted.is_empty() {
                 state.patches.clear();
+                true
             } else {
-                let _ = restore_applied(&mut state, attempted.len());
-            }
-            return Err(format!("T7 Patch: cannot apply the Arxan bypass: {error}"));
+                restore_applied(&mut state, attempted.len())
+            };
+            return Err(if restored {
+                format!("T7 Patch: cannot apply the Arxan bypass: {error}")
+            } else {
+                format!(
+                    "T7 Patch: cannot apply the Arxan bypass and its rollback is incomplete: {error}"
+                )
+            });
         }
     };
 

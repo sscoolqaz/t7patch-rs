@@ -119,8 +119,10 @@ Unload restores the hooks, but two kinds of state stay:
 
 - The exception dispatcher is retained for the process lifetime once an
   induced-exception patch (the lobby marker or the `IsProcessorFeaturePresent`
-  detour) has been live, and on the Wine stub layout while a frozen stack scan
-  still finds a thread in the stub. The DLL pins
+  detour) has been live. On the Wine stub layout the stub is kept while it
+  cannot be restored yet (a thread is in or returning into it, or the guarded
+  write fails); it stays until a later successful install and Unload restores
+  it. The DLL pins
   itself when the dispatcher is installed, so Unload is logical deactivation.
 - The dvar settings changed at install (`ui_error_callstack_ship`,
   `g_allowvote`, `maxvoicepacketsperframe`) are not restored, because that
