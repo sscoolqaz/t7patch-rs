@@ -51,6 +51,7 @@ patch installs its handler into the `Wow64PrepareForException` slot
 | 14 | `7cc3f5a` (PrepReadData fix), `detours,trace` | Ran 93 s after load and shut down cleanly (modules unloaded, NvAPI session destroyed). Zero `c0000005`, no `crashes.log` entry, 659 Arxan int3 (the C++ run had 651). The trace hook logged two `HandleIM` calls from our IM detour (`t7patch+C7DF`) with a valid stack buffer and size `0x14`, from the same sender that used to crash. |
 | 15 | `cee873f` (verdict trace), `detours,trace` | The user could click into a lobby, but hosting failed. Our own client's info response was dropped: `info-check: xuid=<local-xuid> DROP reason=info-response-rejected detail=2`. Code 2 is a failure to read the `valid` bool of the first lobby element. The sender is the local player (P_USER_DATA). Exited after 80 s with zero `c0000005`. |
 | 17 | `8abb861` (nested parser), `detours,trace` | The local client's info response now parses and goes to the game's handler: `info-check: xuid=<local-xuid> DROP reason=info-response-handled detail=0` (run 15: `info-response-rejected detail=2`). Exited after 64 s, with zero `c0000005` and no crash log. Whether hosting succeeded is per the user. |
+| 18 | `d068a9f` (msg_t handoff), `detours,trace` | **Hosting works.** The lobby loaded. The verdict trace shows our own `keep reason=local` / `info-response-handled` pair every 5 to 8 s while hosting. Zero `c0000005` up to 53 s after load. |
 
 ## Findings
 
@@ -322,7 +323,7 @@ loaded the same DLL without faulting.
   buf, size)`. With the raw payload it read a garbage size. It now gets our
   local `msg`, positioned after the IM header, which is the same work as the
   normal path. Upstream passes the raw pointer too, but never reaches that
-  line. Verify hosting again.
+  line. Run 18 confirmed it: the lobby hosts.
 - Open (also upstream): the normal path calls `LobbyMsg_HandleIM` without
   checking `msg.overflowed` after `MSG_ReadData`. The game's own handler
   skips dispatch on overflow.
