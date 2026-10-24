@@ -2237,7 +2237,6 @@ pub unsafe fn msg_lobby_state_package_inspect(this: *mut u8, lobby_msg: *mut c_v
 /// # Safety
 ///
 /// As [`msg_lobby_state_package_inspect`].
-#[allow(clippy::too_many_lines)]
 pub unsafe fn msg_lobby_state_game_package_inspect(this: *mut u8, lobby_msg: *mut c_void) -> i32 {
     // SAFETY: forwarded with the same contract.
     let base_result = unsafe { msg_lobby_state_package_inspect(this, lobby_msg) };
@@ -2274,151 +2273,192 @@ pub unsafe fn msg_lobby_state_game_package_inspect(this: *mut u8, lobby_msg: *mu
         }
 
         let lobby_mode = i32_at(w(5));
-        if lobby_mode == 0 {
-            rw::array_start(g, lm, c"clientlist");
-            let mut index = 0usize;
-            let mut has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            while has_next && index < MAX_LOBBY_CLIENTS {
-                let client = w(9 * index);
-                ok = ok
-                    && rw::int(g, lm, c"team", at_bytes(client, 28524))
-                    && rw::int(g, lm, c"mapvote", at_bytes(client, 28528))
-                    && rw::bool_(g, lm, c"readyup", at_bytes(client, 28532));
-                if !ok {
-                    return 21;
-                }
-                index += 1;
-                has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            }
-            if has_next {
-                return 22;
-            }
-            ok = ok
-                && rw::int(g, lm, c"plistid", w(7126))
-                && rw::int(g, lm, c"plistcurr", w(7127))
-                && rw::glob(g, lm, c"plistentries", at_bytes(this, 28512), 8)
-                && rw::uchar(g, lm, c"plistnext", at_bytes(this, 28520))
-                && rw::uchar(g, lm, c"plistprev", at_bytes(this, 28521))
-                && rw::uchar(g, lm, c"plistprevcount", at_bytes(this, 28522));
-            if !ok {
-                return 5;
-            }
-            return 0;
-        }
-
-        if lobby_mode == 1 {
-            ok = ok && rw::int(g, lm, c"votecount", w(5397));
-            rw::array_start(g, lm, c"votes");
-            let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
-                return 26;
-            };
-            let mut index = 0usize;
-            let mut has_next = rw::element(g, lm, index < votes);
-            while has_next && index < votes {
-                let vote = w(8 * index + 5398);
-                ok = ok
-                    && rw::short(g, lm, c"itemtype", at_bytes(vote, 8))
-                    && rw::uint(g, lm, c"item", at_bytes(vote, 12))
-                    && rw::short(g, lm, c"itemgroup", at_bytes(vote, 16))
-                    && rw::short(g, lm, c"attachment", at_bytes(vote, 20))
-                    && rw::short(g, lm, c"votetype", at_bytes(vote, 24))
-                    && rw::xuid(g, lm, c"votexuid", at_bytes(vote, 0));
-                if !ok {
-                    return 6;
-                }
-                index += 1;
-                has_next = rw::element(g, lm, index < votes);
-            }
-            if has_next {
-                return 23;
-            }
-            rw::array_start(g, lm, c"clientlist");
-            index = 0;
-            has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            while has_next && index < MAX_LOBBY_CLIENTS {
-                let client = w(index + 8 * index + 7131);
-                ok = ok
-                    && rw::int(g, lm, c"team", at_bytes(client, 0))
-                    && rw::int(g, lm, c"pregamepos", at_bytes(client, 4))
-                    && rw::int(g, lm, c"pregamestate", at_bytes(client, 3))
-                    && rw::uint(g, lm, c"clvotecount", at_bytes(client, 6))
-                    && rw::uint(g, lm, c"character", at_bytes(client, 7))
-                    && rw::uint(g, lm, c"loadout", at_bytes(client, 8));
-                if !ok {
-                    return 7;
-                }
-                index += 1;
-                has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            }
-            if has_next {
-                return 24;
-            }
-            // The original ignores `packageOK` after this point and returns 0.
-            if ok {
-                rw::int(g, lm, c"settingssize", w(7350));
-            }
-            let settings = i32_at(w(7350));
-            if settings <= 0 || settings > 0xC000 {
-                return 25;
-            }
-            return 0;
-        }
-
-        if lobby_mode == 3 {
-            ok = ok
-                && rw::int(g, lm, c"compstate", w(5396))
-                && rw::int(g, lm, c"votecount", w(5397));
-            if !ok {
-                return 10;
-            }
-            let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
-                return 27;
-            };
-            let mut index = 0usize;
-            let mut has_next = rw::element(g, lm, index < votes);
-            while has_next && index < votes {
-                let vote = w(8 * index + 5398);
-                ok = ok
-                    && rw::short(g, lm, c"itemtype", at_bytes(vote, 8))
-                    && rw::uint(g, lm, c"item", at_bytes(vote, 12))
-                    && rw::short(g, lm, c"itemgroup", at_bytes(vote, 16))
-                    && rw::short(g, lm, c"attachment", at_bytes(vote, 20))
-                    && rw::short(g, lm, c"votetype", at_bytes(vote, 24))
-                    && rw::xuid(g, lm, c"votexuid", at_bytes(vote, 0));
-                if !ok {
-                    return 8;
-                }
-                index += 1;
-                has_next = rw::element(g, lm, index < votes);
-            }
-            if has_next {
-                return 28;
-            }
-            rw::array_start(g, lm, c"clientlist");
-            index = 0;
-            has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            while has_next && index < MAX_LOBBY_CLIENTS {
-                let client = w(index + 8 * index + 7131);
-                ok = ok
-                    && rw::int(g, lm, c"team", at_bytes(client, 0))
-                    && rw::int(g, lm, c"pregamepos", at_bytes(client, 4))
-                    && rw::int(g, lm, c"pregamestate", at_bytes(client, 3))
-                    && rw::uint(g, lm, c"clvotecount", at_bytes(client, 6))
-                    && rw::uint(g, lm, c"character", at_bytes(client, 7))
-                    && rw::uint(g, lm, c"loadout", at_bytes(client, 8));
-                if !ok {
-                    return 9;
-                }
-                index += 1;
-                has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
-            }
-            if has_next {
-                return 29;
-            }
-            return 0;
+        // Any other mode has no extra section, and the original returns 0.
+        match lobby_mode {
+            0 => lobby_state_game_mode_0(g, this, lm, ok),
+            1 => lobby_state_game_mode_1(g, this, lm, ok),
+            3 => lobby_state_game_mode_3(g, this, lm, ok),
+            _ => 0,
         }
     }
-    0
+}
+
+/// Part of [`msg_lobby_state_game_package_inspect`]: the section for the lobby (mode 0): client teams, map votes, ready-up and the playlist.
+/// `ok` carries the result of the common fields, exactly as in the original, so a
+/// failed common field still runs the unconditional array calls below.
+///
+/// # Safety
+///
+/// As [`msg_lobby_state_package_inspect`].
+unsafe fn lobby_state_game_mode_0(g: &Game, this: *mut u8, lm: *mut c_void, ok: bool) -> i32 {
+    let mut ok = ok;
+    let w = |words: usize| at_words(this, words);
+    // SAFETY: every write lands inside the scratch buffer.
+    unsafe {
+        rw::array_start(g, lm, c"clientlist");
+        let mut index = 0usize;
+        let mut has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        while has_next && index < MAX_LOBBY_CLIENTS {
+            let client = w(9 * index);
+            ok = ok
+                && rw::int(g, lm, c"team", at_bytes(client, 28524))
+                && rw::int(g, lm, c"mapvote", at_bytes(client, 28528))
+                && rw::bool_(g, lm, c"readyup", at_bytes(client, 28532));
+            if !ok {
+                return 21;
+            }
+            index += 1;
+            has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        }
+        if has_next {
+            return 22;
+        }
+        ok = ok
+            && rw::int(g, lm, c"plistid", w(7126))
+            && rw::int(g, lm, c"plistcurr", w(7127))
+            && rw::glob(g, lm, c"plistentries", at_bytes(this, 28512), 8)
+            && rw::uchar(g, lm, c"plistnext", at_bytes(this, 28520))
+            && rw::uchar(g, lm, c"plistprev", at_bytes(this, 28521))
+            && rw::uchar(g, lm, c"plistprevcount", at_bytes(this, 28522));
+        if !ok {
+            return 5;
+        }
+        0
+    }
+}
+
+/// Part of [`msg_lobby_state_game_package_inspect`]: the section for pre-game (mode 1): votes, the client list and the settings size.
+/// `ok` carries the result of the common fields, exactly as in the original, so a
+/// failed common field still runs the unconditional array calls below.
+///
+/// # Safety
+///
+/// As [`msg_lobby_state_package_inspect`].
+unsafe fn lobby_state_game_mode_1(g: &Game, this: *mut u8, lm: *mut c_void, ok: bool) -> i32 {
+    let mut ok = ok;
+    let w = |words: usize| at_words(this, words);
+    // SAFETY: every write lands inside the scratch buffer.
+    unsafe {
+        ok = ok && rw::int(g, lm, c"votecount", w(5397));
+        rw::array_start(g, lm, c"votes");
+        let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
+            return 26;
+        };
+        let mut index = 0usize;
+        let mut has_next = rw::element(g, lm, index < votes);
+        while has_next && index < votes {
+            let vote = w(8 * index + 5398);
+            ok = ok
+                && rw::short(g, lm, c"itemtype", at_bytes(vote, 8))
+                && rw::uint(g, lm, c"item", at_bytes(vote, 12))
+                && rw::short(g, lm, c"itemgroup", at_bytes(vote, 16))
+                && rw::short(g, lm, c"attachment", at_bytes(vote, 20))
+                && rw::short(g, lm, c"votetype", at_bytes(vote, 24))
+                && rw::xuid(g, lm, c"votexuid", at_bytes(vote, 0));
+            if !ok {
+                return 6;
+            }
+            index += 1;
+            has_next = rw::element(g, lm, index < votes);
+        }
+        if has_next {
+            return 23;
+        }
+        rw::array_start(g, lm, c"clientlist");
+        index = 0;
+        has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        while has_next && index < MAX_LOBBY_CLIENTS {
+            let client = w(index + 8 * index + 7131);
+            ok = ok
+                && rw::int(g, lm, c"team", at_bytes(client, 0))
+                && rw::int(g, lm, c"pregamepos", at_bytes(client, 4))
+                && rw::int(g, lm, c"pregamestate", at_bytes(client, 3))
+                && rw::uint(g, lm, c"clvotecount", at_bytes(client, 6))
+                && rw::uint(g, lm, c"character", at_bytes(client, 7))
+                && rw::uint(g, lm, c"loadout", at_bytes(client, 8));
+            if !ok {
+                return 7;
+            }
+            index += 1;
+            has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        }
+        if has_next {
+            return 24;
+        }
+        // The original ignores `packageOK` after this point and returns 0.
+        if ok {
+            rw::int(g, lm, c"settingssize", w(7350));
+        }
+        let settings = i32_at(w(7350));
+        if settings <= 0 || settings > 0xC000 {
+            return 25;
+        }
+        0
+    }
+}
+
+/// Part of [`msg_lobby_state_game_package_inspect`]: the section for a competitive pre-game (mode 3): state, votes and the client list.
+/// `ok` carries the result of the common fields, exactly as in the original, so a
+/// failed common field still runs the unconditional array calls below.
+///
+/// # Safety
+///
+/// As [`msg_lobby_state_package_inspect`].
+unsafe fn lobby_state_game_mode_3(g: &Game, this: *mut u8, lm: *mut c_void, ok: bool) -> i32 {
+    let mut ok = ok;
+    let w = |words: usize| at_words(this, words);
+    // SAFETY: every write lands inside the scratch buffer.
+    unsafe {
+        ok = ok && rw::int(g, lm, c"compstate", w(5396)) && rw::int(g, lm, c"votecount", w(5397));
+        if !ok {
+            return 10;
+        }
+        let Some(votes) = checked_count(i32_at(w(5397)), MAX_LOBBY_VOTES) else {
+            return 27;
+        };
+        let mut index = 0usize;
+        let mut has_next = rw::element(g, lm, index < votes);
+        while has_next && index < votes {
+            let vote = w(8 * index + 5398);
+            ok = ok
+                && rw::short(g, lm, c"itemtype", at_bytes(vote, 8))
+                && rw::uint(g, lm, c"item", at_bytes(vote, 12))
+                && rw::short(g, lm, c"itemgroup", at_bytes(vote, 16))
+                && rw::short(g, lm, c"attachment", at_bytes(vote, 20))
+                && rw::short(g, lm, c"votetype", at_bytes(vote, 24))
+                && rw::xuid(g, lm, c"votexuid", at_bytes(vote, 0));
+            if !ok {
+                return 8;
+            }
+            index += 1;
+            has_next = rw::element(g, lm, index < votes);
+        }
+        if has_next {
+            return 28;
+        }
+        rw::array_start(g, lm, c"clientlist");
+        index = 0;
+        has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        while has_next && index < MAX_LOBBY_CLIENTS {
+            let client = w(index + 8 * index + 7131);
+            ok = ok
+                && rw::int(g, lm, c"team", at_bytes(client, 0))
+                && rw::int(g, lm, c"pregamepos", at_bytes(client, 4))
+                && rw::int(g, lm, c"pregamestate", at_bytes(client, 3))
+                && rw::uint(g, lm, c"clvotecount", at_bytes(client, 6))
+                && rw::uint(g, lm, c"character", at_bytes(client, 7))
+                && rw::uint(g, lm, c"loadout", at_bytes(client, 8));
+            if !ok {
+                return 9;
+            }
+            index += 1;
+            has_next = rw::element(g, lm, index < MAX_LOBBY_CLIENTS);
+        }
+        if has_next {
+            return 29;
+        }
+        0
+    }
 }
 
 /// Port of `MSG_HostHeartbeat_Inspect`. Returns 0 for a valid heartbeat.
