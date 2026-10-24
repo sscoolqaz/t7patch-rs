@@ -46,8 +46,9 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    single hooks, `ALL_HOOKS`, `apply_queued`, `remove_hook` and `uninitialize`:
    1. read each thread's context and compute its new RIP with the pure `plan_ip`
       (no writes);
-   2. `VirtualProtect` every patch range first, restoring them all if one fails,
-      then write the bytes, which can no longer fail;
+   2. `VirtualProtect` every page of every patch range first, one call per page,
+      journaling each page's original protection and restoring them all if one
+      fails, then write the bytes, which can no longer fail;
    3. write the moved contexts. If a write fails, the contexts already written get
       their original RIP back, the bytes are restored, the instruction cache is
       flushed, and `ThreadContext` is returned.
@@ -77,13 +78,24 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    result, after recording the hook state the image actually holds, and the
    trampoline buffers are retained. Every later hook change is refused with
    `ThreadResume`. Upstream ignored `ResumeThread` failures.
-10. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
+10. **Protection and flush failures are reported.** After the writes, every
+    journaled page is restored newest first (so a page two ranges share ends at its
+    original protection), each restore retried up to three times. Then every patch
+    range is flushed. Upstream saved one protection per range, which loses the
+    second page's protection when a range crosses pages that differ, and ignored
+    both `VirtualProtect` and `FlushInstructionCache` failures. A page that stays
+    changed sets `protection_lost()`; a failed flush sets `flush_failed()`. Both
+    are process-wide latches. The other pages and ranges are still restored and
+    flushed, and the call's result is unchanged: the hook change itself applied.
+11. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
    `fault` module. It can fail chosen calls to `OpenThread` (with a chosen last
-   error), `SuspendThread`, `Get/SetThreadContext` or `VirtualProtect`, fail the
+   error), `SuspendThread`, `Get/SetThreadContext`, `VirtualProtect` (making a page
+   writable and restoring it separately) or `FlushInstructionCache`, fail the
    resumes of one chosen thread, and force a no-op context write for every thread so
    the rollback path runs. Plans for different calls combine. A test resumes a
    thread the thaw left suspended itself (`fault::release_stuck`), which also clears
-   the latch; production code cannot clear it. Tests: `hook::tests`.
+   that latch; `fault::reset_latches` clears the other two. Production code cannot
+   clear any of them. Tests: `hook::tests`.
 
 ## Lint changes
 

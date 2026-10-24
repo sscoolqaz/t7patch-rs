@@ -187,9 +187,9 @@ const RESTORE_ATTEMPTS: usize = 3;
 /// lifecycle treats this as terminal: the image is left with a writable page.
 static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
 
-/// True once a page protection could not be restored.
+/// True once a page protection could not be restored, here or by the hooking library.
 pub(crate) fn protection_lost() -> bool {
-    PROTECTION_LOST.load(Ordering::Acquire)
+    PROTECTION_LOST.load(Ordering::Acquire) || min_hook_rs::protection_lost()
 }
 
 /// Changes page protections. A seam over `VirtualProtect` for tests.

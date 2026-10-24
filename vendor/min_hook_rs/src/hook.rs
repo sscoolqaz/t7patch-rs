@@ -44,6 +44,11 @@ const THREAD_ACCESS: u32 =
     THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT;
 /// How many times a failed `ResumeThread` is retried before the thread is declared stuck.
 const RESUME_ATTEMPTS: usize = 3;
+/// How many times a failed protection restore is retried.
+const RESTORE_ATTEMPTS: usize = 3;
+const PAGE_SIZE: usize = 0x1000;
+/// Most pages one patch range (at most 7 bytes) can touch.
+const MAX_PATCH_PAGES: usize = 2;
 
 /// Set once a frozen thread could not be resumed. Its handle is leaked on purpose
 /// and every later hook change is refused with [`HookError::ThreadResume`].
@@ -52,6 +57,22 @@ static THAW_FAILED: AtomicBool = AtomicBool::new(false);
 /// True once a freeze left a live thread suspended. Terminal for the process.
 pub fn thaw_failed() -> bool {
     THAW_FAILED.load(Ordering::Acquire)
+}
+
+/// Set once a patched page could not be returned to its original protection.
+static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
+
+/// True once a hook change left a page with a changed (writable) protection.
+pub fn protection_lost() -> bool {
+    PROTECTION_LOST.load(Ordering::Acquire)
+}
+
+/// Set once the instruction cache could not be flushed over a patch.
+static FLUSH_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// True once an instruction cache flush over a patch failed.
+pub fn flush_failed() -> bool {
+    FLUSH_FAILED.load(Ordering::Acquire)
 }
 
 /// Represents a single hook entry.
@@ -414,6 +435,63 @@ fn enumerate_threads() -> Result<Vec<u32>> {
     Ok(threads)
 }
 
+/// Makes every page of `[address, address + size)` writable, recording each
+/// original protection in `journal` as it is replaced. Each page gets its own call,
+/// so a range across two pages with different protections restores both. Returns
+/// `false` on failure, leaving the pages already changed in `journal`.
+fn make_writable(journal: &mut Vec<(usize, usize, u32)>, address: usize, size: usize) -> bool {
+    let end = address + size;
+    let mut page = address & !(PAGE_SIZE - 1);
+    while page < end {
+        let start = address.max(page);
+        let stop = end.min(page + PAGE_SIZE);
+        let mut old = 0u32;
+        // SAFETY: the range lies in the hooked, mapped function.
+        if !unsafe {
+            sys::protect(
+                start as *mut u8,
+                stop - start,
+                PAGE_EXECUTE_READWRITE,
+                &mut old,
+            )
+        } {
+            return false;
+        }
+        // Never grows: the journal holds MAX_PATCH_PAGES entries per batch entry.
+        journal.push((start, stop - start, old));
+        page += PAGE_SIZE;
+    }
+    true
+}
+
+/// Puts back every protection in `journal`, newest first, so a page that two patch
+/// ranges share ends with its original protection. Each restore is retried; a page
+/// that stays changed sets [`PROTECTION_LOST`]. The others are still restored.
+fn restore_protection(journal: &mut Vec<(usize, usize, u32)>) {
+    while let Some((start, size, old)) = journal.pop() {
+        let restored = (0..RESTORE_ATTEMPTS).any(|_| {
+            let mut ignored = 0u32;
+            // SAFETY: restores a protection this transaction changed on a mapped range.
+            unsafe { sys::restore_protect(start as *mut u8, size, old, &mut ignored) }
+        });
+        if !restored {
+            PROTECTION_LOST.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Flushes the instruction cache over every patch range in `batch`. A failure sets
+/// [`FLUSH_FAILED`]; the other ranges are still flushed.
+fn flush(hooks: &[HookEntry], batch: &[(usize, bool)]) {
+    for &(pos, _) in batch {
+        let (address, size) = hooks[pos].patch_range();
+        // SAFETY: flushes a mapped code range.
+        if !unsafe { sys::flush(address, size) } {
+            FLUSH_FAILED.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Syscalls the freeze depends on. Under `cfg(test)` each can be made to fail.
 mod sys {
     use super::*;
@@ -474,6 +552,29 @@ mod sys {
         unsafe { VirtualProtect(address as *mut c_void, size, new, old) != 0 }
     }
 
+    pub(super) unsafe fn restore_protect(
+        address: *mut u8,
+        size: usize,
+        new: u32,
+        old: &mut u32,
+    ) -> bool {
+        #[cfg(test)]
+        if fault::hit(fault::Call::Reprotect) {
+            return false;
+        }
+        // SAFETY: changes protection only; the caller passes a mapped range.
+        unsafe { VirtualProtect(address as *mut c_void, size, new, old) != 0 }
+    }
+
+    pub(super) unsafe fn flush(address: *mut u8, size: usize) -> bool {
+        #[cfg(test)]
+        if fault::hit(fault::Call::Flush) {
+            return false;
+        }
+        // SAFETY: the current process pseudo-handle is always valid.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), address as *const c_void, size) != 0 }
+    }
+
     /// Whether every suspended thread is given a (no-op) context write, so tests
     /// can reach the context-apply step without parking a thread in a hook.
     pub(super) fn force_moves() -> bool {
@@ -500,9 +601,11 @@ pub(crate) mod fault {
         GetContext,
         SetContext,
         Protect,
+        Reprotect,
+        Flush,
     }
 
-    const CALLS: usize = 5;
+    const CALLS: usize = 7;
     /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
     const MAX_STUCK: usize = 8;
 
@@ -557,6 +660,12 @@ pub(crate) mod fault {
         }
         super::THAW_FAILED.store(false, Ordering::Release);
         released
+    }
+
+    /// Clears the protection and flush latches.
+    pub(crate) fn reset_latches() {
+        super::PROTECTION_LOST.store(false, Ordering::Release);
+        super::FLUSH_FAILED.store(false, Ordering::Release);
     }
 
     pub(crate) fn clear() {
@@ -695,7 +804,8 @@ impl HookManager {
         let ids = enumerate_threads()?;
         // Allocate before freezing: a suspended thread may hold the heap lock.
         let mut moves: Vec<ThreadMove> = Vec::with_capacity(ids.len());
-        let mut protections: Vec<u32> = Vec::with_capacity(batch.len());
+        let mut journal: Vec<(usize, usize, u32)> =
+            Vec::with_capacity(batch.len() * MAX_PATCH_PAGES);
         let mut frozen = FrozenThreads::freeze(&ids)?;
         let hooks = &self.hooks.items;
 
@@ -723,16 +833,13 @@ impl HookManager {
             }
         }
 
-        // Step 2: unprotect every range first, so the byte writes cannot fail.
+        // Step 2: unprotect every page first, so the byte writes cannot fail.
         for &(pos, _) in batch {
             let (address, size) = hooks[pos].patch_range();
-            let mut old_protect = 0u32;
-            // SAFETY: the patch range lies in the hooked, mapped function.
-            if !unsafe { sys::protect(address, size, PAGE_EXECUTE_READWRITE, &mut old_protect) } {
-                Self::reprotect(hooks, batch, &protections);
+            if !make_writable(&mut journal, address as usize, size) {
+                restore_protection(&mut journal);
                 return Err(frozen.abort(HookError::MemoryProtect));
             }
-            protections.push(old_protect);
         }
         for &(pos, enable) in batch {
             // SAFETY: the range is writable and every other thread is frozen.
@@ -766,7 +873,8 @@ impl HookManager {
             break;
         }
 
-        Self::reprotect(hooks, batch, &protections);
+        restore_protection(&mut journal);
+        flush(hooks, batch);
         let thawed = frozen.thaw();
 
         // Record what the image now holds before reporting any error.
@@ -790,20 +898,6 @@ impl HookManager {
         }
         result?;
         Ok(clear)
-    }
-
-    /// Restores the protections saved for the first `protections.len()` batch entries,
-    /// in reverse so shared pages end with their original protection, then flushes.
-    fn reprotect(hooks: &[HookEntry], batch: &[(usize, bool)], protections: &[u32]) {
-        for (&(pos, _), &old) in batch.iter().zip(protections).rev() {
-            let (address, size) = hooks[pos].patch_range();
-            let mut ignored = 0u32;
-            // SAFETY: restores the protection this transaction changed on a mapped range.
-            unsafe {
-                VirtualProtect(address as *mut c_void, size, old, &mut ignored);
-                FlushInstructionCache(GetCurrentProcess(), address as *const c_void, size);
-            }
-        }
     }
 
     /// Builds the batch of hooks whose state differs from `want(hook)`.
@@ -1234,6 +1328,7 @@ mod tests {
             fault::clear();
             // A stranded spinner would hang the join below.
             fault::release_stuck();
+            fault::reset_latches();
             get_manager().lock().unwrap().retain_buffers = false;
             self.stop.store(true, Ordering::Relaxed);
             for thread in self.threads.drain(..) {
@@ -1479,5 +1574,82 @@ mod tests {
         fault::clear();
         fixture.assert_threads_run();
         enable_hook(target(mix_a)).expect("the change was rolled back");
+    }
+
+    #[test]
+    fn failed_protection_restore_is_reported_and_the_rest_restored() {
+        let fixture = Fixture::new();
+        // Every attempt to restore the newest journal entry fails.
+        fault::fail(Call::Reprotect, 0b111);
+        enable_hook(ALL_HOOKS).expect("the hooks are in; only a protection is left changed");
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(protection_lost());
+        assert!(!flush_failed());
+        assert!(hooked(mix_a) && hooked(mix_b));
+    }
+
+    #[test]
+    fn transient_protection_restore_failure_is_retried() {
+        let _fixture = Fixture::new();
+        fault::fail(Call::Reprotect, 0b1);
+        enable_hook(target(mix_a)).expect("enable");
+        assert!(!protection_lost());
+    }
+
+    #[test]
+    fn failed_flush_is_reported_on_its_own() {
+        let fixture = Fixture::new();
+        fault::fail(Call::Flush, 0b1);
+        enable_hook(ALL_HOOKS).expect("the hooks are in");
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(flush_failed());
+        assert!(!protection_lost());
+        assert!(hooked(mix_a) && hooked(mix_b));
+    }
+
+    #[test]
+    fn a_range_across_two_pages_restores_each_page() {
+        let _fixture = Fixture::new();
+        let mut journal = Vec::with_capacity(MAX_PATCH_PAGES);
+        // SAFETY: allocates two committed pages, read-only first and execute-read second.
+        let base = unsafe {
+            VirtualAlloc(
+                ptr::null(),
+                2 * PAGE_SIZE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READONLY,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let mut old = 0u32;
+        // SAFETY: the second page is part of the allocation above.
+        assert_ne!(
+            unsafe {
+                VirtualProtect(
+                    (base + PAGE_SIZE) as *mut c_void,
+                    PAGE_SIZE,
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                )
+            },
+            0
+        );
+        assert!(make_writable(&mut journal, base + PAGE_SIZE - 3, 7));
+        assert_eq!(journal.len(), 2);
+        restore_protection(&mut journal);
+        let protection = |address: usize| {
+            // SAFETY: zeroed MEMORY_BASIC_INFORMATION is valid; VirtualQuery fills it.
+            let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+            // SAFETY: `info` is a valid out-buffer of the size given.
+            unsafe { VirtualQuery(address as *const c_void, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        assert_eq!(protection(base), PAGE_READONLY);
+        assert_eq!(protection(base + PAGE_SIZE), PAGE_EXECUTE_READ);
+        assert!(!protection_lost());
+        // SAFETY: frees the allocation above.
+        unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
     }
 }

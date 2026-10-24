@@ -31,6 +31,12 @@ use min_hook_rs::{ALL_HOOKS, HookError};
 ///   change may have applied. Terminal: every later call is refused with it.
 pub type MinHookError = HookError;
 
+/// True once the hooking library could not flush the instruction cache over a patch.
+#[must_use]
+pub fn flush_failed() -> bool {
+    min_hook_rs::flush_failed()
+}
+
 /// Takes the patch transaction for one library call, or refuses once a freeze has
 /// left a thread suspended.
 fn transaction() -> Result<MutexGuard<'static, ()>, MinHookError> {

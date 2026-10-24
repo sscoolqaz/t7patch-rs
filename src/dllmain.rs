@@ -277,6 +277,9 @@ impl Operations for PatchOps {
         if crate::threads::thaw_failed() {
             failures.push("T7 Patch: a game thread could not be resumed".to_owned());
         }
+        if ffi::flush_failed() {
+            failures.push("T7 Patch: a hook's instruction cache flush failed".to_owned());
+        }
         let priority = ORIGINAL_PRIORITY.load(Ordering::Acquire);
         if priority != 0 {
             // SAFETY: the current process handle is a pseudo-handle.
