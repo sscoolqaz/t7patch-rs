@@ -13,6 +13,7 @@ pub mod arxan;
 pub mod build;
 pub mod campaign;
 pub mod crash_queue;
+pub mod diag;
 pub mod dllmain;
 pub mod exception;
 pub mod ffi;

@@ -19,7 +19,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{BOOL, PCSTR};
 
 use crate::lifecycle::{Lifecycle, Operations};
-use crate::{arxan, exception, ffi, gscu_hash, hooks, protection};
+use crate::{arxan, diag, exception, ffi, gscu_hash, hooks, protection};
 
 const DEFAULT_PLAYER_NAME: &[u8] = b"Unknown Soldier";
 const PATCH_KEY_PHRASE: &[u8] = b"serious_anticrash_2023";
@@ -49,7 +49,9 @@ static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 /// `protection` and the hook names below. Unset, everything is installed, as upstream
 /// does. `hooks` means every hook stage. To split it, `create` creates the `MinHook`
 /// detours without enabling them, `detours` creates and enables them, and `vmt` applies
-/// the lobby VMT hook, which is independent of the detours.
+/// the lobby VMT hook, which is independent of the detours. `trace` adds the
+/// diagnostic hook in [`crate::diag`]; it is not part of the default set, and it
+/// enables every hook that was created.
 /// Proton passes launch-option variables through to the game, so a component
 /// can be switched off without a rebuild.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +66,7 @@ struct Components {
     enable_hooks: bool,
     vmt_hook: bool,
     protection: bool,
+    trace: bool,
 }
 
 impl Components {
@@ -74,6 +77,7 @@ impl Components {
         enable_hooks: true,
         vmt_hook: true,
         protection: true,
+        trace: false,
     };
 
     /// Parses a `T7PATCH_ONLY` value. Unknown names are ignored. Enabled detours imply
@@ -93,6 +97,7 @@ impl Components {
             enable_hooks,
             vmt_hook: all_hooks || has("vmt"),
             protection: has("protection"),
+            trace: has("trace"),
         }
     }
 
@@ -131,13 +136,19 @@ impl Operations for PatchOps {
         }
         protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
 
-        if components.create_hooks && !HOOKS_PREPARED.load(Ordering::Acquire) {
+        if (components.create_hooks || components.trace) && !HOOKS_PREPARED.load(Ordering::Acquire)
+        {
             if !HOOK_LIB_INITIALIZED.load(Ordering::Acquire) {
                 ffi::initialize()
                     .map_err(|error| format!("T7 Patch: MinHook initialize failed: {error}"))?;
                 HOOK_LIB_INITIALIZED.store(true, Ordering::Release);
             }
-            hooks::create_hooks()?;
+            if components.create_hooks {
+                hooks::create_hooks()?;
+            }
+            if components.trace {
+                diag::create_trace_hook()?;
+            }
             HOOKS_PREPARED.store(true, Ordering::Release);
         }
         Ok(())
@@ -175,7 +186,7 @@ impl Operations for PatchOps {
         if components.vmt_hook {
             hooks::apply_vmt_hooks()?;
         }
-        if !components.enable_hooks {
+        if !components.enable_hooks && !components.trace {
             return Ok(());
         }
         // Enabling can fail after a subset of hooks is live, so mark them first.
@@ -382,6 +393,7 @@ mod tests {
             enable_hooks: false,
             vmt_hook: false,
             protection: false,
+            trace: false,
         };
         assert_eq!(
             Components::parse("dispatcher"),
@@ -427,6 +439,15 @@ mod tests {
         assert_eq!(
             Components::parse("arxan,dispatcher,protection,detours,vmt"),
             Components::ALL
+        );
+        assert_eq!(
+            Components::parse("arxan,dispatcher,protection,detours,trace"),
+            Components {
+                create_hooks: true,
+                enable_hooks: true,
+                trace: true,
+                ..base
+            }
         );
     }
 }
