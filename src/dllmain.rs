@@ -44,6 +44,59 @@ static HOOKS_MAY_BE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Process priority class before `activate`, or 0 when there is nothing to restore.
 static ORIGINAL_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
+/// Patch components for in-game diagnosis, chosen with the `T7PATCH_ONLY`
+/// environment variable: a comma-separated subset of `arxan`, `dispatcher`,
+/// `hooks` and `protection`. Unset, everything is installed, as upstream does.
+/// Proton passes launch-option variables through to the game, so a component
+/// can be switched off without a rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent on/off switch per patch component"
+)]
+struct Components {
+    arxan: bool,
+    dispatcher: bool,
+    hooks: bool,
+    protection: bool,
+}
+
+impl Components {
+    const ALL: Self = Self {
+        arxan: true,
+        dispatcher: true,
+        hooks: true,
+        protection: true,
+    };
+
+    /// Parses a `T7PATCH_ONLY` value. Unknown names are ignored.
+    fn parse(value: &str) -> Self {
+        let has = |name: &str| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(name))
+        };
+        Self {
+            arxan: has("arxan"),
+            dispatcher: has("dispatcher"),
+            hooks: has("hooks"),
+            protection: has("protection"),
+        }
+    }
+
+    fn current() -> Self {
+        static CURRENT: std::sync::OnceLock<Components> = std::sync::OnceLock::new();
+        *CURRENT.get_or_init(|| {
+            let components =
+                std::env::var("T7PATCH_ONLY").map_or(Self::ALL, |value| Self::parse(&value));
+            if components != Self::ALL {
+                debug_print(&format!("T7 Patch: diagnostic components {components:?}\n"));
+            }
+            components
+        })
+    }
+}
+
 /// Port of the fork's `PatchOperations`. Its state lives in the statics above, so every
 /// transition sees what earlier ones did.
 struct PatchOps;
@@ -54,7 +107,10 @@ impl Operations for PatchOps {
     }
 
     fn prepare(&mut self) -> Result<(), String> {
-        arxan::install()?;
+        let components = Components::current();
+        if components.arxan {
+            arxan::install()?;
+        }
         // SAFETY: runs inside the game process once its executable is mapped.
         unsafe { protection::initialize() }?;
         if protection::custom_name_is_empty() {
@@ -63,7 +119,7 @@ impl Operations for PatchOps {
         }
         protection::ZW_CONTINUE.store(exception::zw_continue_address(), Ordering::Relaxed);
 
-        if !HOOKS_PREPARED.load(Ordering::Acquire) {
+        if components.hooks && !HOOKS_PREPARED.load(Ordering::Acquire) {
             if !HOOK_LIB_INITIALIZED.load(Ordering::Acquire) {
                 ffi::initialize()
                     .map_err(|error| format!("T7 Patch: MinHook initialize failed: {error}"))?;
@@ -76,11 +132,17 @@ impl Operations for PatchOps {
     }
 
     fn install_dispatcher(&mut self) -> Result<(), String> {
+        if !Components::current().dispatcher {
+            return Ok(());
+        }
         // SAFETY: runs inside the game process, after ntdll is loaded.
         unsafe { exception::install() }
     }
 
     fn install_protection(&mut self) -> Result<(), String> {
+        if !Components::current().protection {
+            return Ok(());
+        }
         // SAFETY: `prepare` ran `protection::initialize` in this process.
         unsafe { protection::install() }?;
         hooks::apply_memory_patches()
@@ -97,6 +159,9 @@ impl Operations for PatchOps {
         unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) }
             .map_err(|_| "T7 Patch: cannot set process priority".to_owned())?;
 
+        if !Components::current().hooks {
+            return Ok(());
+        }
         hooks::apply_vmt_hooks()?;
         // Enabling can fail after a subset of hooks is live, so mark them first.
         HOOKS_MAY_BE_ENABLED.store(true, Ordering::Release);
@@ -104,6 +169,9 @@ impl Operations for PatchOps {
     }
 
     fn start_worker(&mut self) -> Result<(), String> {
+        if !Components::current().protection {
+            return Ok(());
+        }
         protection::start_worker()
     }
 
@@ -284,4 +352,36 @@ pub unsafe extern "system" fn DllMain(
         let _ = unsafe { DisableThreadLibraryCalls(module) };
     }
     BOOL(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_components_parse_a_subset() {
+        assert_eq!(
+            Components::parse("dispatcher"),
+            Components {
+                arxan: false,
+                dispatcher: true,
+                hooks: false,
+                protection: false
+            }
+        );
+        assert!(Components::parse(" Arxan , DISPATCHER,bogus").arxan);
+        assert_eq!(
+            Components::parse("arxan,dispatcher,hooks,protection"),
+            Components::ALL
+        );
+        assert_eq!(
+            Components::parse(""),
+            Components {
+                arxan: false,
+                dispatcher: false,
+                hooks: false,
+                protection: false
+            }
+        );
+    }
 }
