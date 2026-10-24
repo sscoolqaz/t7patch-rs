@@ -6,10 +6,12 @@
 //! `LobbyMsgRW_PackageUInt`. Runs 2, 9 and 11 crashed there on a NULL `data`
 //! with size 22 (`docs/in-game-findings.md`). Its callers are hidden behind
 //! Arxan-encoded stack values, so the hook logs the return address and
-//! arguments of the first few calls and of every call with NULL data.
+//! arguments of the first few calls and of every call with NULL data. With
+//! `trace` on, [`trace`] also logs decisions elsewhere, such as each verdict of
+//! `protection::check_pending_info_requests`.
 
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use windows::Win32::System::Diagnostics::Debug::{OutputDebugStringA, ReadProcessMemory};
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -30,6 +32,8 @@ const STACK_WORDS: usize = 12;
 /// which `AtomicUsize` is laid out as.
 static ORIG_TRACED: AtomicUsize = AtomicUsize::new(0);
 static CALLS: AtomicU32 = AtomicU32::new(0);
+/// Set once the trace hook exists, so other modules' [`trace`] lines are emitted.
+static TRACING: AtomicBool = AtomicBool::new(false);
 static NULL_CALLS: AtomicU32 = AtomicU32::new(0);
 
 // The detour. It keeps the four argument registers, passes them and the entry
@@ -178,6 +182,17 @@ extern "system" fn trace_call(rcx: u64, rdx: u64, r8: u64, r9: u64, entry_rsp: u
     line.emit();
 }
 
+/// Emits a trace line while `trace` is on; does nothing otherwise. Formats into a
+/// stack buffer, so it does not allocate on the game thread.
+pub fn trace(args: std::fmt::Arguments<'_>) {
+    if !TRACING.load(Ordering::Acquire) {
+        return;
+    }
+    let mut line = Line::new();
+    let _ = line.write_fmt(args);
+    line.emit();
+}
+
 /// Creates the trace hook. It is enabled with the other hooks.
 pub fn create_trace_hook() -> Result<(), String> {
     // SAFETY: the thunk preserves the traced function's arguments and stack and
@@ -190,6 +205,7 @@ pub fn create_trace_hook() -> Result<(), String> {
     }
     .map_err(|error| format!("T7 Patch: trace hook creation failed: {error}"))?;
     ORIG_TRACED.store(trampoline, Ordering::Release);
+    TRACING.store(true, Ordering::Release);
     debug_print("T7 Patch: trace hook on 0x1EEA130 created\n");
     Ok(())
 }

@@ -2587,23 +2587,43 @@ impl LobbyPairReader for LiveLobbies<'_> {
 /// raw message the game dispatched, forwarded unchanged to `dwInstantHandleLobbyMessage`
 /// exactly as the C++ does (`(char*)_msg`, which there is the raw payload pointer).
 pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mut c_char) -> bool {
+    // SAFETY: forwarded unchanged from the caller's contract.
+    let (drop, reason, detail) = unsafe { pending_info_decision(xuid, msg, payload) };
+    crate::diag::trace(format_args!(
+        "T7 Patch trace info-check: xuid={xuid:x} {} reason={reason} detail={detail}\n",
+        if drop { "DROP" } else { "keep" },
+    ));
+    drop
+}
+
+/// The decision `check_pending_info_requests` makes, with the reason it returned
+/// and a detail value (a size, a message type or a parser code) for the trace.
+///
+/// # Safety
+///
+/// As for [`check_pending_info_requests`].
+unsafe fn pending_info_decision(
+    xuid: i64,
+    msg: *mut Msg,
+    payload: *mut c_char,
+) -> (bool, &'static str, i64) {
     // SAFETY: `msg` is a live message, copied as the original does.
     let mut copy = unsafe { *msg };
     let size = copy.cursize.wrapping_sub(copy.readcount);
     let Ok(length) = i32::try_from(size) else {
-        return false;
+        return (false, "size", i64::from(size));
     };
     if size >= 2048 {
-        return false;
+        return (false, "size", i64::from(size));
     }
     let Some(g) = game() else {
-        return false;
+        return (false, "not-installed", 0);
     };
     let mut data = [0u8; 2048];
     // SAFETY: `data` is 2048 bytes and `length` is below 2048.
     unsafe { (g.msg_read_data)(&raw mut copy, data.as_mut_ptr().cast(), length) };
     if copy.overflowed {
-        return false;
+        return (false, "overflowed", i64::from(length));
     }
     // SAFETY: the zeroed message is a valid all-zero bit pattern (all integers and NetSrc value 0).
     let mut lobby_msg: LobbyMsg = unsafe { std::mem::zeroed() };
@@ -2611,7 +2631,7 @@ pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mu
     if !unsafe {
         (g.lobby_msg_rw_prep_read_data)(&raw mut lobby_msg, data.as_mut_ptr().cast(), length)
     } {
-        return false;
+        return (false, "prep-read-failed", i64::from(length));
     }
     if lobby_msg.msg_type == MSG_INFO_RESPONSE {
         // SAFETY: the zeroed response is a valid all-zero bit pattern.
@@ -2619,30 +2639,31 @@ pub unsafe fn check_pending_info_requests(xuid: i64, msg: *mut Msg, payload: *mu
         // SAFETY: `response` and `lobby_msg` are live locals.
         let result = unsafe { msg_info_response_safe(&raw mut response, &raw mut lobby_msg) };
         if result != 0 {
-            return true;
+            return (true, "info-response-rejected", i64::from(result));
         }
         // SAFETY: the handler gets the game's own payload pointer, as in the C++; only the
         // inspection above reads through the local `msg`.
         unsafe { (g.dw_instant_handle_lobby_message)(xuid, 0, payload) };
-        return true;
+        return (true, "info-response-handled", 0);
     }
 
     // SAFETY: reads the local player's XUID from the game's player data.
     let local = unsafe { local_player_xuid() };
+    let msg_type = i64::from(lobby_msg.msg_type);
     if xuid == 0 || xuid == local {
-        return false;
+        return (false, "local", msg_type);
     }
     if !IS_FRIENDS_ONLY.load(Ordering::Relaxed) {
-        return false;
+        return (false, "not-friends-only", msg_type);
     }
     if (AND_MASK & xuid) != EXPECTED_MASK {
-        return false;
+        return (false, "server-or-splitscreen", msg_type);
     }
     // SAFETY: the friends interface is mapped while Steam is loaded.
     if unsafe { is_friend_by_xuid_uncached(xuid) } {
-        return false;
+        return (false, "friend", msg_type);
     }
-    true
+    (true, "not-a-friend", msg_type)
 }
 
 /// Copies the 0x44-byte head of the game's lobby message into a local 0x50-byte buffer.
