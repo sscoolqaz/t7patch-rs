@@ -23,9 +23,11 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use windows_sys::Wdk::System::SystemInformation::{
+    NtQuerySystemInformation, SystemProcessInformation,
+};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::LibraryLoader::*;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
@@ -35,8 +37,13 @@ compile_error!("Hook module only supports x86_64 architecture");
 
 /// Initial capacity for the hook entry buffer.
 const INITIAL_HOOK_CAPACITY: usize = 32;
-/// Initial capacity for the thread ID buffer.
-const INITIAL_THREAD_CAPACITY: usize = 128;
+/// Upper bound on the threads one freeze may hold. A game process has far fewer.
+const MAX_THREADS: usize = 512;
+/// How many freeze attempts may be disturbed (a thread created during the freeze,
+/// or one whose suspension could not be confirmed) before the freeze is abandoned.
+const FREEZE_ATTEMPTS: usize = 16;
+/// Smallest process-information buffer; grown before the freeze when too small.
+const MIN_PROCESS_BUFFER: usize = 256 * 1024;
 /// Special value indicating an invalid hook position.
 const INVALID_HOOK_POS: usize = usize::MAX;
 /// Thread access rights for suspending/resuming threads.
@@ -274,55 +281,125 @@ struct FrozenThreads {
 }
 
 impl FrozenThreads {
-    /// Suspends every thread in `ids`. Fails closed: if any live thread of this
-    /// process cannot be opened or suspended, the threads already suspended are
+    /// Suspends every other thread of the process, verified against threads created
+    /// while the freeze runs. Fails closed: if any live thread cannot be opened or
+    /// suspended, or new threads keep appearing, the threads already suspended are
     /// resumed and an error is returned. A thread that has exited is skipped.
-    fn freeze(ids: &[u32]) -> Result<Self> {
+    fn freeze(list: &mut ThreadList) -> Result<Self> {
         // Allocate before suspending: a suspended thread may hold the heap lock.
         let mut frozen = Self {
-            handles: Vec::with_capacity(ids.len()),
-            active: true,
+            handles: Vec::with_capacity(MAX_THREADS),
+            active: false,
         };
-        if let Err(error) = frozen.suspend(ids) {
-            return Err(frozen.abort(error));
-        }
-        Ok(frozen)
-    }
-
-    fn suspend(&mut self, ids: &[u32]) -> Result<()> {
-        // SAFETY: plain Win32 calls on handles this function opens and owns.
-        unsafe {
-            let process_id = GetCurrentProcessId();
-            for &id in ids {
-                let handle = sys::open_thread(id);
-                if handle.is_null() {
-                    // The id no longer names a thread: it exited after the snapshot.
-                    if GetLastError() == ERROR_INVALID_PARAMETER {
-                        continue;
+        let mut seen = IdSet::new();
+        let mut gone = IdSet::new();
+        let mut fresh = IdSet::new();
+        let mut disturbed = HookError::ThreadSuspend;
+        for _attempt in 0..FREEZE_ATTEMPTS {
+            seen.clear();
+            gone.clear();
+            frozen.active = true;
+            match frozen.attempt(list, &mut seen, &mut gone, &mut fresh) {
+                Ok(None) => return Ok(frozen),
+                Ok(Some(error)) => {
+                    disturbed = error;
+                    if !frozen.thaw() {
+                        return Err(HookError::ThreadResume);
                     }
-                    return Err(HookError::ThreadSuspend);
+                    // Let a starting or exiting thread settle before retrying.
+                    // SAFETY: Sleep takes a plain duration.
+                    unsafe { Sleep(1) };
                 }
-                let owner = GetProcessIdOfThread(handle);
-                if owner != process_id {
-                    CloseHandle(handle);
-                    // A reused id now names another process's thread; ours exited.
-                    if owner != 0 {
-                        continue;
-                    }
-                    return Err(HookError::ThreadSuspend);
-                }
-                if !sys::suspend_thread(handle) {
-                    let exited = exited(handle);
-                    CloseHandle(handle);
-                    if exited {
-                        continue;
-                    }
-                    return Err(HookError::ThreadSuspend);
-                }
-                self.handles.push(handle);
+                Err(error) => return Err(frozen.abort(error)),
             }
         }
-        Ok(())
+        Err(disturbed)
+    }
+
+    // An enumeration is a snapshot, not a creation barrier: a thread not yet
+    // suspended can create another. One attempt suspends every thread of a
+    // snapshot, reads their contexts (which waits for `SuspendThread` to take
+    // effect), and enumerates again. A thread in the second list but not the first
+    // was created during the freeze. It is never suspended: under Wine a thread
+    // caught mid-startup may never reach its suspension, so reading its context
+    // hangs while every other thread is frozen. The attempt is thawed and retried
+    // instead. A thread whose context cannot be read, so its suspension is not
+    // confirmed, also retries: under Wine that happens to a thread that is
+    // starting or exiting. Returns the disturbance, or `None` once frozen.
+    //
+    // `gone` holds the ids whose thread had exited, which may still be listed on
+    // the second enumeration and are not new.
+    fn attempt(
+        &mut self,
+        list: &mut ThreadList,
+        seen: &mut IdSet,
+        gone: &mut IdSet,
+        fresh: &mut IdSet,
+    ) -> Result<Option<HookError>> {
+        fresh.clear();
+        list.enumerate(fresh)?;
+        #[cfg(test)]
+        fault::hide_threads(fresh);
+        for &id in fresh.as_slice() {
+            if self.open_suspend(id)? {
+                seen.insert(id)?;
+            } else {
+                gone.insert(id)?;
+            }
+        }
+        for &handle in &self.handles {
+            // SAFETY: `handle` is an open thread this freeze suspended.
+            if !unsafe { sys::synchronize(handle) } {
+                return Ok(Some(HookError::ThreadContext));
+            }
+        }
+        fresh.clear();
+        list.enumerate(fresh)?;
+        #[cfg(test)]
+        fault::hide_threads(fresh);
+        let settled = fresh
+            .as_slice()
+            .iter()
+            .all(|&id| seen.contains(id) || gone.contains(id));
+        Ok((!settled).then_some(HookError::ThreadSuspend))
+    }
+
+    /// Opens and suspends `id`. Returns `false` when the thread has already exited.
+    fn open_suspend(&mut self, id: u32) -> Result<bool> {
+        if self.handles.len() >= MAX_THREADS {
+            // Never grow while threads are suspended.
+            return Err(HookError::ThreadSuspend);
+        }
+        // SAFETY: plain Win32 calls on a handle this function opens and owns.
+        unsafe {
+            let handle = sys::open_thread(id);
+            if handle.is_null() {
+                // The id no longer names a thread: it exited after the enumeration.
+                if GetLastError() == ERROR_INVALID_PARAMETER {
+                    return Ok(false);
+                }
+                return Err(HookError::ThreadSuspend);
+            }
+            let owner = GetProcessIdOfThread(handle);
+            if owner != GetCurrentProcessId() {
+                CloseHandle(handle);
+                // A reused id now names another process's thread; ours exited.
+                if owner != 0 {
+                    return Ok(false);
+                }
+                return Err(HookError::ThreadSuspend);
+            }
+            if !sys::suspend_thread(handle) {
+                let exited = exited(handle);
+                CloseHandle(handle);
+                if exited {
+                    return Ok(false);
+                }
+                return Err(HookError::ThreadSuspend);
+            }
+            self.handles.push(handle);
+        }
+        Ok(true)
     }
 
     /// Thaws after `error` and returns the error to report: `error` itself, or
@@ -393,46 +470,163 @@ fn exited(handle: HANDLE) -> bool {
     read && exit_code != STILL_ACTIVE.cast_unsigned()
 }
 
-/// Enumerates all threads in the current process except the current thread.
-fn enumerate_threads() -> Result<Vec<u32>> {
-    let mut threads = Vec::with_capacity(INITIAL_THREAD_CAPACITY);
-    // SAFETY: Toolhelp calls on a snapshot handle this function owns.
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(HookError::ThreadSuspend);
-        }
-        let mut te = THREADENTRY32 {
-            dwSize: size_of::<THREADENTRY32>() as u32,
-            cntUsage: 0,
-            th32ThreadID: 0,
-            th32OwnerProcessID: 0,
-            tpBasePri: 0,
-            tpDeltaPri: 0,
-            dwFlags: 0,
-        };
-        let mut succeeded = false;
-        if Thread32First(snapshot, &mut te) != 0 {
-            loop {
-                if te.dwSize >= 16
-                    && te.th32OwnerProcessID == GetCurrentProcessId()
-                    && te.th32ThreadID != GetCurrentThreadId()
-                {
-                    threads.push(te.th32ThreadID);
-                }
-                te.dwSize = size_of::<THREADENTRY32>() as u32;
-                if Thread32Next(snapshot, &mut te) == 0 {
-                    break;
-                }
-            }
-            succeeded = GetLastError() == ERROR_NO_MORE_FILES;
-        }
-        CloseHandle(snapshot);
-        if !succeeded {
-            return Err(HookError::ThreadSuspend);
+/// A fixed-capacity, duplicate-free set of thread ids. Never allocates.
+struct IdSet {
+    ids: [u32; MAX_THREADS],
+    len: usize,
+}
+
+impl IdSet {
+    const fn new() -> Self {
+        Self {
+            ids: [0; MAX_THREADS],
+            len: 0,
         }
     }
-    Ok(threads)
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.ids[..self.len]
+    }
+
+    fn contains(&self, id: u32) -> bool {
+        self.as_slice().contains(&id)
+    }
+
+    /// Adds `id` unless it is already present.
+    fn insert(&mut self, id: u32) -> Result<()> {
+        if self.contains(id) {
+            return Ok(());
+        }
+        if self.len >= MAX_THREADS {
+            return Err(HookError::ThreadSuspend);
+        }
+        self.ids[self.len] = id;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+/// Lists this process's threads through `NtQuerySystemInformation`, into a buffer
+/// sized before the freeze, so enumerating again while threads are suspended does
+/// not allocate. Toolhelp is not used: Wine's `CreateToolhelp32Snapshot` allocates
+/// from the process heap, which a suspended thread may hold locked.
+struct ThreadList {
+    process_id: u32,
+    current_thread: u32,
+    /// `SYSTEM_PROCESS_INFORMATION` buffer, 8-byte aligned.
+    buffer: Vec<u64>,
+}
+
+impl ThreadList {
+    /// Sizes the buffer with headroom. Allocates, so it runs before any freeze.
+    fn new() -> Result<Self> {
+        // SAFETY: both queries take no arguments and cannot fail.
+        let (process_id, current_thread) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
+        let mut bytes = MIN_PROCESS_BUFFER;
+        for _attempt in 0..8 {
+            let mut buffer = vec![0u64; bytes / 8];
+            let mut needed = 0u32;
+            let status = query_processes(&mut buffer, &mut needed);
+            if status >= 0 {
+                // Leave room for threads created before the freeze queries again.
+                let used = usize::try_from(needed).unwrap_or(bytes);
+                if used.saturating_mul(2) > bytes {
+                    buffer = vec![0u64; used.saturating_mul(2).div_ceil(8)];
+                }
+                return Ok(Self {
+                    process_id,
+                    current_thread,
+                    buffer,
+                });
+            }
+            if status != STATUS_INFO_LENGTH_MISMATCH {
+                return Err(HookError::ThreadSuspend);
+            }
+            bytes = usize::try_from(needed)
+                .unwrap_or(0)
+                .max(bytes)
+                .saturating_mul(2);
+        }
+        Err(HookError::ThreadSuspend)
+    }
+
+    /// Fills `ids` with every thread of this process except the caller.
+    fn enumerate(&mut self, ids: &mut IdSet) -> Result<()> {
+        let mut needed = 0u32;
+        if query_processes(&mut self.buffer, &mut needed) < 0 {
+            return Err(HookError::ThreadSuspend);
+        }
+        // SAFETY: the buffer is a live `Vec<u64>`, so its bytes are initialized.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), self.buffer.len() * 8)
+        };
+        parse_process_threads(bytes, self.process_id, self.current_thread, ids)
+    }
+}
+
+fn query_processes(buffer: &mut [u64], needed: &mut u32) -> NTSTATUS {
+    let length = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
+    // SAFETY: `buffer` is writable for `length` bytes and `needed` is a valid out-pointer.
+    unsafe {
+        NtQuerySystemInformation(
+            SystemProcessInformation,
+            buffer.as_mut_ptr().cast(),
+            length,
+            needed,
+        )
+    }
+}
+
+// x64 `SYSTEM_PROCESS_INFORMATION` and `SYSTEM_THREAD_INFORMATION` layout.
+const PROCESS_NEXT_OFFSET: usize = 0x00;
+const PROCESS_THREAD_COUNT: usize = 0x04;
+const PROCESS_ID: usize = 0x50;
+const PROCESS_ENTRY_SIZE: usize = 0x100;
+const THREAD_ENTRY_SIZE: usize = 0x50;
+const THREAD_CLIENT_ID_THREAD: usize = 0x30;
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let slice = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes(slice.try_into().ok()?))
+}
+
+/// Collects the thread ids of `process_id`, except `skip`, from a
+/// `SystemProcessInformation` buffer. Every read is bounds-checked.
+fn parse_process_threads(bytes: &[u8], process_id: u32, skip: u32, ids: &mut IdSet) -> Result<()> {
+    let invalid = HookError::ThreadSuspend;
+    let mut offset = 0usize;
+    loop {
+        let next = read_u32(bytes, offset + PROCESS_NEXT_OFFSET).ok_or(invalid)?;
+        let count = read_u32(bytes, offset + PROCESS_THREAD_COUNT).ok_or(invalid)?;
+        let pid = read_u64(bytes, offset + PROCESS_ID).ok_or(invalid)?;
+        if pid == u64::from(process_id) {
+            let count = usize::try_from(count).map_err(|_| invalid)?;
+            for index in 0..count {
+                let entry = offset + PROCESS_ENTRY_SIZE + index * THREAD_ENTRY_SIZE;
+                let tid = read_u64(bytes, entry + THREAD_CLIENT_ID_THREAD).ok_or(invalid)?;
+                let tid = u32::try_from(tid).map_err(|_| invalid)?;
+                if tid != skip {
+                    ids.insert(tid)?;
+                }
+            }
+            return Ok(());
+        }
+        if next == 0 {
+            return Err(invalid);
+        }
+        offset = offset
+            .checked_add(usize::try_from(next).map_err(|_| invalid)?)
+            .ok_or(invalid)?;
+    }
 }
 
 /// Makes every page of `[address, address + size)` writable, recording each
@@ -534,6 +728,18 @@ mod sys {
         unsafe { GetThreadContext(handle, &mut context.0) != 0 }
     }
 
+    /// Reads a newly suspended thread's context, which waits until the suspension
+    /// has taken effect.
+    pub(super) unsafe fn synchronize(handle: HANDLE) -> bool {
+        #[cfg(test)]
+        if fault::hit(fault::Call::Synchronize) {
+            return false;
+        }
+        let mut context = AlignedContext::control();
+        // SAFETY: the caller passes an open, suspended thread; the buffer is aligned.
+        unsafe { GetThreadContext(handle, &mut context.0) != 0 }
+    }
+
     pub(super) unsafe fn set_context(handle: HANDLE, context: &AlignedContext) -> bool {
         #[cfg(test)]
         if fault::hit(fault::Call::SetContext) {
@@ -603,9 +809,12 @@ pub(crate) mod fault {
         Protect,
         Reprotect,
         Flush,
+        Synchronize,
     }
 
-    const CALLS: usize = 7;
+    const CALLS: usize = 8;
+    /// Most freeze rounds a hide schedule covers.
+    const MAX_ROUNDS: usize = 2 * super::FREEZE_ATTEMPTS;
     /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
     const MAX_STUCK: usize = 8;
 
@@ -619,6 +828,30 @@ pub(crate) mod fault {
         static STICK: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
         /// Handles the thaw left suspended, for the test to resume itself.
         static STUCK: Cell<[usize; MAX_STUCK]> = const { Cell::new([0; MAX_STUCK]) };
+        /// Per freeze round, how many trailing ids the enumeration hides, so a thread
+        /// seems to appear in a later round. And how many rounds have run.
+        static HIDE: Cell<([u8; MAX_ROUNDS], usize)> = const { Cell::new(([0; MAX_ROUNDS], 0)) };
+    }
+
+    /// Hides `schedule[round]` trailing ids from each freeze round's enumeration.
+    pub(crate) fn hide(schedule: &[u8]) {
+        let mut rounds = [0; MAX_ROUNDS];
+        rounds[..schedule.len()].copy_from_slice(schedule);
+        HIDE.with(|hide| hide.set((rounds, 0)));
+    }
+
+    /// How many freeze rounds have run since the last [`hide`] or [`clear`].
+    pub(crate) fn rounds() -> usize {
+        HIDE.with(|hide| hide.get().1)
+    }
+
+    pub(super) fn hide_threads(ids: &mut super::IdSet) {
+        HIDE.with(|hide| {
+            let (schedule, round) = hide.get();
+            let count = schedule.get(round).copied().unwrap_or(0);
+            ids.len = ids.len.saturating_sub(usize::from(count));
+            hide.set((schedule, round + 1));
+        });
     }
 
     /// Fails the calls to `call` whose zero-based index is set in `mask`. Plans for
@@ -673,6 +906,7 @@ pub(crate) mod fault {
         OPEN_ERROR.with(|value| value.set(5));
         FORCE_MOVES.with(|value| value.set(false));
         STICK.with(|stick| stick.set((0, 0)));
+        HIDE.with(|hide| hide.set(([0; MAX_ROUNDS], 0)));
     }
 
     pub(super) fn hit(call: Call) -> bool {
@@ -801,12 +1035,12 @@ impl HookManager {
         if batch.is_empty() && watch.is_empty() {
             return Ok(true);
         }
-        let ids = enumerate_threads()?;
         // Allocate before freezing: a suspended thread may hold the heap lock.
-        let mut moves: Vec<ThreadMove> = Vec::with_capacity(ids.len());
+        let mut list = ThreadList::new()?;
+        let mut moves: Vec<ThreadMove> = Vec::with_capacity(MAX_THREADS);
         let mut journal: Vec<(usize, usize, u32)> =
             Vec::with_capacity(batch.len() * MAX_PATCH_PAGES);
-        let mut frozen = FrozenThreads::freeze(&ids)?;
+        let mut frozen = FrozenThreads::freeze(&mut list)?;
         let hooks = &self.hooks.items;
 
         // Step 1: read contexts and plan the moves.
@@ -1252,7 +1486,11 @@ mod tests {
     /// A fault mask hitting the last thread the freeze visits, so every other
     /// thread (spinners included) is suspended first and must be resumed.
     fn last_thread() -> u64 {
-        1 << (enumerate_threads().expect("enumerate").len() - 1)
+        let mut ids = IdSet::new();
+        ThreadList::new()
+            .and_then(|mut list| list.enumerate(&mut ids))
+            .expect("enumerate");
+        1 << (ids.len - 1)
     }
 
     fn retain_buffers() -> bool {
@@ -1403,6 +1641,8 @@ mod tests {
         fault::open_error(ERROR_INVALID_PARAMETER);
         fault::fail(Call::OpenThread, 0b1);
         enable_hook(target(mix_a)).expect("an exited thread does not block the freeze");
+        // Still listed on the check, but known gone, so not taken for a new thread.
+        assert_eq!(fault::rounds(), 2);
         assert!(hooked(mix_a));
     }
 
@@ -1651,5 +1891,103 @@ mod tests {
         assert!(!protection_lost());
         // SAFETY: frees the allocation above.
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_thread_that_appears_during_the_freeze_restarts_it() {
+        let fixture = Fixture::new();
+        // The first snapshot misses one thread; the check after suspending finds
+        // it, so the attempt is thawed and a second one sees every thread.
+        fault::hide(&[1]);
+        enable_hook(target(mix_a)).expect("enable");
+        assert_eq!(fault::rounds(), 4);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(hooked(mix_a));
+    }
+
+    #[test]
+    fn threads_that_keep_appearing_abandon_the_freeze() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        // Every attempt's check finds a thread its snapshot missed.
+        fault::hide(&[1, 0].repeat(FREEZE_ATTEMPTS));
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadSuspend));
+        assert_eq!(fault::rounds(), 2 * FREEZE_ATTEMPTS);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert_eq!(bytes(mix_a), before);
+        enable_hook(target(mix_a)).expect("retry");
+    }
+
+    #[test]
+    fn unconfirmed_suspension_is_retried() {
+        let fixture = Fixture::new();
+        fault::fail(Call::Synchronize, 0b1);
+        enable_hook(target(mix_a)).expect("the second attempt confirms every suspension");
+        assert_eq!(fault::rounds(), 3);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert!(hooked(mix_a));
+    }
+
+    #[test]
+    fn suspension_that_is_never_confirmed_patches_nothing() {
+        let fixture = Fixture::new();
+        let before = bytes(mix_a);
+        fault::fail(Call::Synchronize, u64::MAX);
+        assert_eq!(enable_hook(target(mix_a)), Err(HookError::ThreadContext));
+        assert_eq!(fault::rounds(), FREEZE_ATTEMPTS);
+        fault::clear();
+        fixture.assert_threads_run();
+        assert_eq!(bytes(mix_a), before);
+    }
+
+    #[test]
+    fn id_set_is_bounded_and_deduplicates() {
+        let mut set = IdSet::new();
+        set.insert(9).unwrap();
+        set.insert(9).unwrap();
+        assert_eq!(set.as_slice(), &[9]);
+        for id in 0..u32::try_from(MAX_THREADS).unwrap() - 1 {
+            set.insert(1000 + id).unwrap();
+        }
+        assert_eq!(set.insert(9), Ok(()));
+        assert_eq!(set.insert(1), Err(HookError::ThreadSuspend));
+    }
+
+    fn process_entry(next: u32, pid: u64, tids: &[u64]) -> Vec<u8> {
+        let mut entry = vec![0u8; PROCESS_ENTRY_SIZE + tids.len() * THREAD_ENTRY_SIZE];
+        entry[0..4].copy_from_slice(&next.to_le_bytes());
+        entry[4..8].copy_from_slice(&u32::try_from(tids.len()).unwrap().to_le_bytes());
+        entry[PROCESS_ID..PROCESS_ID + 8].copy_from_slice(&pid.to_le_bytes());
+        for (index, tid) in tids.iter().enumerate() {
+            let at = PROCESS_ENTRY_SIZE + index * THREAD_ENTRY_SIZE + THREAD_CLIENT_ID_THREAD;
+            entry[at..at + 8].copy_from_slice(&tid.to_le_bytes());
+        }
+        entry
+    }
+
+    #[test]
+    fn parses_the_own_process_and_skips_the_caller() {
+        let next = u32::try_from(PROCESS_ENTRY_SIZE + THREAD_ENTRY_SIZE).unwrap();
+        let mut buffer = process_entry(next, 3, &[1]);
+        buffer.extend_from_slice(&process_entry(0, 77, &[10, 11, 12]));
+        let mut ids = IdSet::new();
+        parse_process_threads(&buffer, 77, 11, &mut ids).unwrap();
+        assert_eq!(ids.as_slice(), &[10, 12]);
+    }
+
+    #[test]
+    fn missing_process_or_truncated_buffer_is_an_error() {
+        let buffer = process_entry(0, 3, &[1]);
+        let mut ids = IdSet::new();
+        let invalid = Err(HookError::ThreadSuspend);
+        assert_eq!(parse_process_threads(&buffer, 77, 0, &mut ids), invalid);
+        let full = process_entry(0, 77, &[1, 2]);
+        let truncated = &full[..PROCESS_ENTRY_SIZE + THREAD_ENTRY_SIZE + THREAD_CLIENT_ID_THREAD];
+        assert_eq!(parse_process_threads(truncated, 77, 0, &mut ids), invalid);
+        let looping = process_entry(u32::MAX, 3, &[]);
+        assert_eq!(parse_process_threads(&looping, 77, 0, &mut ids), invalid);
     }
 }

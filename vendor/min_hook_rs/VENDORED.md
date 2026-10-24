@@ -12,6 +12,7 @@
 
 - `Cargo.toml` is upstream's `Cargo.toml.orig`, minus its `[profile.release]`
   section (profiles of a non-root package are ignored and Cargo warns about them).
+  It adds the `Wdk_System_SystemInformation` feature of `windows-sys` for patch 9.
 - The registry files `.cargo-ok`, `.cargo_vcs_info.json`, `.gitignore` and
   `Cargo.lock` are not copied.
 
@@ -22,11 +23,11 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
 1. **Error codes.** `HookError::ThreadSuspend` (13), `HookError::ThreadContext`
    (14) and `HookError::ThreadResume` (15) are new, with `as_str` and `from_code`
    entries. Codes 1 to 12 still match `MH_STATUS`.
-2. **Fail-closed freeze.** `FrozenThreads::freeze` suspends every enumerated thread
-   or none. If `OpenThread` or `SuspendThread` fails for a live thread of this
-   process, the threads already suspended are resumed and `ThreadSuspend` is
+2. **Fail-closed freeze.** `FrozenThreads::freeze` suspends every thread of the
+   process or none. If `OpenThread` or `SuspendThread` fails for a live thread of
+   this process, the threads already suspended are resumed and `ThreadSuspend` is
    returned. Upstream zeroed the failed entry and reported success. A failed
-   Toolhelp snapshot also returns `ThreadSuspend` (upstream: `MemoryAlloc`).
+   enumeration also returns `ThreadSuspend` (upstream: `MemoryAlloc`).
    Three cases are skipped as "thread is gone", because a thread that no longer
    exists cannot be parked in a patched range:
    - `OpenThread` fails with `ERROR_INVALID_PARAMETER` (the id no longer exists);
@@ -69,7 +70,28 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    are kept, and `retain_buffers` stays set so later calls never free them either.
    On error, `remove_hook` keeps the hook and `uninitialize` stays initialized with
    its hooks intact.
-9. **Resume failures are terminal.** `FrozenThreads::thaw` resumes each thread
+9. **Threads created during the freeze are caught.** Upstream enumerated once
+   with Toolhelp, so a thread created after the snapshot kept running while code
+   was patched. Now each freeze attempt suspends every thread of a snapshot, reads
+   their contexts (which waits for `SuspendThread` to take effect), and enumerates
+   again. If the second list has a thread the first did not, the attempt is thawed
+   and retried after a 1 ms pause. That thread is never suspended: under Wine a
+   thread caught mid-startup may never reach its suspension, and reading its
+   context then hangs with every other thread frozen. (Suspending such threads
+   deadlocked the T7Patch-rs test binary in 4 of 6 runs.) An attempt whose context
+   read fails is retried the same way, since under Wine that happens to a thread
+   that is starting or exiting. An id whose thread had exited may still be listed,
+   so it is not counted as new. After 16 disturbed attempts the freeze gives up
+   with `ThreadSuspend`, or `ThreadContext` if the last one failed a context read.
+   Enumeration uses `NtQuerySystemInformation(SystemProcessInformation)` into a
+   buffer sized with headroom before the freeze, and ids go into fixed arrays, so
+   nothing allocates while threads are suspended. Toolhelp is not used: Wine's
+   `CreateToolhelp32Snapshot` allocates from the process heap, which a suspended
+   thread may hold locked. Every buffer is sized for 512 threads before the first
+   suspension; more fails closed. The enumeration and the parser are ports of
+   `src/threads.rs` in T7Patch-rs. This needs the `Wdk_System_SystemInformation`
+   feature of `windows-sys`.
+10. **Resume failures are terminal.** `FrozenThreads::thaw` resumes each thread
    once, retrying a failed `ResumeThread` up to three times; a thread that has
    exited counts as resumed. Every error path thaws explicitly, and drop thaws as a
    safety net, so nothing is resumed twice. A thread that stays suspended keeps its
@@ -78,7 +100,7 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    result, after recording the hook state the image actually holds, and the
    trampoline buffers are retained. Every later hook change is refused with
    `ThreadResume`. Upstream ignored `ResumeThread` failures.
-10. **Protection and flush failures are reported.** After the writes, every
+11. **Protection and flush failures are reported.** After the writes, every
     journaled page is restored newest first (so a page two ranges share ends at its
     original protection), each restore retried up to three times. Then every patch
     range is flushed. Upstream saved one protection per range, which loses the
@@ -87,12 +109,14 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
     changed sets `protection_lost()`; a failed flush sets `flush_failed()`. Both
     are process-wide latches. The other pages and ranges are still restored and
     flushed, and the call's result is unchanged: the hook change itself applied.
-11. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
+12. **Test seam.** Under `cfg(test)`, the `sys` wrappers consult the per-thread
    `fault` module. It can fail chosen calls to `OpenThread` (with a chosen last
-   error), `SuspendThread`, `Get/SetThreadContext`, `VirtualProtect` (making a page
+   error), `SuspendThread`, the context read that synchronizes a new suspension,
+   `Get/SetThreadContext`, `VirtualProtect` (making a page
    writable and restoring it separately) or `FlushInstructionCache`, fail the
    resumes of one chosen thread, and force a no-op context write for every thread so
-   the rollback path runs. Plans for different calls combine. A test resumes a
+   the rollback path runs. It can also hide trailing ids from chosen enumerations,
+   so a thread seems to appear mid-freeze. Plans for different calls combine. A test resumes a
    thread the thaw left suspended itself (`fault::release_stuck`), which also clears
    that latch; `fault::reset_latches` clears the other two. Production code cannot
    clear any of them. Tests: `hook::tests`.
@@ -112,9 +136,10 @@ removed. Neither changes behaviour.
 
 ## Known limits
 
-- Threads created after the Toolhelp snapshot are not frozen (unchanged from upstream).
 - A thread left suspended by a failed resume may hold the process heap lock. The
   vectors dropped after the thaw, and the caller formatting the error, may then
-  deadlock. `src/threads.rs` in T7Patch-rs has the same exposure.
+  deadlock. `src/threads.rs` in T7Patch-rs has the same exposure. Wine's
+  `NtQuerySystemInformation` may allocate on its Unix side, from an allocator a
+  suspended thread could hold (not verified); `src/threads.rs` shares that too.
 - Only RIP is checked (unchanged from upstream). A return address into a trampoline (from a relocated
   `call` in the prologue) on some thread's stack is not detected.
