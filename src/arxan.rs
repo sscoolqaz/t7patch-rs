@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use windows::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+use windows::Win32::System::Diagnostics::Debug::{FlushInstructionCache, IMAGE_SECTION_HEADER};
 use windows::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS, VirtualProtect, VirtualQuery,
 };
@@ -506,27 +506,26 @@ pub(crate) unsafe fn restore_usize(slot: usize, ours: usize, original: usize) ->
 unsafe fn find_pattern_in_executable_image(image_base: usize, pattern: &[u8]) -> Vec<usize> {
     let mut matches = Vec::new();
     // SAFETY: the main module's DOS and NT headers are mapped in the game process.
-    let (image_size, sections) = unsafe {
+    let (image_size, table, count) = unsafe {
         let dos = &*(image_base as *const windows::Win32::System::SystemServices::IMAGE_DOS_HEADER);
         let nt_offset = usize::try_from(dos.e_lfanew).unwrap_or_default();
         let nt = &*((image_base + nt_offset)
             as *const windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
         let optional = (&raw const nt.OptionalHeader).cast::<u8>();
-        #[allow(
-            clippy::cast_ptr_alignment,
-            reason = "the section table follows the 8-byte aligned optional header"
-        )]
-        let first = optional
-            .add(nt.FileHeader.SizeOfOptionalHeader as usize)
-            .cast::<windows::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER>();
-        let count = nt.FileHeader.NumberOfSections as usize;
         (
             nt.OptionalHeader.SizeOfImage as usize,
-            std::slice::from_raw_parts(first, count),
+            // The section table follows the optional header.
+            optional.add(nt.FileHeader.SizeOfOptionalHeader as usize),
+            nt.FileHeader.NumberOfSections as usize,
         )
     };
 
-    for section in sections {
+    for index in 0..count {
+        let offset = index * size_of::<IMAGE_SECTION_HEADER>();
+        // SAFETY: the section table holds `count` headers after the optional header, in
+        // the mapped image. Each is copied out unaligned, so no alignment is assumed.
+        let section: IMAGE_SECTION_HEADER =
+            unsafe { std::ptr::read_unaligned(table.add(offset).cast()) };
         let virtual_address = section.VirtualAddress as usize;
         if section.Characteristics.0 & IMAGE_SCN_MEM_EXECUTE == 0 || virtual_address >= image_size {
             continue;
