@@ -161,12 +161,6 @@ impl HookEntry {
         }
     }
 
-    /// Returns true if `ip` lies in the hook's trampoline slot, which also holds the relay.
-    fn slot_contains(&self, ip: usize) -> bool {
-        let start = self.trampoline as usize;
-        ip >= start && ip < start + MEMORY_SLOT_SIZE
-    }
-
     /// Writes the jump (`enable`) or the original prologue (`!enable`).
     ///
     /// # Safety
@@ -260,12 +254,167 @@ fn plan_ip(hooks: &[HookEntry], batch: &[(usize, bool)], ip: usize) -> usize {
 struct AlignedContext(CONTEXT);
 
 impl AlignedContext {
-    fn control() -> Self {
+    /// A buffer for the one context read per frozen thread: the control registers,
+    /// which a move rewrites, and the integer registers, which the slot check reads.
+    fn captured() -> Self {
         // SAFETY: `CONTEXT` is plain data; all-zero is a valid value.
         let mut context = Self(unsafe { std::mem::zeroed::<CONTEXT>() });
-        context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+        context.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
         context
     }
+
+    /// A copy of a captured context that resumes at `ip` and writes back only the
+    /// control registers, as a move always did. The integer registers are left alone.
+    fn moved_to(&self, ip: u64) -> Self {
+        let mut context = *self;
+        context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+        context.0.Rip = ip;
+        context
+    }
+}
+
+/// Most bytes of one thread's stack the slot check reads. A larger span counts as
+/// unknown, so the slot is kept rather than scanned in part.
+const MAX_STACK_SCAN_BYTES: usize = 64 * 1024 * 1024;
+/// Most stack bytes one transaction reads across every thread, so the time threads
+/// stay frozen is bounded. Past it the remaining threads count as unknown.
+const MAX_TOTAL_SCAN_BYTES: usize = 256 * 1024 * 1024;
+/// Words the stack scan reads at a time, into a fixed buffer.
+const STACK_CHUNK_WORDS: usize = 64;
+
+/// The trampoline slots a transaction may free, sorted. Built before the freeze.
+struct SlotSet {
+    starts: Vec<usize>,
+    /// A slot whose end overflows the address space: nothing can be proven about it.
+    malformed: bool,
+}
+
+impl SlotSet {
+    /// Allocates, so it runs before any thread is suspended.
+    fn new(starts: impl Iterator<Item = usize>) -> Self {
+        let mut starts: Vec<usize> = starts.collect();
+        starts.sort_unstable();
+        let malformed = starts
+            .iter()
+            .any(|&start| start.checked_add(MEMORY_SLOT_SIZE).is_none());
+        Self { starts, malformed }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// True when `address` lies in `[start, start + MEMORY_SLOT_SIZE)` of a slot.
+    fn contains(&self, address: usize) -> bool {
+        // The last slot starting at or below `address`.
+        let after = self.starts.partition_point(|&start| start <= address);
+        after > 0 && address - self.starts[after - 1] < MEMORY_SLOT_SIZE
+    }
+
+    fn contains_word(&self, word: u64) -> bool {
+        usize::try_from(word).is_ok_and(|address| self.contains(address))
+    }
+}
+
+/// How a frozen thread may still reach a slot. Anything but `Clear` keeps the slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    Clear,
+    /// Its instruction pointer, once moved, lies in a slot.
+    Rip,
+    /// A general-purpose register holds an address in a slot.
+    Register,
+    /// A word on its live stack holds an address in a slot.
+    Stack,
+    /// Its stack could not be read in full, so nothing is known.
+    Unknown,
+}
+
+/// The general-purpose registers of a captured context, RSP included.
+fn registers(context: &CONTEXT) -> [u64; 16] {
+    [
+        context.Rax,
+        context.Rbx,
+        context.Rcx,
+        context.Rdx,
+        context.Rsi,
+        context.Rdi,
+        context.Rbp,
+        context.Rsp,
+        context.R8,
+        context.R9,
+        context.R10,
+        context.R11,
+        context.R12,
+        context.R13,
+        context.R14,
+        context.R15,
+    ]
+}
+
+/// Scans `[rsp, base)` for a word in `slots`, `STACK_CHUNK_WORDS` at a time, and
+/// charges the bytes read to `budget`. `read` fills its buffer from an address and
+/// fails instead of faulting. A zero or misaligned base, an RSP outside the stack,
+/// a span past the limits, or a failed read is `Unknown`. Allocation-free; never
+/// writes the stack.
+fn scan_stack(
+    rsp: usize,
+    base: usize,
+    slots: &SlotSet,
+    budget: &mut usize,
+    mut read: impl FnMut(usize, &mut [u64]) -> bool,
+) -> Reach {
+    if rsp == 0 || base == 0 || !base.is_multiple_of(8) || rsp > base {
+        return Reach::Unknown;
+    }
+    let mut cursor = rsp & !7;
+    let span = base - cursor;
+    if span > MAX_STACK_SCAN_BYTES || span > *budget {
+        return Reach::Unknown;
+    }
+    *budget -= span;
+    let mut chunk = [0u64; STACK_CHUNK_WORDS];
+    while cursor < base {
+        let words = ((base - cursor) / 8).min(STACK_CHUNK_WORDS);
+        if !read(cursor, &mut chunk[..words]) {
+            return Reach::Unknown;
+        }
+        if chunk[..words].iter().any(|&word| slots.contains_word(word)) {
+            return Reach::Stack;
+        }
+        cursor += words * 8;
+    }
+    Reach::Clear
+}
+
+/// Whether a frozen thread, resuming at `new_ip`, may still reach a slot: by RIP, by
+/// a register, or by a word on its live stack (`base` is its `NT_TIB.StackBase`, or
+/// `None` if that could not be read).
+fn reach(
+    context: &CONTEXT,
+    new_ip: usize,
+    base: Option<usize>,
+    slots: &SlotSet,
+    budget: &mut usize,
+    read: impl FnMut(usize, &mut [u64]) -> bool,
+) -> Reach {
+    if slots.malformed {
+        return Reach::Unknown;
+    }
+    if slots.contains(new_ip) {
+        return Reach::Rip;
+    }
+    if registers(context)
+        .iter()
+        .any(|&value| slots.contains_word(value))
+    {
+        return Reach::Register;
+    }
+    let Some(base) = base else {
+        return Reach::Unknown;
+    };
+    let rsp = usize::try_from(context.Rsp).unwrap_or(0);
+    scan_stack(rsp, base, slots, budget, read)
 }
 
 /// A suspended thread whose instruction pointer must move.
@@ -383,7 +532,7 @@ impl FrozenThreads {
                 Some(false) => return Ok(Some(HookError::ThreadSuspend)),
                 None => return Ok(Some(HookError::ThreadContext)),
             }
-            let mut context = AlignedContext::control();
+            let mut context = AlignedContext::captured();
             // SAFETY: as above; the thread has started, so its suspension takes effect.
             if !unsafe { sys::get_context(handle, &mut context) } {
                 return Ok(Some(HookError::ThreadContext));
@@ -818,6 +967,13 @@ mod sys {
         if fault::hit(fault::Call::Started) {
             return Some(false);
         }
+        // SAFETY: forwarded from the caller.
+        unsafe { teb(handle) }.map(|teb| teb != 0)
+    }
+
+    /// The thread's TEB address, zero until it has started, or `None` if the query
+    /// failed. Never blocks.
+    unsafe fn teb(handle: HANDLE) -> Option<usize> {
         // x64 THREAD_BASIC_INFORMATION is 0x30 bytes; TebBaseAddress is at +8.
         let mut information = [0u64; 6];
         let mut returned = 0u32;
@@ -831,7 +987,60 @@ mod sys {
                 &mut returned,
             )
         };
-        (status >= 0).then_some(information[1] != 0)
+        if status < 0 {
+            return None;
+        }
+        usize::try_from(information[1]).ok()
+    }
+
+    /// The top (highest address) of the suspended thread's stack, its
+    /// `NT_TIB.StackBase`, or `None` if it cannot be read. Never blocks.
+    pub(super) unsafe fn stack_base(handle: HANDLE) -> Option<usize> {
+        #[cfg(test)]
+        if fault::hit(fault::Call::StackBase) {
+            return None;
+        }
+        // SAFETY: forwarded from the caller.
+        let teb = unsafe { teb(handle) }?;
+        if teb == 0 {
+            return None;
+        }
+        // NT_TIB.StackBase is the second word of the TEB.
+        let mut base = [0u64; 1];
+        // SAFETY: the read is validated and fails instead of faulting.
+        if !unsafe { read_words(teb.checked_add(8)?, &mut base) } {
+            return None;
+        }
+        usize::try_from(base[0]).ok()
+    }
+
+    /// Reads `out.len()` words of a frozen thread's stack at `address`, failing
+    /// instead of faulting. Allocation-free on the Rust side.
+    pub(super) unsafe fn read_stack(address: usize, out: &mut [u64]) -> bool {
+        #[cfg(test)]
+        if fault::hit(fault::Call::ReadStack) {
+            return false;
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { read_words(address, out) }
+    }
+
+    /// Reads `out.len()` words at `address` of this process; a short read fails.
+    unsafe fn read_words(address: usize, out: &mut [u64]) -> bool {
+        let bytes = size_of_val(out);
+        let mut copied = 0usize;
+        // SAFETY: ReadProcessMemory validates the source range and fails instead of
+        // faulting; `out` is writable for `bytes` bytes.
+        let read = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                address as *const c_void,
+                out.as_mut_ptr().cast(),
+                bytes,
+                &mut copied,
+            )
+        };
+        read != 0 && copied == bytes
     }
 
     pub(super) unsafe fn wait(handle: HANDLE) -> u32 {
@@ -916,9 +1125,11 @@ pub(crate) mod fault {
         Flush,
         Started,
         Wait,
+        StackBase,
+        ReadStack,
     }
 
-    const CALLS: usize = 9;
+    const CALLS: usize = 11;
     /// Most freeze rounds a hide schedule covers.
     const MAX_ROUNDS: usize = 2 * super::FREEZE_ATTEMPTS;
     /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
@@ -1067,6 +1278,52 @@ pub(crate) mod fault {
     pub(super) fn force_moves() -> bool {
         FORCE_MOVES.with(Cell::get)
     }
+
+    /// Most threads whose slot check one transaction records: every thread a
+    /// freeze can hold, so no finding is dropped.
+    const MAX_REACH: usize = super::MAX_THREADS;
+
+    thread_local! {
+        /// What the last transaction's slot check found, per thread id, in order.
+        static REACH: Cell<([(u32, super::Reach); MAX_REACH], usize)> =
+            const { Cell::new(([(0, super::Reach::Clear); MAX_REACH], 0)) };
+    }
+
+    pub(super) fn begin_reach() {
+        REACH.with(|reach| reach.set(([(0, super::Reach::Clear); MAX_REACH], 0)));
+    }
+
+    /// Records a thread's slot check. Fixed storage, so it never allocates.
+    pub(super) fn record_reach(handle: HANDLE, found: super::Reach) {
+        // SAFETY: `handle` is an open thread handle.
+        let id = unsafe { GetThreadId(handle) };
+        REACH.with(|reach| {
+            let (mut entries, len) = reach.get();
+            if len < MAX_REACH {
+                entries[len] = (id, found);
+                reach.set((entries, len + 1));
+            }
+        });
+    }
+
+    /// What the last transaction's slot check found for thread `id`, if it was checked.
+    pub(super) fn reach_of(id: u32) -> Option<super::Reach> {
+        REACH.with(|reach| {
+            let (entries, len) = reach.get();
+            entries[..len]
+                .iter()
+                .find(|(entry, _)| *entry == id)
+                .map(|&(_, found)| found)
+        })
+    }
+
+    /// Every slot check of the last transaction.
+    pub(super) fn reaches() -> Vec<super::Reach> {
+        REACH.with(|reach| {
+            let (entries, len) = reach.get();
+            entries[..len].iter().map(|&(_, found)| found).collect()
+        })
+    }
 }
 
 impl HookManager {
@@ -1146,8 +1403,11 @@ impl HookManager {
     /// [`HookError::ThreadResume`] is returned in place of any other result. Every
     /// later call is then refused with it.
     ///
-    /// Returns whether every thread was verified to be outside the trampoline slots
-    /// of the hooks in `watch` once the batch applied.
+    /// Returns whether every thread was verified unable to reach the trampoline slots
+    /// of the hooks in `watch` once the batch applied: no thread's RIP (after its
+    /// move), general-purpose register, or word on its live stack (RSP up to its
+    /// `NT_TIB.StackBase`) lies in one. A stack that cannot be read in full, or a
+    /// missing stack base, counts as reaching them; that is not an error.
     fn transact(&mut self, batch: &[(usize, bool)], watch: &[usize]) -> Result<bool> {
         if thaw_failed() {
             return Err(HookError::ThreadResume);
@@ -1160,24 +1420,45 @@ impl HookManager {
         let mut moves: Vec<ThreadMove> = Vec::with_capacity(MAX_THREADS);
         let mut journal: Vec<(usize, usize, u32)> =
             Vec::with_capacity(batch.len() * MAX_PATCH_PAGES);
+        let slots = SlotSet::new(
+            watch
+                .iter()
+                .map(|&pos| self.hooks.items[pos].trampoline as usize),
+        );
+        #[cfg(test)]
+        fault::begin_reach();
         let mut frozen = FrozenThreads::freeze(&mut list)?;
         let hooks = &self.hooks.items;
 
         // Step 1: plan the moves from the contexts the freeze read. A second read
-        // would be a second chance to block.
+        // would be a second chance to block. A watched slot stays allocated while
+        // any thread may still reach it, or nothing is known about one.
         let mut clear = true;
-        for (&handle, &context) in frozen.handles.iter().zip(&frozen.contexts) {
-            let mut context = context;
-            let ip = context.0.Rip;
+        let mut budget = MAX_TOTAL_SCAN_BYTES;
+        for (&handle, captured) in frozen.handles.iter().zip(&frozen.contexts) {
+            let ip = captured.0.Rip;
             let new_ip = plan_ip(hooks, batch, ip as usize);
-            if watch.iter().any(|&pos| hooks[pos].slot_contains(new_ip)) {
-                clear = false;
+            // Tests check every thread, so each holder's own finding is recorded.
+            if !slots.is_empty() && (clear || cfg!(test)) {
+                // SAFETY: `handle` is an open thread this freeze suspended.
+                let base = unsafe { sys::stack_base(handle) };
+                let found = reach(
+                    &captured.0,
+                    new_ip,
+                    base,
+                    &slots,
+                    &mut budget,
+                    // SAFETY: the read is validated and never faults.
+                    |address, out| unsafe { sys::read_stack(address, out) },
+                );
+                #[cfg(test)]
+                fault::record_reach(handle, found);
+                clear &= found == Reach::Clear;
             }
             if new_ip as u64 != ip || sys::force_moves() {
-                context.0.Rip = new_ip as u64;
                 moves.push(ThreadMove {
                     handle,
-                    context,
+                    context: captured.moved_to(new_ip as u64),
                     original_ip: ip,
                 });
             }
@@ -1725,9 +2006,6 @@ mod tests {
         assert_eq!(plan_ip(&hooks, &disable, 0x2010), 0x2010);
         hooks[0].patch_above = true;
         assert_eq!(plan_ip(&hooks, &disable, 0x1000 - 5), 0x1000);
-
-        assert!(hooks[0].slot_contains(0x2010));
-        assert!(!hooks[0].slot_contains(0x2000 + MEMORY_SLOT_SIZE));
     }
 
     #[test]
@@ -2175,5 +2453,428 @@ mod tests {
         fault::clear();
         fixture.assert_threads_run();
         assert_eq!(bytes(mix_a), before);
+    }
+
+    fn slots(starts: &[usize]) -> SlotSet {
+        SlotSet::new(starts.iter().copied())
+    }
+
+    #[test]
+    fn slot_set_is_half_open_and_sorted() {
+        let set = slots(&[0x9000, 0x1000]);
+        assert!(!set.is_empty());
+        assert!(set.contains(0x1000));
+        assert!(set.contains(0x1000 + MEMORY_SLOT_SIZE - 1));
+        assert!(!set.contains(0x1000 + MEMORY_SLOT_SIZE));
+        assert!(!set.contains(0x0FFF));
+        assert!(set.contains(0x9010));
+        assert!(!set.contains(0x5000));
+        assert!(!set.contains(0));
+        assert!(slots(&[]).is_empty());
+        assert!(!slots(&[]).contains(0x1000));
+        assert!(!set.malformed);
+        assert!(slots(&[usize::MAX - 8]).malformed);
+    }
+
+    /// A fake stack of `words` starting at `rsp`, read like `sys::read_stack`.
+    /// `fail_at` fails the read that covers that address.
+    fn reader(
+        rsp: usize,
+        words: &[u64],
+        fail_at: Option<usize>,
+    ) -> impl FnMut(usize, &mut [u64]) -> bool + '_ {
+        move |address, out| {
+            let end = address + out.len() * 8;
+            if fail_at.is_some_and(|at| (address..end).contains(&at)) {
+                return false;
+            }
+            let first = (address - rsp) / 8;
+            match words.get(first..first + out.len()) {
+                Some(found) => {
+                    out.copy_from_slice(found);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    #[test]
+    fn stack_scan_finds_a_slot_word_past_the_first_chunk() {
+        let set = slots(&[0x7000]);
+        let rsp = 0x10_0000;
+        let mut words = vec![0u64; 3 * STACK_CHUNK_WORDS + 5];
+        let base = rsp + words.len() * 8;
+        let mut budget = MAX_TOTAL_SCAN_BYTES;
+        assert_eq!(
+            scan_stack(rsp, base, &set, &mut budget, reader(rsp, &words, None)),
+            Reach::Clear
+        );
+        assert_eq!(budget, MAX_TOTAL_SCAN_BYTES - words.len() * 8);
+        words[2 * STACK_CHUNK_WORDS + 3] = 0x7000 + 0x3F;
+        assert_eq!(
+            scan_stack(rsp, base, &set, &mut budget, reader(rsp, &words, None)),
+            Reach::Stack
+        );
+        // The word just past the slot does not count.
+        words[2 * STACK_CHUNK_WORDS + 3] = 0x7040;
+        assert_eq!(
+            scan_stack(rsp, base, &set, &mut budget, reader(rsp, &words, None)),
+            Reach::Clear
+        );
+        // The topmost word, just below the base, is read.
+        let last = words.len() - 1;
+        words[last] = 0x7001;
+        assert_eq!(
+            scan_stack(rsp, base, &set, &mut budget, reader(rsp, &words, None)),
+            Reach::Stack
+        );
+        // An unaligned RSP is scanned from the word that holds it.
+        assert_eq!(
+            scan_stack(rsp + 3, base, &set, &mut budget, reader(rsp, &words, None)),
+            Reach::Stack
+        );
+    }
+
+    #[test]
+    fn stack_scan_uncertainty_is_unknown_never_clear() {
+        let set = slots(&[0x7000]);
+        let rsp = 0x10_0000;
+        let words = vec![0u64; 2 * STACK_CHUNK_WORDS];
+        let base = rsp + words.len() * 8;
+        let full = MAX_TOTAL_SCAN_BYTES;
+        let scan = |rsp: usize, base: usize, budget: usize, fail_at: Option<usize>| {
+            let mut budget = budget;
+            scan_stack(
+                rsp,
+                base,
+                &set,
+                &mut budget,
+                reader(0x10_0000, &words, fail_at),
+            )
+        };
+        // A read failing in the second chunk, after a clean first one.
+        assert_eq!(
+            scan(rsp, base, full, Some(rsp + STACK_CHUNK_WORDS * 8)),
+            Reach::Unknown
+        );
+        assert_eq!(scan(0, base, full, None), Reach::Unknown);
+        assert_eq!(scan(rsp, 0, full, None), Reach::Unknown);
+        assert_eq!(scan(base + 8, base, full, None), Reach::Unknown);
+        assert_eq!(scan(rsp, base + 4, full, None), Reach::Unknown);
+        assert_eq!(scan(rsp, base, words.len() * 8 - 1, None), Reach::Unknown);
+        assert_eq!(
+            scan(rsp, rsp + MAX_STACK_SCAN_BYTES + 8, full, None),
+            Reach::Unknown
+        );
+        // An empty live stack (RSP at the base) holds nothing.
+        assert_eq!(scan(base, base, full, None), Reach::Clear);
+    }
+
+    #[test]
+    fn every_register_and_the_moved_ip_are_checked() {
+        let set = slots(&[0x7000]);
+        // SAFETY: `CONTEXT` is plain data; all-zero is a valid value.
+        let blank: CONTEXT = unsafe { std::mem::zeroed() };
+        let rsp = 0x10_0000usize;
+        let words = [0u64; 4];
+        let base = Some(rsp + 32);
+        let check = |context: &CONTEXT, new_ip: usize, base: Option<usize>| {
+            let mut budget = MAX_TOTAL_SCAN_BYTES;
+            reach(
+                context,
+                new_ip,
+                base,
+                &set,
+                &mut budget,
+                reader(rsp, &words, None),
+            )
+        };
+        let mut clean = blank;
+        clean.Rsp = rsp as u64;
+        assert_eq!(check(&clean, 0x1234, base), Reach::Clear);
+        assert_eq!(check(&clean, 0x7008, base), Reach::Rip);
+        assert_eq!(check(&clean, 0x1234, None), Reach::Unknown);
+        for index in 0..16 {
+            let mut context = clean;
+            let fields = [
+                &mut context.Rax,
+                &mut context.Rbx,
+                &mut context.Rcx,
+                &mut context.Rdx,
+                &mut context.Rsi,
+                &mut context.Rdi,
+                &mut context.Rbp,
+                &mut context.Rsp,
+                &mut context.R8,
+                &mut context.R9,
+                &mut context.R10,
+                &mut context.R11,
+                &mut context.R12,
+                &mut context.R13,
+                &mut context.R14,
+                &mut context.R15,
+            ];
+            *fields.into_iter().nth(index).unwrap() = 0x7010;
+            assert_eq!(
+                check(&context, 0x1234, base),
+                Reach::Register,
+                "register {index}"
+            );
+        }
+        let malformed = slots(&[usize::MAX - 8]);
+        let mut budget = MAX_TOTAL_SCAN_BYTES;
+        assert_eq!(
+            reach(
+                &clean,
+                0x1234,
+                base,
+                &malformed,
+                &mut budget,
+                reader(rsp, &words, None)
+            ),
+            Reach::Unknown
+        );
+    }
+
+    #[test]
+    fn moves_write_only_the_control_registers() {
+        let mut captured = AlignedContext::captured();
+        assert_eq!(
+            captured.0.ContextFlags,
+            CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64
+        );
+        captured.0.Rip = 0x1000;
+        captured.0.R13 = 0x5555;
+        let moved = captured.moved_to(0x2000);
+        assert_eq!(moved.0.ContextFlags, CONTEXT_CONTROL_AMD64);
+        assert_eq!(moved.0.Rip, 0x2000);
+        assert_eq!(moved.0.R13, 0x5555);
+        assert_eq!(captured.0.Rip, 0x1000);
+    }
+
+    /// XOR mask that keeps a held address out of memory in readable form.
+    const MASK: u64 = 0x5A5A_5A5A_5A5A_5A5A;
+
+    /// Spins with `masked ^ MASK` only in r13 (or only in a word it pushed) until
+    /// `*stop` is nonzero, after setting `*ready` once the address is held.
+    fn hold(masked: u64, on_stack: bool, ready: *mut u8, stop: *const u8) {
+        if on_stack {
+            // SAFETY: pushes one word and pops it before the block ends; reads and
+            // writes only the two live flags.
+            unsafe {
+                std::arch::asm!(
+                    "xor {value}, {mask}",
+                    "push {value}",
+                    "xor {value}, {value}",
+                    "mov byte ptr [{ready}], 1",
+                    "2:",
+                    "pause",
+                    "cmp byte ptr [{stop}], 0",
+                    "je 2b",
+                    "add rsp, 8",
+                    value = inout(reg) masked => _,
+                    mask = in(reg) MASK,
+                    ready = in(reg) ready,
+                    stop = in(reg) stop,
+                );
+            }
+        } else {
+            // SAFETY: touches only r13 (declared clobbered) and the two live flags.
+            unsafe {
+                std::arch::asm!(
+                    "xor r13, {mask}",
+                    "mov byte ptr [{ready}], 1",
+                    "2:",
+                    "pause",
+                    "cmp byte ptr [{stop}], 0",
+                    "je 2b",
+                    "xor r13, r13",
+                    mask = in(reg) MASK,
+                    ready = in(reg) ready,
+                    stop = in(reg) stop,
+                    inout("r13") masked => _,
+                );
+            }
+        }
+    }
+
+    /// A thread holding an address only in a register or only on its stack. Drop
+    /// stops and joins it, so a failed assertion cannot leave it spinning.
+    struct Holder {
+        id: u32,
+        stop: Arc<std::sync::atomic::AtomicU8>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Holder {
+        fn start(address: usize, on_stack: bool) -> Self {
+            use std::sync::atomic::AtomicU8;
+            let stop = Arc::new(AtomicU8::new(0));
+            let ready = Arc::new(AtomicU8::new(0));
+            let masked = address as u64 ^ MASK;
+            let (ids, id) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn({
+                let (stop, ready) = (stop.clone(), ready.clone());
+                move || {
+                    // SAFETY: reads the calling thread's id.
+                    let _ = ids.send(unsafe { GetCurrentThreadId() });
+                    hold(masked, on_stack, ready.as_ptr(), stop.as_ptr());
+                }
+            });
+            // The guard exists before anything can panic, so the thread is always
+            // stopped and joined.
+            let mut holder = Self {
+                id: 0,
+                stop,
+                thread: Some(thread),
+            };
+            holder.id = id.recv().expect("holder id");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ready.load(Ordering::Acquire) == 0 {
+                assert!(Instant::now() < deadline, "holder never became ready");
+                std::thread::yield_now();
+            }
+            holder
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            self.stop.store(1, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn trampoline_of(f: MixFn) -> usize {
+        let manager = get_manager().lock().unwrap();
+        let pos = manager.find_hook_entry(target(f));
+        manager.hooks.items[pos].trampoline as usize
+    }
+
+    fn is_created(f: MixFn) -> bool {
+        get_manager().lock().unwrap().find_hook_entry(target(f)) != INVALID_HOOK_POS
+    }
+
+    fn slot_bytes(trampoline: usize) -> [u8; 16] {
+        // SAFETY: the slot is kept allocated (retained) whenever this is called.
+        unsafe { ptr::read_volatile(trampoline as *const [u8; 16]) }
+    }
+
+    /// Asserts a remove kept `mix_a`'s slot: the hook is gone, the buffers are
+    /// retained, the slot's bytes are untouched and its trampoline still runs the
+    /// original function, and a new hook is given a different slot.
+    fn assert_slot_kept(trampoline: usize, before: [u8; 16], original: u64) {
+        assert!(!is_created(mix_a));
+        assert!(retain_buffers());
+        assert_eq!(slot_bytes(trampoline), before);
+        // SAFETY: the kept trampoline runs the original `mix_a`, of type `MixFn`.
+        let through: MixFn = unsafe { std::mem::transmute::<usize, MixFn>(trampoline) };
+        assert_eq!(through(7), original);
+        create_hook(target(mix_a), detour as MixFn as *mut c_void).expect("recreate");
+        assert_ne!(trampoline_of(mix_a), trampoline);
+    }
+
+    #[test]
+    fn a_clean_remove_frees_the_slot() {
+        let fixture = Fixture::new();
+        let trampoline = trampoline_of(mix_a);
+        remove_hook(target(mix_a)).expect("remove");
+        let reaches = fault::reaches();
+        assert!(!reaches.is_empty());
+        // The spinners hold nothing in a slot, and their stacks read in full.
+        for &spinner in &fixture.spinners {
+            assert_eq!(fault::reach_of(spinner), Some(Reach::Clear));
+        }
+        // Another thread of the runtime may hold a stale copy, which keeps the slot
+        // conservatively. Only a fully clean check must free it.
+        if reaches.iter().all(|&found| found == Reach::Clear) {
+            assert!(!retain_buffers());
+            // The free list is LIFO and mix_b keeps the block mapped, so a freed
+            // slot is the next one handed out.
+            create_hook(target(mix_a), detour as MixFn as *mut c_void).expect("recreate");
+            assert_eq!(trampoline_of(mix_a), trampoline);
+        } else {
+            assert!(retain_buffers());
+        }
+    }
+
+    #[test]
+    fn a_slot_held_only_in_a_register_is_kept() {
+        let fixture = Fixture::new();
+        let original = mix_a(7);
+        let trampoline = trampoline_of(mix_a);
+        let before = slot_bytes(trampoline);
+        let holder = Holder::start(trampoline + 8, false);
+        remove_hook(target(mix_a)).expect("a kept slot is not an error");
+        assert_eq!(fault::reach_of(holder.id), Some(Reach::Register));
+        drop(holder);
+        fixture.assert_threads_run();
+        assert_slot_kept(trampoline, before, original);
+    }
+
+    #[test]
+    fn a_slot_held_only_on_a_stack_is_kept() {
+        let fixture = Fixture::new();
+        let original = mix_a(7);
+        let trampoline = trampoline_of(mix_a);
+        let before = slot_bytes(trampoline);
+        let holder = Holder::start(trampoline + 8, true);
+        remove_hook(target(mix_a)).expect("a kept slot is not an error");
+        assert_eq!(fault::reach_of(holder.id), Some(Reach::Stack));
+        drop(holder);
+        fixture.assert_threads_run();
+        assert_slot_kept(trampoline, before, original);
+    }
+
+    #[test]
+    fn an_unreadable_stack_keeps_the_slot() {
+        let fixture = Fixture::new();
+        let original = mix_a(7);
+        let trampoline = trampoline_of(mix_a);
+        let before = slot_bytes(trampoline);
+        fault::fail(Call::ReadStack, u64::MAX);
+        remove_hook(target(mix_a)).expect("a kept slot is not an error");
+        fault::clear();
+        assert_eq!(fault::reach_of(fixture.spinners[0]), Some(Reach::Unknown));
+        fixture.assert_threads_run();
+        assert_slot_kept(trampoline, before, original);
+    }
+
+    #[test]
+    fn a_missing_stack_base_keeps_the_slot() {
+        let fixture = Fixture::new();
+        let original = mix_a(7);
+        let trampoline = trampoline_of(mix_a);
+        let before = slot_bytes(trampoline);
+        fault::fail(Call::StackBase, u64::MAX);
+        remove_hook(target(mix_a)).expect("a kept slot is not an error");
+        fault::clear();
+        assert_eq!(fault::reach_of(fixture.spinners[0]), Some(Reach::Unknown));
+        fixture.assert_threads_run();
+        assert_slot_kept(trampoline, before, original);
+    }
+
+    #[test]
+    fn an_unreadable_stack_keeps_the_buffers_on_uninitialize() {
+        let fixture = Fixture::new();
+        let original = mix_a(7);
+        let trampoline = trampoline_of(mix_a);
+        let before = slot_bytes(trampoline);
+        enable_hook(target(mix_a)).expect("enable");
+        fault::fail(Call::ReadStack, u64::MAX);
+        uninitialize().expect("kept buffers are not an error");
+        fault::clear();
+        assert_eq!(fault::reach_of(fixture.spinners[0]), Some(Reach::Unknown));
+        fixture.assert_threads_run();
+        assert!(!hooked(mix_a));
+        assert!(retain_buffers());
+        assert_eq!(slot_bytes(trampoline), before);
+        // SAFETY: the kept trampoline runs the original `mix_a`, of type `MixFn`.
+        let through: MixFn = unsafe { std::mem::transmute::<usize, MixFn>(trampoline) };
+        assert_eq!(through(7), original);
+        initialize().expect("uninitialize completed");
     }
 }

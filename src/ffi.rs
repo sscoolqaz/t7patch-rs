@@ -65,8 +65,10 @@ pub fn initialize() -> Result<(), MinHookError> {
 }
 
 /// Tears the hooking library down, disabling and removing every hook it created.
-/// The trampolines are freed only if no thread was found inside one; otherwise
-/// they are kept for the process lifetime. On error the library stays initialized.
+/// The trampolines are freed only if no frozen thread's instruction pointer,
+/// general-purpose register or live stack word points into one, and every stack
+/// could be read in full; otherwise they are kept for the process lifetime. On
+/// error the library stays initialized.
 ///
 /// # Errors
 ///
@@ -121,8 +123,10 @@ pub unsafe fn disable_hook(target: usize) -> Result<(), MinHookError> {
     min_hook_rs::disable_hook(target as *mut c_void)
 }
 
-/// Removes a hook entirely. Its trampoline is freed only if no thread was found
-/// inside it. On error the hook is kept.
+/// Removes a hook entirely. Its trampoline is freed only if no frozen thread's
+/// instruction pointer, general-purpose register or live stack word points into
+/// it, and every stack could be read in full; otherwise it is kept for the process
+/// lifetime. On error the hook is kept.
 ///
 /// # Safety
 ///

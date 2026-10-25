@@ -74,12 +74,25 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    froze with `ACTION_ENABLE`, so disabling one hook never moved threads out of its
    trampoline. The batch now carries each hook's real direction.
 8. **Trampolines are freed only when verified unreachable.** `remove_hook` freezes
-   even for a disabled hook. It frees the slot only if no thread's RIP lies in the
-   64-byte slot, which holds the trampoline and the relay. `uninitialize` calls
-   `uninitialize_buffer` only if no thread is in any slot. Otherwise the buffers
-   are kept, and `retain_buffers` stays set so later calls never free them either.
-   On error, `remove_hook` keeps the hook and `uninitialize` stays initialized with
-   its hooks intact.
+   even for a disabled hook. It frees the slot only if no frozen thread can reach the
+   64-byte slot, which holds the trampoline and the relay: no thread's RIP (after its
+   move), none of its general-purpose registers (RAX to R15, RSP included), and no
+   word of its live stack, from RSP up to its `NT_TIB.StackBase`, lies in the slot.
+   `uninitialize` calls `uninitialize_buffer` only if no thread can reach any slot.
+   Otherwise the buffers are kept, and `retain_buffers` stays set so later calls
+   never free them either. On error, `remove_hook` keeps the hook and `uninitialize`
+   stays initialized with its hooks intact.
+   The check reuses the freeze's one context read per thread, which now asks for
+   `CONTEXT_CONTROL | CONTEXT_INTEGER`; a move still writes back only
+   `CONTEXT_CONTROL`. The stack base is the TEB's second word, from
+   `NtQueryInformationThread(ThreadBasicInformation)` and `ReadProcessMemory`; the
+   stack is read with `ReadProcessMemory` in 64-word chunks into a fixed buffer. The
+   watched slots are a sorted array built before the freeze. Stack words are only
+   read. Uncertainty keeps the slot and is not an error: a missing or misaligned
+   stack base, an RSP of zero or above the base, a failed or short read, a stack span
+   over 64 MiB, more than 256 MiB read across all threads, or a slot whose end
+   overflows. The scan is conservative: a stale word that only looks like a slot
+   address also keeps it.
 9. **Threads created during the freeze are caught.** Upstream enumerated once
    with Toolhelp, so a thread created after the snapshot kept running while code
    was patched. Now each freeze attempt suspends every thread of a snapshot,
@@ -136,14 +149,34 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    `fault` module. It can fail chosen calls to `OpenThread`, make a chosen thread
    look gone to it, `SuspendThread`, the started (TEB) check, the zero-timeout wait,
    `Get/SetThreadContext`, `VirtualProtect` (making a page
-   writable and restoring it separately) or `FlushInstructionCache`, fail the
+   writable and restoring it separately), `FlushInstructionCache`, the stack-base
+   read or the stack read of the slot check (patch 8), fail the
    resumes of one chosen thread, and force a no-op context write for every thread so
    the rollback path runs. It can also hide trailing ids from chosen enumerations,
    so a thread seems to appear mid-freeze. Plans for different calls combine, and
    bit 63 of a mask covers every later call. A test resumes a
    thread the thaw left suspended itself (`fault::release_stuck`), which also clears
    that latch; `fault::reset_latches` clears the other two. Production code cannot
-   clear any of them. Tests: `hook::tests`.
+   clear any of them. The last transaction's slot check is recorded per thread id
+   in fixed storage (`fault::reach_of`), so a test can tell which thread kept a slot,
+   and why. Tests: `hook::tests`.
+
+## Ideas borrowed from neohook
+
+[neohook](https://github.com/aliendwarf/neohook) 0.16.0 (crates.io), by AlienDwarf,
+is dual-licensed MIT OR Apache-2.0. T7Patch-rs takes the MIT option; its notice is
+in `LICENSE-neohook-MIT`. Only ideas are borrowed, no code. neohook was read, never
+built or linked, and is not a dependency.
+
+- Patch 8, from `src/reclaim.rs` (`inspect_thread`, `scan_stack`): a trampoline is
+  reachable while a suspended thread's general-purpose registers or its stack, from
+  RSP up, hold an address inside it, not only its instruction pointer. The register
+  list and the whole-stack scan are that idea. The implementation is new and differs
+  on purpose: it reuses the existing freeze and its saved contexts, bounds the span
+  by the TEB's stack base instead of walking `VirtualQuery` regions, and treats an
+  unreadable page as a reason to keep the slot (neohook skips uncommitted or guarded
+  pages). neohook's retire queue, its suspend and reclamation code, and its
+  return-address handling are not used.
 
 ## Lint changes
 
@@ -169,5 +202,12 @@ removed. Neither changes behaviour.
   would still make `GetThreadContext` block under Wine; nothing bounds that call.
   No such case has been observed. A bounded design would read contexts on a
   pre-created helper thread with a timeout.
-- Only RIP is checked (unchanged from upstream). A return address into a trampoline (from a relocated
-  `call` in the prologue) on some thread's stack is not detected.
+- The slot check (patch 8) sees only frozen threads' registers and live stacks.
+  It does not see the calling thread's own stack (a `remove_hook` called from code
+  that a trampoline's relocated `call` is returning into), trampoline pointers
+  saved in heap or global data, or the saved contexts and stacks of idle fibers.
+  On Wine, `NtQueryInformationThread` makes a wineserver call and
+  `ReadProcessMemory` on the own process copies under an exception handler while
+  threads are suspended. Neither allocates on the Rust side; that neither takes a
+  lock or allocates inside Wine was not audited for the Proton version in use
+  (`src/threads.rs` makes the same calls).
