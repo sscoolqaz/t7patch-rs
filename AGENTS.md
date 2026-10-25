@@ -96,6 +96,10 @@ pointer, and a fixed crash queue with a safe stack probe. Further hardening:
   block), or a thread that cannot be suspended and whose handle is not
   signaled (Windows refuses a terminating thread) thaws the attempt and
   retries it. A thread counts as exited only when its handle is signaled.
+- A hook whose bytes, or the source bytes its trampoline copied, overlap
+  another hook's is refused. Before every hook write the target's bytes are
+  compared with the backup the trampoline was built from; a change writes
+  nothing.
 - A removed hook's trampoline is freed only when no frozen thread's RIP,
   general-purpose register or live stack word points into it. A stack that cannot
   be read in full keeps the trampoline for the process lifetime.

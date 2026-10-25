@@ -381,3 +381,20 @@ pub fn is_executable_address(address: usize) -> bool {
         mi.State == MEM_COMMIT && (mi.Protect & PAGE_EXECUTE_FLAGS) != 0
     }
 }
+
+/// How many trampoline slots are allocated, across every block. Test-only: lets a
+/// test see that a refused hook gave its slot back.
+#[cfg(test)]
+pub(crate) fn used_slots() -> usize {
+    let manager = BUFFER_MANAGER.lock().unwrap();
+    let mut used = 0usize;
+    let mut block = manager.blocks;
+    while !block.is_null() {
+        // SAFETY: every block in the list is a live allocation the manager owns.
+        unsafe {
+            used += (*block).used_count as usize;
+            block = (*block).next;
+        }
+    }
+    used
+}

@@ -61,6 +61,14 @@ pub enum HookError {
     /// A frozen thread could not be resumed. Terminal: the change may have applied, and
     /// every later hook change is refused
     ThreadResume = 15,
+
+    /// The new hook's bytes (its patch range, hot-patch bytes or the source bytes its
+    /// trampoline copies) overlap another hook's
+    Overlapping = 16,
+
+    /// The target's bytes no longer hold what the hook expects (the original code, or
+    /// its own jump once enabled), or could not be read, so nothing was written
+    TargetModified = 17,
 }
 
 impl HookError {
@@ -83,6 +91,8 @@ impl HookError {
             HookError::ThreadSuspend => "Thread suspension failed",
             HookError::ThreadContext => "Thread context access failed",
             HookError::ThreadResume => "Thread resume failed",
+            HookError::Overlapping => "Hook overlaps another hook",
+            HookError::TargetModified => "Target code changed since the hook was created",
         }
     }
 
@@ -105,6 +115,8 @@ impl HookError {
             13 => HookError::ThreadSuspend,
             14 => HookError::ThreadContext,
             15 => HookError::ThreadResume,
+            16 => HookError::Overlapping,
+            17 => HookError::TargetModified,
             _ => HookError::Unknown,
         }
     }

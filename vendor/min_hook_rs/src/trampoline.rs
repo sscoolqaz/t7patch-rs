@@ -10,17 +10,53 @@ use std::ptr;
 /// Maximum size of a trampoline function
 const TRAMPOLINE_MAX_SIZE: usize = MEMORY_SLOT_SIZE - size_of::<JmpAbs>();
 
-/// Create a trampoline function
-pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
+/// Bytes the decoder is given for each instruction. It shortens an instruction cut
+/// off by the end of its input instead of failing, so it always gets this many.
+const DECODE_WINDOW: usize = 16;
+/// Bytes of target code a snapshot holds: the last instruction the scan decodes
+/// starts below `JmpRel` + 15 (one that starts at offset 4 or less and is up to 15
+/// bytes long), and is decoded from a full window.
+pub const SNAPSHOT_CODE: usize = size_of::<JmpRel>() - 1 + 15 + DECODE_WINDOW;
+
+/// A copy of the target's code taken once, before the trampoline is built. The
+/// trampoline is decoded and copied from it, never from live memory, so the hook's
+/// backup is exactly what its trampoline was built from even if another writer
+/// changes the code meanwhile.
+pub struct Snapshot {
+    /// The hot-patch bytes `[target - 5, target)`, if they could be read.
+    pub above: Option<[u8; size_of::<JmpRel>()]>,
+    /// The code from `target` on.
+    pub code: [u8; SNAPSHOT_CODE],
+    /// How many bytes of `code` could be read.
+    pub len: usize,
+}
+
+impl Snapshot {
+    /// The `len` bytes at `offset`, or `None` past what was read (or for a `len`
+    /// field larger than the buffer).
+    fn bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        self.code
+            .get(..self.len)?
+            .get(offset..offset.checked_add(len)?)
+    }
+}
+
+/// Create a trampoline function from `snapshot`, the target's code read beforehand.
+/// Addresses (relative displacements, the jump back) are still computed from the
+/// target's real address.
+pub fn create_trampoline(ct: &mut Trampoline, snapshot: &Snapshot) -> Result<()> {
     ct.patch_above = false;
     ct.n_ip = 0;
     ct.old_ips.fill(0);
     ct.new_ips.fill(0);
+    ct.source_len = 0;
 
     let mut old_pos = 0u8;
     let mut new_pos = 0u8;
     let mut jmp_dest = 0usize; // Destination address of an internal jump
     let mut finished = false;
+    // End of the source bytes the trampoline depends on.
+    let mut source_end = 0u8;
 
     // Allocate trampoline buffer
     ct.trampoline = allocate_buffer(ct.target)?;
@@ -29,15 +65,19 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
         let old_inst = (ct.target as usize + old_pos as usize) as *const u8;
         let new_inst = (ct.trampoline as usize + new_pos as usize) as *mut u8;
 
-        // Get instruction bytes for decoding
-        let code_slice =
-            unsafe { std::slice::from_raw_parts(old_inst, 16.min(256 - old_pos as usize)) };
+        // A full decode window, or the function cannot be hooked: a truncated
+        // instruction would decode with a wrong length.
+        let code_slice = snapshot
+            .bytes(old_pos as usize, DECODE_WINDOW)
+            .ok_or(HookError::UnsupportedFunction)?;
+        let source = code_slice.as_ptr();
 
         let hs = decode_instruction(code_slice);
         if hs.len == 0 {
             return Err(HookError::UnsupportedFunction);
         }
 
+        let mut jump_back = false;
         let mut copy_size = hs.len;
         let mut temp_buffer = [0u8; 16];
 
@@ -53,10 +93,12 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
             }
             copy_size = size_of::<JmpAbs>() as u8;
             finished = true;
+            // This jump back is not a copy: the instruction runs in place.
+            jump_back = true;
         } else if hs.is_rip_relative() {
             // Handle RIP-relative addressing
             unsafe {
-                ptr::copy_nonoverlapping(old_inst, temp_buffer.as_mut_ptr(), hs.len as usize);
+                ptr::copy_nonoverlapping(source, temp_buffer.as_mut_ptr(), hs.len as usize);
             }
 
             // Calculate new displacement
@@ -117,7 +159,7 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
                     jmp_dest = dest as usize;
                 }
                 unsafe {
-                    ptr::copy_nonoverlapping(old_inst, new_inst, hs.len as usize);
+                    ptr::copy_nonoverlapping(source, new_inst, hs.len as usize);
                 }
             } else {
                 // External jump - use absolute jump
@@ -152,7 +194,7 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
                     jmp_dest = dest as usize;
                 }
                 unsafe {
-                    ptr::copy_nonoverlapping(old_inst, new_inst, hs.len as usize);
+                    ptr::copy_nonoverlapping(source, new_inst, hs.len as usize);
                 }
             } else {
                 // External conditional jump - not supported for LOOP instructions
@@ -180,12 +222,12 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
             // RET instruction - complete if not in branch
             finished = (old_inst as usize) >= jmp_dest;
             unsafe {
-                ptr::copy_nonoverlapping(old_inst, new_inst, hs.len as usize);
+                ptr::copy_nonoverlapping(source, new_inst, hs.len as usize);
             }
         } else {
             // Regular instruction - copy as-is
             unsafe {
-                ptr::copy_nonoverlapping(old_inst, new_inst, hs.len as usize);
+                ptr::copy_nonoverlapping(source, new_inst, hs.len as usize);
             }
         }
 
@@ -209,35 +251,46 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
 
         new_pos += copy_size;
         old_pos += hs.len;
+        if !jump_back {
+            source_end = old_pos;
+        }
 
         if finished {
             break;
         }
     }
 
+    ct.source_len = source_end;
+
     // Check if we have enough space for the hook
     if (old_pos as usize) < size_of::<JmpRel>() {
         let padding_size = size_of::<JmpRel>() - old_pos as usize;
-        let padding_start = (ct.target as usize + old_pos as usize) as *const u8;
+        let padding = snapshot.bytes(old_pos as usize, padding_size);
 
         // Check if there's padding after the function
-        if !is_code_padding(padding_start, padding_size) {
+        if !padding.is_some_and(is_code_padding) {
             // Check for short jump space
             if (old_pos as usize) < size_of::<JmpRelShort>() {
                 let short_padding_size = size_of::<JmpRelShort>() - old_pos as usize;
-                if !is_code_padding(padding_start, short_padding_size) {
+                let short = snapshot.bytes(old_pos as usize, short_padding_size);
+                if !short.is_some_and(is_code_padding) {
                     return Err(HookError::UnsupportedFunction);
                 }
             }
 
             // Try to use hot patch area above the function
-            let hot_patch_addr = (ct.target as usize - size_of::<JmpRel>()) as *mut c_void;
-            if !is_executable_address(hot_patch_addr as usize) {
+            let hot_patch_addr = (ct.target as usize)
+                .checked_sub(size_of::<JmpRel>())
+                .ok_or(HookError::UnsupportedFunction)?;
+            if !is_executable_address(hot_patch_addr) {
                 return Err(HookError::UnsupportedFunction);
             }
 
-            let hot_patch_bytes = (ct.target as usize - size_of::<JmpRel>()) as *const u8;
-            if !is_code_padding(hot_patch_bytes, size_of::<JmpRel>()) {
+            if !snapshot
+                .above
+                .as_ref()
+                .is_some_and(|above| is_code_padding(above))
+            {
                 return Err(HookError::UnsupportedFunction);
             }
 
@@ -258,24 +311,12 @@ pub fn create_trampoline(ct: &mut Trampoline) -> Result<()> {
     Ok(())
 }
 
-/// Check if memory region contains only padding bytes
-fn is_code_padding(inst: *const u8, size: usize) -> bool {
-    if size == 0 {
-        return true;
-    }
-
-    unsafe {
-        let first_byte = *inst;
-        if first_byte != 0x00 && first_byte != 0x90 && first_byte != 0xCC {
-            return false;
-        }
-
-        for i in 1..size {
-            if *inst.add(i) != first_byte {
-                return false;
-            }
+/// Check if the bytes are all one padding byte (`00`, `90` or `CC`).
+fn is_code_padding(bytes: &[u8]) -> bool {
+    match bytes.first() {
+        None => true,
+        Some(&first) => {
+            matches!(first, 0x00 | 0x90 | 0xCC) && bytes.iter().all(|&byte| byte == first)
         }
     }
-
-    true
 }

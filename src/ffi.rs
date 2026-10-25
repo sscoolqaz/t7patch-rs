@@ -34,6 +34,12 @@ use min_hook_rs::{ALL_HOOKS, HookError};
 ///   disabled instead.
 /// - [`HookError::ThreadResume`] (15): a frozen thread could not be resumed. The
 ///   change may have applied. Terminal: every later call is refused with it.
+/// - [`HookError::Overlapping`] (16): the new hook's bytes (its patch range, the
+///   hot-patch bytes above it, or the source bytes its trampoline copies) overlap
+///   another hook's. Nothing was created.
+/// - [`HookError::TargetModified`] (17): just before a write, a hook's bytes no longer
+///   held what the hook left there (the original code, or its own jump once
+///   enabled), or could not be read. Nothing was written and no hook changed state.
 pub type MinHookError = HookError;
 
 /// True once the hooking library could not flush the instruction cache over a patch.
@@ -88,7 +94,7 @@ pub fn uninitialize() -> Result<(), MinHookError> {
 ///
 /// # Errors
 ///
-/// Returns the hooking library's error when `target` is already hooked, is not executable, or its prologue cannot be relocated into a trampoline.
+/// Returns the hooking library's error when `target` is already hooked, is not executable, its bytes overlap another hook's ([`HookError::Overlapping`]), or its prologue cannot be relocated into a trampoline.
 pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHookError> {
     let _transaction = transaction()?;
     let original = min_hook_rs::create_hook(target as *mut c_void, detour as *mut c_void)?;
@@ -103,7 +109,7 @@ pub unsafe fn create_hook(target: usize, detour: usize) -> Result<usize, MinHook
 ///
 /// # Errors
 ///
-/// Returns the hooking library's error when the hook does not exist or its jump cannot be written safely.
+/// Returns the hooking library's error when the hook does not exist or its jump cannot be written safely, including [`HookError::TargetModified`] when the target's bytes changed since the hook was created.
 pub unsafe fn enable_hook(target: usize) -> Result<(), MinHookError> {
     let _transaction = transaction()?;
     min_hook_rs::enable_hook(target as *mut c_void)
@@ -204,6 +210,10 @@ mod tests {
         assert_eq!(MinHookError::from_code(14), MinHookError::ThreadContext);
         assert_eq!(MinHookError::ThreadResume as i32, 15);
         assert_eq!(MinHookError::from_code(15), MinHookError::ThreadResume);
+        assert_eq!(MinHookError::Overlapping as i32, 16);
+        assert_eq!(MinHookError::from_code(16), MinHookError::Overlapping);
+        assert_eq!(MinHookError::TargetModified as i32, 17);
+        assert_eq!(MinHookError::from_code(17), MinHookError::TargetModified);
         assert_eq!(
             MinHookError::ThreadResume.to_string(),
             "Thread resume failed"

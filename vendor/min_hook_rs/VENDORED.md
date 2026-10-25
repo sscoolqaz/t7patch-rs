@@ -2,9 +2,11 @@
 
 - Upstream: [`min_hook_rs`](https://github.com/Rukkhadevata123/min_hook_rs) 2.2.1 from crates.io,
   by Rukkhadevata123, MIT (see `LICENSE`). A pure-Rust port of MinHook.
-- Copied from the cargo registry source. `src/disasm.rs`, `src/instruction.rs`,
-  `README.md` and `LICENSE` are unchanged. `src/buffer.rs`, `src/trampoline.rs` and
-  `src/lib.rs` carry only the lint and format changes listed under "Lint changes".
+- Copied from the cargo registry source. `src/disasm.rs`, `README.md` and `LICENSE`
+  are unchanged. `src/lib.rs` carries only the lint and format changes listed under
+  "Lint changes". `src/buffer.rs` has those plus a test-only slot counter
+  (`used_slots`). `src/trampoline.rs` and `src/instruction.rs` change for patches 13
+  and 14.
 - T7Patch-rs reaches it only through `src/ffi.rs`. It is a workspace member, so
   `cargo test --workspace` and `cargo clippy --workspace` cover it.
 
@@ -19,7 +21,8 @@
 
 ## Patches
 
-All behaviour patches are in `src/hook.rs` and `src/error.rs`.
+The behaviour patches are in `src/hook.rs` and `src/error.rs`, and for patches 13
+and 14 also in `src/trampoline.rs` and `src/instruction.rs`.
 
 1. **Error codes.** `HookError::ThreadSuspend` (13), `HookError::ThreadContext`
    (14) and `HookError::ThreadResume` (15) are new, with `as_str` and `from_code`
@@ -150,7 +153,8 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    look gone to it, `SuspendThread`, the started (TEB) check, the zero-timeout wait,
    `Get/SetThreadContext`, `VirtualProtect` (making a page
    writable and restoring it separately), `FlushInstructionCache`, the stack-base
-   read or the stack read of the slot check (patch 8), fail the
+   read or the stack read of the slot check (patch 8), the footprint read before a
+   write (patch 14), fail the
    resumes of one chosen thread, and force a no-op context write for every thread so
    the rollback path runs. It can also hide trailing ids from chosen enumerations,
    so a thread seems to appear mid-freeze. Plans for different calls combine, and
@@ -160,6 +164,38 @@ All behaviour patches are in `src/hook.rs` and `src/error.rs`.
    clear any of them. The last transaction's slot check is recorded per thread id
    in fixed storage (`fault::reach_of`), so a test can tell which thread kept a slot,
    and why. Tests: `hook::tests`.
+
+13. **Overlapping hooks are refused.** Upstream refused only a hook on the same
+   target. Each hook now has a *footprint*: its patch range (5 bytes, or with the hot
+   patch the 5 bytes above the target and 2 at it) together with the source bytes its
+   trampoline copied or relocated (`Trampoline::source_len`, at most 19: an
+   instruction starts at offset 4 or less). The trampoline is a copy of the source
+   bytes, and one that ran out of room jumps back to `target + source_len` (one that
+   ends at a `ret` or a jump does not return there), so a write anywhere in the
+   footprint would break it even where it misses the patch range. `create_hook` refuses a target inside an existing hook's
+   footprint before decoding it (it may not be an instruction boundary), and a new
+   footprint that overlaps any existing one, enabled, disabled or queued, after the
+   trampoline is built, with `HookError::Overlapping` (16). The refused trampoline's
+   slot is freed: nothing was published that points into it. A failed
+   `create_trampoline` now frees its slot too (upstream leaked it).
+14. **The original bytes are re-checked just before every write.** `create_hook`
+   reads the target's code once, without faulting (`ReadProcessMemory`, split at a
+   page boundary): the hot-patch bytes above it and 35 bytes from it. The trampoline
+   is decoded and copied from that snapshot, never from live memory, so a writer that
+   changes the code and changes it back while the trampoline is built cannot leave a
+   trampoline that differs from the backup. Each decode gets a full 16-byte window or
+   the hook is refused (`UnsupportedFunction`): the decoder silently shortens an
+   instruction its input cuts off. The footprint's bytes from the snapshot are the
+   hook's backup (`HookEntry::original`; a disable writes back its patch range). In
+   `transact`, with every thread frozen and after every footprint was made writable
+   (the whole footprint, so a source byte on an execute-only page can be read back),
+   each footprint is read without faulting and compared with what the hook last left
+   there: the original bytes before an enable, the original bytes with its own jumps
+   before a disable. A mismatch, or a failed read, writes nothing, restores the
+   protections, thaws, and returns `HookError::TargetModified` (17). No hook changes
+   state. This also covers `remove_hook` and `uninitialize` of an enabled hook, so
+   foreign bytes over a hook's jump are never overwritten with the backup. The code
+   is not re-checked after a rollback write in the same freeze.
 
 ## Ideas borrowed from neohook
 
@@ -177,6 +213,14 @@ built or linked, and is not a dependency.
   unreadable page as a reason to keep the slot (neohook skips uncommitted or guarded
   pages). neohook's retire queue, its suspend and reclamation code, and its
   return-address handling are not used.
+- Patch 13, from `src/transaction.rs` (the stolen-bytes check at attach, lines
+  971-981, repeated at commit, lines 1414-1421, and `ranges_overlap`, line 2800):
+  refuse a hook whose bytes overlap a queued or installed hook's. Ours compares
+  footprints, which add the hot-patch bytes and every relocated source byte, and
+  checks once, under the hook-manager lock that every change holds.
+- Patch 14 is not from neohook. neohook checks only that its patch has the stolen
+  length before writing (`src/transaction.rs` line 2058), not that the bytes are
+  still the ones it saved.
 
 ## Lint changes
 

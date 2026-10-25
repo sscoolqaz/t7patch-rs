@@ -18,7 +18,7 @@ use crate::buffer::{
 };
 use crate::error::{HookError, Result};
 use crate::instruction::*;
-use crate::trampoline::create_trampoline;
+use crate::trampoline::{SNAPSHOT_CODE, Snapshot, create_trampoline};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,7 +58,13 @@ const RESUME_ATTEMPTS: usize = 3;
 /// How many times a failed protection restore is retried.
 const RESTORE_ATTEMPTS: usize = 3;
 const PAGE_SIZE: usize = 0x1000;
-/// Most pages one patch range (at most 7 bytes) can touch.
+/// Most source bytes a trampoline copies: an instruction starts at offset 4 or less
+/// and is at most 15 bytes long.
+const MAX_SOURCE_LEN: usize = size_of::<JmpRel>() - 1 + 15;
+/// Most bytes one hook's footprint covers: the hot-patch bytes above the target and
+/// the source bytes from it.
+const MAX_FOOTPRINT: usize = size_of::<JmpRel>() + MAX_SOURCE_LEN;
+/// Most pages one footprint (at most 24 bytes) can touch.
 const MAX_PATCH_PAGES: usize = 2;
 
 /// Set once a frozen thread could not be resumed. Its handle is leaked on purpose
@@ -95,8 +101,12 @@ struct HookEntry {
     detour: *mut c_void,
     /// Address of the trampoline function.
     trampoline: *mut c_void,
-    /// Backup of the original prologue of the target function.
-    backup: [u8; 8],
+    /// The footprint's bytes as the trampoline was built from them (see
+    /// [`HookEntry::footprint`]). The first `patch_range().1` are the bytes a disable
+    /// writes back.
+    original: [u8; MAX_FOOTPRINT],
+    /// How many bytes from `target` the trampoline copied or relocated.
+    source_len: u8,
     /// Whether the hot patch area is used.
     patch_above: bool,
     /// Whether the hook is currently enabled.
@@ -139,7 +149,8 @@ impl HookEntry {
             target: ptr::null_mut(),
             detour: ptr::null_mut(),
             trampoline: ptr::null_mut(),
-            backup: [0; 8],
+            original: [0; MAX_FOOTPRINT],
+            source_len: 0,
             patch_above: false,
             is_enabled: false,
             queue_enable: false,
@@ -161,46 +172,85 @@ impl HookEntry {
         }
     }
 
+    /// The bytes the hook depends on, as `(start, len)`: its patch range together
+    /// with the source bytes its trampoline copied. The trampoline is a copy of those
+    /// bytes, and one that ran out of room jumps back to `target + source_len`, so a
+    /// write anywhere in the footprint would break it even where it misses the patch
+    /// range. Both start at the same address. Never longer than [`MAX_FOOTPRINT`].
+    fn footprint(&self) -> (usize, usize) {
+        let (start, patch_len) = self.patch_range();
+        let start = start as usize;
+        let end = (start + patch_len).max(self.target as usize + usize::from(self.source_len));
+        (start, end - start)
+    }
+
+    /// The bytes an enabled hook holds in its patch range, and how many there are:
+    /// a 5-byte jump to the relay, and with the hot patch, a 2-byte short jump back
+    /// to it at the target.
+    fn patch_bytes(&self) -> ([u8; size_of::<JmpRel>() + size_of::<JmpRelShort>()], usize) {
+        let (patch_target, len) = self.patch_range();
+        let jmp = JmpRel::new_jmp(
+            (self.detour as isize - (patch_target as isize + size_of::<JmpRel>() as isize)) as i32,
+        );
+        let mut bytes = [0u8; size_of::<JmpRel>() + size_of::<JmpRelShort>()];
+        // SAFETY: `JmpRel` and `JmpRelShort` are packed plain bytes of these sizes.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &jmp as *const JmpRel as *const u8,
+                bytes.as_mut_ptr(),
+                size_of::<JmpRel>(),
+            );
+            if self.patch_above {
+                let short_jmp =
+                    JmpRelShort::new(-(size_of::<JmpRelShort>() as i8 + size_of::<JmpRel>() as i8));
+                ptr::copy_nonoverlapping(
+                    &short_jmp as *const JmpRelShort as *const u8,
+                    bytes.as_mut_ptr().add(size_of::<JmpRel>()),
+                    size_of::<JmpRelShort>(),
+                );
+            }
+        }
+        (bytes, len)
+    }
+
+    /// What the footprint holds when the hook is `enabled`, or not: the original
+    /// bytes, with the patch range replaced by the jumps when enabled.
+    fn image(&self, enabled: bool) -> [u8; MAX_FOOTPRINT] {
+        let mut image = self.original;
+        if enabled {
+            let (bytes, len) = self.patch_bytes();
+            image[..len].copy_from_slice(&bytes[..len]);
+        }
+        image
+    }
+
     /// Writes the jump (`enable`) or the original prologue (`!enable`).
     ///
     /// # Safety
     ///
     /// The patch range must be writable and no thread may be executing it.
     unsafe fn write_patch(&self, enable: bool) {
-        let (patch_target, _) = self.patch_range();
+        let (patch_target, len) = self.patch_range();
+        let image = self.image(enable);
         // SAFETY: the caller made the patch range writable and froze every other thread.
-        unsafe {
-            if enable {
-                let jmp = JmpRel::new_jmp(
-                    (self.detour as isize - (patch_target as isize + size_of::<JmpRel>() as isize))
-                        as i32,
-                );
-                ptr::copy_nonoverlapping(
-                    &jmp as *const JmpRel as *const u8,
-                    patch_target,
-                    size_of::<JmpRel>(),
-                );
-                if self.patch_above {
-                    let short_jmp = JmpRelShort::new(
-                        -(size_of::<JmpRelShort>() as i8 + size_of::<JmpRel>() as i8),
-                    );
-                    ptr::copy_nonoverlapping(
-                        &short_jmp as *const JmpRelShort as *const u8,
-                        self.target as *mut u8,
-                        size_of::<JmpRelShort>(),
-                    );
-                }
-            } else if self.patch_above {
-                ptr::copy_nonoverlapping(
-                    self.backup.as_ptr(),
-                    patch_target,
-                    size_of::<JmpRel>() + size_of::<JmpRelShort>(),
-                );
-            } else {
-                ptr::copy_nonoverlapping(self.backup.as_ptr(), patch_target, size_of::<JmpRel>());
-            }
-        }
+        unsafe { ptr::copy_nonoverlapping(image.as_ptr(), patch_target, len) };
     }
+
+    /// Whether the footprint in memory holds what it must while the hook is
+    /// `enabled` (or not). Reads without faulting and without allocating; a failed
+    /// read counts as a mismatch.
+    fn footprint_matches(&self, enabled: bool) -> bool {
+        let (start, len) = self.footprint();
+        let mut live = [0u8; MAX_FOOTPRINT];
+        // SAFETY: the read is validated and fails instead of faulting.
+        let read = unsafe { sys::read_code(start, &mut live[..len]) };
+        read && live[..len] == self.image(enabled)[..len]
+    }
+}
+
+/// True when the half-open ranges `[a, a + a_len)` and `[b, b + b_len)` share a byte.
+fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
 
 /// Finds the original instruction pointer for a thread, used when disabling a hook.
@@ -920,6 +970,58 @@ fn flush(hooks: &[HookEntry], batch: &[(usize, bool)]) {
     }
 }
 
+/// Reads the target's code once, without faulting: the hot-patch bytes above it,
+/// and as much of [`SNAPSHOT_CODE`] from it as is readable. The read is split at a
+/// page boundary, so code that ends at the end of a mapping still yields its
+/// readable part; [`create_trampoline`] refuses what it would need beyond that.
+fn snapshot(target: usize) -> Snapshot {
+    let mut snapshot = Snapshot {
+        above: None,
+        code: [0; SNAPSHOT_CODE],
+        len: 0,
+    };
+    if let Some(above) = target.checked_sub(size_of::<JmpRel>()) {
+        let mut bytes = [0u8; size_of::<JmpRel>()];
+        // SAFETY: the read is validated and fails instead of faulting.
+        if unsafe { sys::read_raw(above, &mut bytes) } {
+            snapshot.above = Some(bytes);
+        }
+    }
+    let first = (PAGE_SIZE - target % PAGE_SIZE).min(SNAPSHOT_CODE);
+    // SAFETY: as above.
+    if unsafe { sys::read_raw(target, &mut snapshot.code[..first]) } {
+        snapshot.len = first;
+        // SAFETY: as above.
+        if first < SNAPSHOT_CODE
+            && unsafe { sys::read_raw(target + first, &mut snapshot.code[first..]) }
+        {
+            snapshot.len = SNAPSHOT_CODE;
+        }
+    }
+    snapshot
+}
+
+/// The `len` bytes at `start` from a snapshot of the code at `target`, `start`
+/// being at most the hot-patch size below it. `None` if the snapshot lacks them.
+fn snapshot_bytes(
+    snapshot: &Snapshot,
+    target: usize,
+    start: usize,
+    len: usize,
+) -> Option<[u8; MAX_FOOTPRINT]> {
+    let mut out = [0u8; MAX_FOOTPRINT];
+    for (index, byte) in out[..len].iter_mut().enumerate() {
+        let address = start.checked_add(index)?;
+        *byte = if address < target {
+            let above = snapshot.above.as_ref()?;
+            *above.get(size_of::<JmpRel>() - (target - address))?
+        } else {
+            *snapshot.code[..snapshot.len].get(address - target)?
+        };
+    }
+    Some(out)
+}
+
 /// Syscalls the freeze depends on. Under `cfg(test)` each can be made to fail.
 mod sys {
     use super::*;
@@ -1027,6 +1129,33 @@ mod sys {
         unsafe { read_words(address, out) }
     }
 
+    /// Reads a hook's footprint just before a write, failing instead of faulting.
+    pub(super) unsafe fn read_code(address: usize, out: &mut [u8]) -> bool {
+        #[cfg(test)]
+        if fault::hit(fault::Call::ReadCode) {
+            return false;
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { read_raw(address, out) }
+    }
+
+    /// Reads `out.len()` bytes at `address` of this process; a short read fails.
+    pub(super) unsafe fn read_raw(address: usize, out: &mut [u8]) -> bool {
+        let mut copied = 0usize;
+        // SAFETY: ReadProcessMemory validates the source range and fails instead of
+        // faulting; `out` is writable for its length.
+        let read = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                address as *const c_void,
+                out.as_mut_ptr().cast(),
+                out.len(),
+                &mut copied,
+            )
+        };
+        read != 0 && copied == out.len()
+    }
+
     /// Reads `out.len()` words at `address` of this process; a short read fails.
     unsafe fn read_words(address: usize, out: &mut [u64]) -> bool {
         let bytes = size_of_val(out);
@@ -1129,9 +1258,10 @@ pub(crate) mod fault {
         Wait,
         StackBase,
         ReadStack,
+        ReadCode,
     }
 
-    const CALLS: usize = 11;
+    const CALLS: usize = 12;
     /// Most freeze rounds a hide schedule covers.
     const MAX_ROUNDS: usize = 2 * super::FREEZE_ATTEMPTS;
     /// Most stuck handles one test can collect. Fixed, so recording one never allocates.
@@ -1466,13 +1596,25 @@ impl HookManager {
             }
         }
 
-        // Step 2: unprotect every page first, so the byte writes cannot fail.
+        // Step 2: unprotect every page first, so the byte writes cannot fail. The
+        // whole footprint, not only the patch range, so it can be read back even
+        // where its source bytes reach an execute-only page.
         for &(pos, _) in batch {
-            let (address, size) = hooks[pos].patch_range();
-            if !make_writable(&mut journal, address as usize, size) {
+            let (address, size) = hooks[pos].footprint();
+            if !make_writable(&mut journal, address, size) {
                 restore_protection(&mut journal);
                 return Err(frozen.abort(HookError::MemoryProtect));
             }
+        }
+        // With every thread frozen nothing can change the bytes between this check
+        // and the write: each footprint must still hold what the hook last left
+        // there, the original bytes (enable) or its own jump (disable).
+        if batch
+            .iter()
+            .any(|&(pos, enable)| !hooks[pos].footprint_matches(!enable))
+        {
+            restore_protection(&mut journal);
+            return Err(frozen.abort(HookError::TargetModified));
         }
         for &(pos, enable) in batch {
             // SAFETY: the range is writable and every other thread is frozen.
@@ -1636,7 +1778,12 @@ impl HookManager {
         Ok(())
     }
 
-    /// Creates a new hook for the specified target and detour.
+    /// Creates a new hook for the specified target and detour. A hook whose
+    /// footprint (patch range, hot-patch bytes and copied source bytes) overlaps an
+    /// existing one's, enabled, disabled or queued, is refused with
+    /// [`HookError::Overlapping`]. The trampoline is built from one snapshot of the
+    /// target's code, which is also the backup [`HookManager::transact`] checks
+    /// before every write.
     fn create_hook(&mut self, target: *mut c_void, detour: *mut c_void) -> Result<*mut c_void> {
         if !self.heap {
             return Err(HookError::NotInitialized);
@@ -1648,34 +1795,54 @@ impl HookManager {
         if pos != INVALID_HOOK_POS {
             return Err(HookError::AlreadyCreated);
         }
-        let mut trampoline = Trampoline::new(target, detour, ptr::null_mut());
-        create_trampoline(&mut trampoline)?;
-        let hook_entry = self.add_hook_entry().ok_or(HookError::MemoryAlloc)?;
-        hook_entry.target = target;
-        hook_entry.detour = trampoline.relay;
-        hook_entry.trampoline = trampoline.trampoline;
-        hook_entry.patch_above = trampoline.patch_above;
-        hook_entry.is_enabled = false;
-        hook_entry.queue_enable = false;
-        hook_entry.n_ip = trampoline.n_ip;
-        hook_entry.old_ips = trampoline.old_ips;
-        hook_entry.new_ips = trampoline.new_ips;
-        unsafe {
-            if trampoline.patch_above {
-                ptr::copy_nonoverlapping(
-                    (target as *const u8).sub(size_of::<JmpRel>()),
-                    hook_entry.backup.as_mut_ptr(),
-                    size_of::<JmpRel>() + size_of::<JmpRelShort>(),
-                );
-            } else {
-                ptr::copy_nonoverlapping(
-                    target as *const u8,
-                    hook_entry.backup.as_mut_ptr(),
-                    size_of::<JmpRel>(),
-                );
-            }
+        // Before decoding: a target inside another hook's bytes may not even be an
+        // instruction boundary.
+        if self.overlaps_existing(target as usize, 1) {
+            return Err(HookError::Overlapping);
         }
-        Ok(hook_entry.trampoline)
+        let snapshot = snapshot(target as usize);
+        let mut trampoline = Trampoline::new(target, detour, ptr::null_mut());
+        if let Err(error) = create_trampoline(&mut trampoline, &snapshot) {
+            // Never published: nothing points into the slot.
+            free_buffer(trampoline.trampoline);
+            return Err(error);
+        }
+        let mut entry = HookEntry::new();
+        entry.target = target;
+        entry.detour = trampoline.relay;
+        entry.trampoline = trampoline.trampoline;
+        entry.patch_above = trampoline.patch_above;
+        entry.source_len = trampoline.source_len;
+        entry.n_ip = trampoline.n_ip;
+        entry.old_ips = trampoline.old_ips;
+        entry.new_ips = trampoline.new_ips;
+        let (start, len) = entry.footprint();
+        let original = (len <= MAX_FOOTPRINT)
+            .then(|| snapshot_bytes(&snapshot, target as usize, start, len))
+            .flatten();
+        let Some(original) = original else {
+            free_buffer(trampoline.trampoline);
+            return Err(HookError::UnsupportedFunction);
+        };
+        entry.original[..len].copy_from_slice(&original[..len]);
+        if self.overlaps_existing(start, len) {
+            free_buffer(trampoline.trampoline);
+            return Err(HookError::Overlapping);
+        }
+        let Some(slot) = self.add_hook_entry() else {
+            free_buffer(trampoline.trampoline);
+            return Err(HookError::MemoryAlloc);
+        };
+        *slot = entry;
+        Ok(slot.trampoline)
+    }
+
+    /// True when `[start, start + len)` overlaps the footprint of an existing hook.
+    fn overlaps_existing(&self, start: usize, len: usize) -> bool {
+        self.hooks.items[..self.hooks.size].iter().any(|hook| {
+            let (other, other_len) = hook.footprint();
+            ranges_overlap(start, len, other, other_len)
+        })
     }
 
     /// Removes a hook for the specified target. Its trampoline is released only if
@@ -2878,5 +3045,433 @@ mod tests {
         let through: MixFn = unsafe { std::mem::transmute::<usize, MixFn>(trampoline) };
         assert_eq!(through(7), original);
         initialize().expect("uninitialize completed");
+    }
+
+    #[test]
+    fn ranges_overlap_is_half_open() {
+        assert!(ranges_overlap(10, 5, 14, 5));
+        assert!(!ranges_overlap(10, 5, 15, 5));
+        assert!(!ranges_overlap(15, 5, 10, 5));
+        assert!(ranges_overlap(10, 10, 12, 1));
+        assert!(ranges_overlap(12, 1, 10, 10));
+        assert!(!ranges_overlap(10, 0, 10, 5));
+        assert!(!ranges_overlap(10, 5, 12, 0));
+        assert!(ranges_overlap(usize::MAX - 2, 5, usize::MAX - 1, 1));
+    }
+
+    #[test]
+    fn footprint_and_images_cover_the_patch_and_the_source() {
+        let mut hook = entry(0x1000, 0x2000, 0x2030);
+        hook.source_len = 8;
+        hook.original[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(hook.footprint(), (0x1000, 8));
+        // The jump to the relay at 0x2030: E9 rel32 from the end of the jump.
+        let (bytes, len) = hook.patch_bytes();
+        assert_eq!(len, 5);
+        assert_eq!(bytes[..5], [0xE9, 0x2B, 0x10, 0x00, 0x00]);
+        assert_eq!(
+            hook.image(true)[..8],
+            [0xE9, 0x2B, 0x10, 0x00, 0x00, 6, 7, 8]
+        );
+        assert_eq!(hook.image(false)[..8], [1, 2, 3, 4, 5, 6, 7, 8]);
+        // A source shorter than the patch: the patch range is the footprint.
+        hook.source_len = 3;
+        assert_eq!(hook.footprint(), (0x1000, 5));
+        // With the hot patch: the jump sits above the target, and a short jump back
+        // to it at the target.
+        hook.patch_above = true;
+        assert_eq!(hook.footprint(), (0x1000 - 5, 8));
+        let (bytes, len) = hook.patch_bytes();
+        assert_eq!(len, 7);
+        // The jump now starts 5 bytes earlier, so its offset is 5 larger.
+        assert_eq!(bytes[..7], [0xE9, 0x30, 0x10, 0x00, 0x00, 0xEB, 0xF9]);
+        hook.source_len = 1;
+        assert_eq!(hook.footprint(), (0x1000 - 5, 7));
+    }
+
+    // Crafted code, hooked but never executed. Offsets into the first page.
+    const NOPS: usize = 0x100;
+    const RET: usize = 0x200;
+    const INDIRECT: usize = 0x300;
+    const EXTERNAL: usize = 0x400;
+    const ABOVE: usize = 0x500;
+    /// Starts 5 bytes before the second page; its last copied instruction ends on it.
+    const CROSS: usize = PAGE_SIZE - 5;
+
+    /// Two pages of crafted code. Drop removes the hooks it created, by force if a
+    /// remove fails, before the pages are freed.
+    struct Crafted {
+        base: usize,
+        targets: Vec<usize>,
+    }
+
+    impl Crafted {
+        fn new() -> Self {
+            // SAFETY: allocates two fresh pages.
+            let base = unsafe {
+                VirtualAlloc(
+                    ptr::null(),
+                    2 * PAGE_SIZE,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+            let code = Self {
+                base,
+                targets: Vec::new(),
+            };
+            code.put(0, &[0xCC; 2 * PAGE_SIZE]);
+            code.put(NOPS, &[0x90; 32]);
+            // xor eax, eax; ret; then int3 padding.
+            code.put(RET, &[0x31, 0xC0, 0xC3]);
+            // jmp [rip + 0].
+            code.put(INDIRECT, &[0xFF, 0x25, 0, 0, 0, 0]);
+            // jmp +1 (internal); nop; jmp rel32 (external); then nops another hook uses.
+            code.put(EXTERNAL, &[0xEB, 0x01, 0x90, 0xE9, 0xB0, 0xB1, 0x90, 0x90]);
+            code.put(EXTERNAL + 8, &[0x90; 8]);
+            // Nop hot-patch bytes, then xor eax, eax; ret; push rbp (not padding).
+            code.put(ABOVE - 10, &[0x90; 10]);
+            code.put(ABOVE, &[0x31, 0xC0, 0xC3, 0x55]);
+            // Four nops, then mov eax, imm32 across the page boundary.
+            code.put(
+                CROSS,
+                &[0x90, 0x90, 0x90, 0x90, 0xB8, 0x11, 0x22, 0x33, 0x44],
+            );
+            code
+        }
+
+        fn address(&self, offset: usize) -> usize {
+            self.base + offset
+        }
+
+        fn put(&self, offset: usize, bytes: &[u8]) {
+            // SAFETY: the pages are this fixture's, writable, and never executed.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (self.base + offset) as *mut u8,
+                    bytes.len(),
+                )
+            };
+        }
+
+        fn get(&self, offset: usize, len: usize) -> Vec<u8> {
+            // SAFETY: as above; the range is inside the two pages.
+            unsafe { std::slice::from_raw_parts((self.base + offset) as *const u8, len) }.to_vec()
+        }
+
+        fn hook(&mut self, offset: usize) -> Result<*mut c_void> {
+            let target = self.address(offset);
+            let trampoline = create_hook(target as *mut c_void, detour as MixFn as *mut c_void)?;
+            self.targets.push(target);
+            Ok(trampoline)
+        }
+
+        fn unhook(&mut self, offset: usize) -> Result<()> {
+            let target = self.address(offset);
+            remove_hook(target as *mut c_void)?;
+            self.targets.retain(|&other| other != target);
+            Ok(())
+        }
+
+        fn create(&self, offset: usize) -> Result<*mut c_void> {
+            create_hook(
+                self.address(offset) as *mut c_void,
+                detour as MixFn as *mut c_void,
+            )
+        }
+
+        fn enable(&self, offset: usize) -> Result<()> {
+            enable_hook(self.address(offset) as *mut c_void)
+        }
+
+        fn disable(&self, offset: usize) -> Result<()> {
+            disable_hook(self.address(offset) as *mut c_void)
+        }
+
+        /// The hook's `(source_len, footprint offset, footprint len, patch_above)`.
+        fn layout(&self, offset: usize) -> (u8, usize, usize, bool) {
+            let manager = get_manager().lock().unwrap();
+            let hook =
+                &manager.hooks.items[manager.find_hook_entry(self.address(offset) as *mut c_void)];
+            let (start, len) = hook.footprint();
+            (hook.source_len, start - self.base, len, hook.patch_above)
+        }
+
+        fn image(&self, offset: usize, enabled: bool) -> Vec<u8> {
+            let manager = get_manager().lock().unwrap();
+            let hook =
+                &manager.hooks.items[manager.find_hook_entry(self.address(offset) as *mut c_void)];
+            hook.image(enabled)[..hook.footprint().1].to_vec()
+        }
+
+        fn enabled(&self, offset: usize) -> bool {
+            let manager = get_manager().lock().unwrap();
+            let pos = manager.find_hook_entry(self.address(offset) as *mut c_void);
+            manager.hooks.items[pos].is_enabled
+        }
+    }
+
+    impl Drop for Crafted {
+        fn drop(&mut self) {
+            for &target in &self.targets {
+                if remove_hook(target as *mut c_void).is_err() {
+                    let mut manager = get_manager().lock().unwrap();
+                    let pos = manager.find_hook_entry(target as *mut c_void);
+                    if pos != INVALID_HOOK_POS {
+                        manager.delete_hook_entry(pos);
+                    }
+                }
+            }
+            // SAFETY: frees the pages allocated in `new`; no hook points at them now.
+            unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn footprints_cover_each_way_a_trampoline_ends() {
+        let _fixture = Fixture::new();
+        let mut code = Crafted::new();
+        for offset in [NOPS, RET, INDIRECT, EXTERNAL, ABOVE] {
+            code.hook(offset).expect("create");
+        }
+        // Five one-byte nops, then the jump back: the sixth runs in place.
+        assert_eq!(code.layout(NOPS), (5, NOPS, 5, false));
+        // Ends at ret; the int3 padding after it completes the patch range.
+        assert_eq!(code.layout(RET), (3, RET, 5, false));
+        // Ends at the indirect jump, one byte past the patch range.
+        assert_eq!(code.layout(INDIRECT), (6, INDIRECT, 6, false));
+        // An internal jump, then an external one: three bytes past the patch range.
+        assert_eq!(code.layout(EXTERNAL), (8, EXTERNAL, 8, false));
+        // Too short and no padding after it: the hot-patch bytes above it.
+        assert_eq!(code.layout(ABOVE), (3, ABOVE - 5, 8, true));
+        for (offset, start) in [
+            (NOPS, NOPS),
+            (RET, RET),
+            (INDIRECT, INDIRECT),
+            (EXTERNAL, EXTERNAL),
+            (ABOVE, ABOVE - 5),
+        ] {
+            let original = code.image(offset, false);
+            assert_eq!(code.get(start, original.len()), original);
+        }
+    }
+
+    #[test]
+    fn overlapping_hooks_are_refused_and_give_their_slot_back() {
+        let _fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(NOPS).expect("create");
+        let used = crate::buffer::used_slots();
+        // Inside another hook's bytes, refused before anything is decoded.
+        assert_eq!(code.create(NOPS + 2), Err(HookError::Overlapping));
+        // Right after them.
+        code.hook(NOPS + 5).expect("an adjacent hook");
+        let used = used + 1;
+        assert_eq!(crate::buffer::used_slots(), used);
+
+        // The patch ranges [0, 5) and [6, 11) are disjoint, but the external jump's
+        // source bytes reach the second hook: refused after its trampoline was built,
+        // whose slot is freed again.
+        code.hook(EXTERNAL + 6).expect("create");
+        let used = used + 1;
+        assert_eq!(code.create(EXTERNAL), Err(HookError::Overlapping));
+        assert_eq!(crate::buffer::used_slots(), used);
+
+        // A hook whose bytes reach into the hot-patch bytes above ABOVE.
+        code.hook(ABOVE - 8).expect("create");
+        assert_eq!(code.create(ABOVE), Err(HookError::Overlapping));
+        assert_eq!(crate::buffer::used_slots(), used + 1);
+        code.unhook(ABOVE - 8).expect("remove");
+        // One that ends where they begin.
+        code.hook(ABOVE - 10).expect("create");
+        code.hook(ABOVE).expect("adjacent to the hot-patch bytes");
+        assert_eq!(code.create(ABOVE - 3), Err(HookError::Overlapping));
+        assert_eq!(code.create(ABOVE + 1), Err(HookError::Overlapping));
+    }
+
+    #[test]
+    fn a_changed_byte_past_the_patch_range_blocks_the_enable() {
+        let fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(EXTERNAL).expect("create");
+        let original = code.image(EXTERNAL, false);
+        let mut changed = original.clone();
+        changed[6] ^= 0x01;
+        code.put(EXTERNAL + 6, &changed[6..7]);
+        assert_eq!(code.enable(EXTERNAL), Err(HookError::TargetModified));
+        fixture.assert_threads_run();
+        assert_eq!(code.get(EXTERNAL, 8), changed);
+        assert!(!code.enabled(EXTERNAL));
+        assert!(!protection_lost() && !flush_failed() && !thaw_failed());
+        code.put(EXTERNAL + 6, &original[6..7]);
+        code.enable(EXTERNAL).expect("the original bytes are back");
+        assert_eq!(code.get(EXTERNAL, 8), code.image(EXTERNAL, true));
+        assert_eq!(code.get(EXTERNAL, 1), [0xE9]);
+        code.disable(EXTERNAL).expect("disable");
+        assert_eq!(code.get(EXTERNAL, 8), original);
+    }
+
+    #[test]
+    fn a_changed_jump_blocks_the_disable_and_the_remove() {
+        let fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(NOPS).expect("create");
+        code.enable(NOPS).expect("enable");
+        let enabled = code.image(NOPS, true);
+        assert_eq!(code.get(NOPS, 5), enabled);
+        let mut changed = enabled.clone();
+        changed[1] ^= 0xFF;
+        code.put(NOPS + 1, &changed[1..2]);
+        assert_eq!(code.disable(NOPS), Err(HookError::TargetModified));
+        assert_eq!(
+            remove_hook(code.address(NOPS) as *mut c_void),
+            Err(HookError::TargetModified)
+        );
+        fixture.assert_threads_run();
+        // Nothing was written back over the foreign bytes, and the hook is kept.
+        assert_eq!(code.get(NOPS, 5), changed);
+        assert!(code.enabled(NOPS));
+        code.put(NOPS + 1, &enabled[1..2]);
+        code.disable(NOPS).expect("the jump is back");
+        assert_eq!(code.get(NOPS, 5), [0x90; 5]);
+    }
+
+    #[test]
+    fn hot_patch_hooks_are_checked_in_both_directions() {
+        let _fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(ABOVE).expect("create");
+        let original = code.get(ABOVE - 5, 8);
+        code.enable(ABOVE).expect("enable");
+        let enabled = code.get(ABOVE - 5, 8);
+        assert_eq!(enabled, code.image(ABOVE, true));
+        assert_eq!(enabled[0], 0xE9);
+        assert_eq!(enabled[5..], [0xEB, 0xF9, 0xC3]);
+        code.disable(ABOVE).expect("disable");
+        assert_eq!(code.get(ABOVE - 5, 8), original);
+        code.enable(ABOVE).expect("enable");
+        // The short jump back to the hot patch, changed.
+        code.put(ABOVE + 1, &[0xFA]);
+        assert_eq!(code.disable(ABOVE), Err(HookError::TargetModified));
+        assert!(code.enabled(ABOVE));
+        code.put(ABOVE + 1, &[0xF9]);
+        code.disable(ABOVE).expect("disable");
+        assert_eq!(code.get(ABOVE - 5, 8), original);
+    }
+
+    #[test]
+    fn an_unreadable_footprint_blocks_the_write() {
+        let fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(NOPS).expect("create");
+        fault::fail(Call::ReadCode, u64::MAX);
+        assert_eq!(code.enable(NOPS), Err(HookError::TargetModified));
+        fault::clear();
+        fixture.assert_threads_run();
+        assert_eq!(code.get(NOPS, 5), [0x90; 5]);
+        assert!(!code.enabled(NOPS));
+        code.enable(NOPS).expect("enable");
+    }
+
+    #[test]
+    fn one_changed_hook_blocks_the_whole_batch() {
+        let fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(NOPS).expect("create");
+        code.hook(RET).expect("create");
+        code.put(RET + 1, &[0xC1]);
+        assert_eq!(enable_hook(ALL_HOOKS), Err(HookError::TargetModified));
+        fixture.assert_threads_run();
+        assert!(!hooked(mix_a) && !hooked(mix_b));
+        assert_eq!(code.get(NOPS, 5), [0x90; 5]);
+        assert!(!code.enabled(NOPS) && !code.enabled(RET));
+        code.put(RET + 1, &[0xC0]);
+        enable_hook(ALL_HOOKS).expect("enable");
+        assert!(hooked(mix_a) && hooked(mix_b));
+        assert_eq!(code.get(RET, 5), code.image(RET, true));
+    }
+
+    #[test]
+    fn an_execute_only_source_page_is_checked_and_restored() {
+        let _fixture = Fixture::new();
+        let mut code = Crafted::new();
+        code.hook(CROSS).expect("create");
+        // Four nops and the five-byte mov: four of its bytes are on the second page.
+        assert_eq!(code.layout(CROSS), (9, CROSS, 9, false));
+        let protection = |address: usize| {
+            // SAFETY: zeroed MEMORY_BASIC_INFORMATION is valid; VirtualQuery fills it.
+            let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+            // SAFETY: `info` is a valid out-buffer of the size given.
+            unsafe { VirtualQuery(address as *const c_void, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        let second = code.address(PAGE_SIZE);
+        let mut old = 0u32;
+        // SAFETY: the second page belongs to the fixture.
+        assert_ne!(
+            unsafe { VirtualProtect(second as *mut c_void, PAGE_SIZE, PAGE_EXECUTE, &mut old) },
+            0
+        );
+        code.enable(CROSS)
+            .expect("the footprint is readable while it is writable");
+        assert_eq!(protection(second), PAGE_EXECUTE);
+        assert_eq!(protection(code.address(0)), PAGE_EXECUTE_READWRITE);
+        code.disable(CROSS).expect("disable");
+        assert_eq!(protection(second), PAGE_EXECUTE);
+        assert!(!protection_lost());
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe {
+                VirtualProtect(
+                    second as *mut c_void,
+                    PAGE_SIZE,
+                    PAGE_EXECUTE_READWRITE,
+                    &mut old,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            code.get(CROSS, 9),
+            [0x90, 0x90, 0x90, 0x90, 0xB8, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn the_trampoline_is_built_from_the_snapshot_not_live_memory() {
+        let _fixture = Fixture::new();
+        let code = Crafted::new();
+        let target = code.address(NOPS);
+        // Live memory holds nops; the snapshot holds xor eax, eax; ret; int3 int3, as
+        // if another writer changed the code back and forth while it was read.
+        let mut snapshot = snapshot(target);
+        assert_eq!(snapshot.len, SNAPSHOT_CODE);
+        snapshot.code[..5].copy_from_slice(&[0x31, 0xC0, 0xC3, 0xCC, 0xCC]);
+        let mut built = Trampoline::new(
+            target as *mut c_void,
+            detour as MixFn as *mut c_void,
+            ptr::null_mut(),
+        );
+        create_trampoline(&mut built, &snapshot).expect("build");
+        assert_eq!(built.source_len, 3);
+        // SAFETY: the slot was just allocated and filled by create_trampoline.
+        let copied = unsafe { ptr::read(built.trampoline as *const [u8; 3]) };
+        assert_eq!(copied, [0x31, 0xC0, 0xC3]);
+        free_buffer(built.trampoline);
+
+        // A snapshot cut short refuses the hook rather than decode a partial window.
+        snapshot.len = 15;
+        let mut short = Trampoline::new(
+            target as *mut c_void,
+            detour as MixFn as *mut c_void,
+            ptr::null_mut(),
+        );
+        assert_eq!(
+            create_trampoline(&mut short, &snapshot),
+            Err(HookError::UnsupportedFunction)
+        );
+        free_buffer(short.trampoline);
     }
 }

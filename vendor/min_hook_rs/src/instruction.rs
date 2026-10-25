@@ -108,6 +108,9 @@ pub struct Trampoline {
     pub old_ips: [u8; 8],
     /// Instruction boundaries of the trampoline function
     pub new_ips: [u8; 8],
+    /// How many bytes from `target` the trampoline copied or relocated. Its code
+    /// depends on them staying unchanged.
+    pub source_len: u8,
 }
 
 impl JmpRelShort {
@@ -201,6 +204,7 @@ impl Trampoline {
             n_ip: 0,
             old_ips: [0; 8],
             new_ips: [0; 8],
+            source_len: 0,
         }
     }
 }
