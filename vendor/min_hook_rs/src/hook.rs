@@ -744,8 +744,10 @@ impl IdSet {
 
 /// Lists this process's threads through `NtQuerySystemInformation`, into a buffer
 /// sized before the freeze, so enumerating again while threads are suspended does
-/// not allocate. Toolhelp is not used: Wine's `CreateToolhelp32Snapshot` allocates
-/// from the process heap, which a suspended thread may hold locked.
+/// not allocate on the Rust side. Toolhelp is not used: Wine's
+/// `CreateToolhelp32Snapshot` allocates from the process heap, which a suspended
+/// thread may hold locked. Wine's own enumeration still allocates on its Unix
+/// side; see the Known limits in `VENDORED.md`.
 struct ThreadList {
     process_id: u32,
     current_thread: u32,

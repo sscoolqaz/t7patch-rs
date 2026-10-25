@@ -10,7 +10,9 @@
 //! lock, so allocating or taking a lock while it is frozen can deadlock. Thread
 //! ids live in fixed arrays, the enumeration buffer and the thread vector are
 //! sized before the first `SuspendThread`, and errors are static until every
-//! thread is resumed.
+//! thread is resumed. That holds on the Rust side; under Wine the enumeration
+//! itself allocates on its Unix side (see `vendor/min_hook_rs/VENDORED.md`,
+//! Known limits).
 //!
 //! The Win32 calls sit behind [`ThreadOps`], so the freeze and thaw logic is
 //! tested with a fake that fails any call on demand.

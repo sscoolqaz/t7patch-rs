@@ -86,8 +86,10 @@ unload of hooks, Steam vtable slots, the lobby marker and the update-preload
 pointer, and a fixed crash queue with a safe stack probe. Further hardening:
 
 - Code writes freeze threads through `NtQuerySystemInformation`, with no
-  allocation after the first suspend. A thread that cannot be resumed keeps
-  its handle and disables further code writes (terminal).
+  allocation on the Rust side after the first suspend. Under Wine the
+  enumeration itself allocates and opens `/proc` files on its Unix side; see
+  the Known limits in `vendor/min_hook_rs/VENDORED.md`. A thread that cannot
+  be resumed keeps its handle and disables further code writes (terminal).
 - Each freeze, here and in the vendored hook library, is a bounded run of
   attempts. A thread created during the freeze is never suspended; it, a
   thread with no TEB yet (one Wine has not started, whose context read would

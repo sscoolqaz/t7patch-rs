@@ -193,11 +193,55 @@ removed. Neither changes behaviour.
 
 ## Known limits
 
+Wine findings below were read from source: upstream Wine 11.20 (the tests'
+`wine`, tag `wine-11.20`), upstream 11.0, and the Wine that GE-Proton11-9 builds
+(Valve's fork at `981e2f0b9007`, wine-staging `v11.0` at `6cc805ea5713`, and the
+GE patches at `01bfbf67b354`; GE-Proton11-11 reports the same `wine-11.0
+(Staging)`). Every function named below is the same in all of them apart from
+refactors. glibc is 2.44. Windows findings were read from the disassembly of
+Windows 11 26100 `kernelbase.dll` 10.0.26100.9278 and `ntdll.dll` 10.0.26100.9549.
+
+- **How Wine suspends.** `SuspendThread` reaches the thread as SIGUSR1, and
+  `usr1_handler` parks it in `wait_suspend`. SIGUSR1 is in `server_block_set`,
+  which `server_enter_uninterrupted_section` masks before taking its mutex and
+  which every Wine signal handler runs under (`sa_mask`). A thread blocked in a
+  wineserver wait (`server_select`) holds no mutex while it waits. So a thread
+  whose suspension the freeze confirmed holds no Wine mutex taken that way,
+  `virtual_mutex` included. It can still hold anything taken with SIGUSR1
+  unmasked: the PE-side process heap lock and loader lock, and, while it runs
+  Unix-side code (a Wine Unix library, a graphics driver), glibc's `malloc`
+  arena mutexes and its stdio `list_all_lock`.
+- **The enumeration allocates inside Wine while threads are suspended.**
+  `NtQuerySystemInformation(SystemProcessInformation)` runs
+  `get_system_process_info`, which `malloc`s a buffer of the caller's size and
+  `free`s it, and for every process the wineserver lists (every Wine process of
+  the prefix) and every one of its threads `fopen`s and `fclose`s
+  `/proc/<pid>/status` and `/proc/<pid>/task/<tid>/stat`. In glibc `malloc`
+  and `free` take an arena mutex, and `fopen` and `fclose` take the global
+  `list_all_lock`. A frozen thread suspended inside glibc `malloc` (on a
+  shared arena) or `fopen`/`fclose`/`fflush(NULL)` would deadlock the freeze
+  on its second enumeration. Not observed. `src/threads.rs` has the same
+  exposure. Wine's `NtGetNextThread` is one wineserver call with no Unix-side
+  allocation, so an enumeration built on it would avoid this; it is not used
+  yet.
+- **The slot check's own calls take no lock and allocate nothing, verified.**
+  Under Wine, `NtQueryInformationThread(ThreadBasicInformation)` is one
+  `wine_server_call` (per-thread request and reply pipes, signal masking, no
+  mutex, no allocation). An own-process `ReadProcessMemory` is `memmove` under
+  `__TRY` after `virtual_check_buffer_for_write` on our own buffer, with no
+  wineserver call. Only a fault (an unreadable source page) goes further:
+  `segv_handler` takes `virtual_mutex`, which no confirmed-suspended thread can
+  hold (above), then recovers through `longjmp`; Valve's fork adds a lock-free
+  `steamclient_handle_fault` lookup there. Debug traces, when `WINEDEBUG`
+  enables them, are formatted into a per-thread buffer and written with
+  `write(2)`. On Windows, `kernelbase!ReadProcessMemory` calls
+  `ntdll!NtReadVirtualMemory`, and on failure `RtlNtStatusToDosError` and
+  `RtlSetLastWin32Error` (not disassembled further); `NtReadVirtualMemory` and
+  `NtQueryInformationThread` are bare `syscall` stubs. `src/threads.rs` makes
+  the same calls.
 - A thread left suspended by a failed resume may hold the process heap lock. The
   vectors dropped after the thaw, and the caller formatting the error, may then
-  deadlock. `src/threads.rs` in T7Patch-rs has the same exposure. Wine's
-  `NtQuerySystemInformation` may allocate on its Unix side, from an allocator a
-  suspended thread could hold (not verified); `src/threads.rs` shares that too.
+  deadlock. `src/threads.rs` in T7Patch-rs has the same exposure.
 - A thread that has started (has a TEB) but cannot reach its suspension point
   would still make `GetThreadContext` block under Wine; nothing bounds that call.
   No such case has been observed. A bounded design would read contexts on a
@@ -206,8 +250,3 @@ removed. Neither changes behaviour.
   It does not see the calling thread's own stack (a `remove_hook` called from code
   that a trampoline's relocated `call` is returning into), trampoline pointers
   saved in heap or global data, or the saved contexts and stacks of idle fibers.
-  On Wine, `NtQueryInformationThread` makes a wineserver call and
-  `ReadProcessMemory` on the own process copies under an exception handler while
-  threads are suspended. Neither allocates on the Rust side; that neither takes a
-  lock or allocates inside Wine was not audited for the Proton version in use
-  (`src/threads.rs` makes the same calls).
