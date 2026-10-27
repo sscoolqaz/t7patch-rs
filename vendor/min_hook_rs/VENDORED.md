@@ -6,7 +6,7 @@
   are unchanged. `src/lib.rs` carries only the lint and format changes listed under
   "Lint changes". `src/buffer.rs` has those plus a test-only slot counter
   (`used_slots`). `src/trampoline.rs` and `src/instruction.rs` change for patches 13
-  and 14.
+  and 14. `src/hook.rs` drives the shared `thread_freeze` engine (patch 15).
 - T7Patch-rs reaches it only through `src/ffi.rs`. It is a workspace member, so
   `cargo test --workspace` and `cargo clippy --workspace` cover it.
 
@@ -15,7 +15,9 @@
 - `Cargo.toml` is upstream's `Cargo.toml.orig`, minus its `[profile.release]`
   section (profiles of a non-root package are ignored and Cargo warns about them).
   It adds the `Wdk_System_SystemInformation` and `Wdk_System_Threading` features of
-  `windows-sys` for patch 9.
+  `windows-sys` for patch 9, and a path dependency on the workspace's
+  `thread_freeze` crate (patch 15; a dev-dependency on it with the `test-seams`
+  feature for the hook tests' fault wrapper).
 - The registry files `.cargo-ok`, `.cargo_vcs_info.json`, `.gitignore` and
   `Cargo.lock` are not copied.
 
@@ -23,6 +25,18 @@
 
 The behaviour patches are in `src/hook.rs` and `src/error.rs`, and for patches 13
 and 14 also in `src/trampoline.rs` and `src/instruction.rs`.
+
+Since patch 15 the thread-freeze mechanics (patches 2–5, 9, 10) live in the
+workspace crate `thread_freeze`, shared with `src/threads.rs` in T7Patch-rs, so
+the two callers no longer carry the same policy twice. `src/hook.rs` keeps
+MinHook's own policy — moving a suspended thread's RIP out of a trampoline, the
+slot reach check (patch 8), the footprint re-check (patch 14), the protection
+journal and flush — and drives the engine's `Freeze`. The engine owns the single
+terminal thaw latch both callers read, captures one `CONTEXT_CONTROL |
+CONTEXT_INTEGER` context per thread, and leaks its handles and buffers (and the
+caller's scratch) rather than dropping them after a failed thaw. The patch
+descriptions below are of behaviour the engine now provides; the names
+(`FrozenThreads`, `ThreadList`) are historical.
 
 1. **Error codes.** `HookError::ThreadSuspend` (13), `HookError::ThreadContext`
    (14) and `HookError::ThreadResume` (15) are new, with `as_str` and `from_code`
@@ -120,6 +134,15 @@ and 14 also in `src/trampoline.rs` and `src/instruction.rs`.
    freeze fails closed.
    After 16 disturbed attempts the freeze gives up with `ThreadSuspend`, or
    `ThreadContext` if the last one failed a context read.
+   Since patch 15 the second enumeration (the frozen recheck) differs by host.
+   On Windows it re-enumerates with `NtQuerySystemInformation`, a plain syscall
+   there. On Wine that call allocates on its Unix side (see Known limits), so the
+   recheck instead walks the live thread list with `NtGetNextThread` (one
+   wineserver call, no Unix-side allocation, bounded) and confirms a size-0
+   `SystemProcessInformation` length fingerprint of the whole prefix is unchanged
+   across the freeze. A listed thread that is neither this one nor already held,
+   and has not exited, was created during the freeze: it is never suspended and
+   the attempt restarts. The idea is from neohook; see below.
    Enumeration uses `NtQuerySystemInformation(SystemProcessInformation)` into a
    buffer sized with headroom before the freeze, and ids go into fixed arrays, so
    nothing allocates on the Rust side while threads are suspended. Toolhelp is
@@ -197,6 +220,21 @@ and 14 also in `src/trampoline.rs` and `src/instruction.rs`.
    foreign bytes over a hook's jump are never overwritten with the backup. The code
    is not re-checked after a rollback write in the same freeze.
 
+15. **One shared freeze engine.** The thread-freeze policy, which `src/hook.rs`
+   and `src/threads.rs` in T7Patch-rs carried separately, moved to the workspace
+   crate `thread_freeze` (the vendor depends on it by path; it never depends on the
+   application crate). The engine's `Freeze<O>` is generic over a `ThreadOps`
+   trait, so the hook tests drive the real freeze through a fault-injecting wrapper
+   (`FaultOps`, behind the engine's `test-seams` feature) and the engine has its own
+   fake-ops unit tests. `src/hook.rs` keeps every MinHook-specific policy and maps
+   the engine's `FreezeError`/`AcquireError` to `ThreadSuspend`/`ThreadContext`/
+   `ThreadResume` as before. The single terminal thaw latch now lives in the engine,
+   read by both callers. On a failed thaw the engine keeps (leaks) its handles,
+   contexts and ops rather than dropping them, and each caller keeps its own
+   scratch (`moves`/`journal`/`slots`; `batch`/`watch`; `reports`), because a stuck
+   thread may hold the heap lock a drop would take. The enumeration's Wine recheck
+   now uses `NtGetNextThread` (patch 9).
+
 ## Ideas borrowed from neohook
 
 [neohook](https://github.com/aliendwarf/neohook) 0.16.0 (crates.io), by AlienDwarf,
@@ -213,6 +251,14 @@ built or linked, and is not a dependency.
   unreadable page as a reason to keep the slot (neohook skips uncommitted or guarded
   pages). neohook's retire queue, its suspend and reclamation code, and its
   return-address handling are not used.
+- The `NtGetNextThread` enumeration (patch 9, `thread_freeze` crate), from
+  `src/reclaim.rs` (`nt_get_next_thread`): walk the process's threads with the
+  allocation-free `NtGetNextThread` instead of a heap-allocating snapshot while
+  threads are suspended. neohook resolves it with `GetProcAddress` and falls back
+  to Toolhelp, and its `catch_up_new_threads` suspends threads that appear late;
+  this engine does neither (the Wine hang fixed in commit 95213b1 means late
+  threads are never suspended), binds `NtGetNextThread` as a raw-dylib import, and
+  pairs the walk with the prefix fingerprint above.
 - Patch 13, from `src/transaction.rs` (the stolen-bytes check at attach, lines
   971-981, repeated at commit, lines 1414-1421, and `ranges_overlap`, line 2800):
   refuse a hook whose bytes overlap a queued or installed hook's. Ours compares
@@ -255,19 +301,23 @@ Windows 11 26100 `kernelbase.dll` 10.0.26100.9278 and `ntdll.dll` 10.0.26100.954
   unmasked: the PE-side process heap lock and loader lock, and, while it runs
   Unix-side code (a Wine Unix library, a graphics driver), glibc's `malloc`
   arena mutexes and its stdio `list_all_lock`.
-- **The enumeration allocates inside Wine while threads are suspended.**
-  `NtQuerySystemInformation(SystemProcessInformation)` runs
-  `get_system_process_info`, which `malloc`s a buffer of the caller's size and
-  `free`s it, and for every process the wineserver lists (every Wine process of
-  the prefix) and every one of its threads `fopen`s and `fclose`s
-  `/proc/<pid>/status` and `/proc/<pid>/task/<tid>/stat`. In glibc `malloc`
-  and `free` take an arena mutex, and `fopen` and `fclose` take the global
-  `list_all_lock`. A frozen thread suspended inside glibc `malloc` (on a
-  shared arena) or `fopen`/`fclose`/`fflush(NULL)` would deadlock the freeze
-  on its second enumeration. Not observed. `src/threads.rs` has the same
-  exposure. Wine's `NtGetNextThread` is one wineserver call with no Unix-side
-  allocation, so an enumeration built on it would avoid this; it is not used
-  yet.
+- **The frozen recheck no longer allocates inside Wine (patch 9).** The second
+  enumeration, which runs while threads are suspended, used
+  `NtQuerySystemInformation(SystemProcessInformation)`;
+  `get_system_process_info` `malloc`s a buffer and `fopen`s `/proc/<pid>/status`
+  and `/proc/<pid>/task/<tid>/stat` for every thread of every Wine process, and
+  glibc `malloc`/`fopen` take an arena mutex / the stdio `list_all_lock`, so a
+  thread suspended inside one would deadlock the freeze. On Wine the recheck now
+  walks `NtGetNextThread` (one wineserver call, no Unix-side allocation) plus a
+  size-0 fingerprint. Residual, Wine only: `NtGetNextThread` silently skips a
+  thread the wineserver cannot hand out a handle for (a thread created with a
+  restrictive security descriptor — threads get none by default, so this needs a
+  deliberately set one — or a wineserver out of memory), so a thread created in
+  the freeze window that is both unhandleable and exactly offset by another
+  thread or process exiting in the same window would be missed. On Windows the
+  recheck still re-enumerates (a plain syscall). The first, pre-suspend
+  enumeration still uses `SystemProcessInformation` on both hosts, which is safe
+  because nothing is suspended then.
 - **The slot check's own calls take no lock and allocate nothing, verified.**
   Under Wine, `NtQueryInformationThread(ThreadBasicInformation)` is one
   `wine_server_call` (per-thread request and reply pipes, signal masking, no

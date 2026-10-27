@@ -6,6 +6,7 @@ version = 4
 name = "min_hook_rs"
 version = "2.2.1"
 dependencies = [
+ "thread_freeze",
  "windows-sys",
 ]
 
@@ -43,7 +44,16 @@ name = "t7patch"
 version = "0.1.0"
 dependencies = [
  "min_hook_rs",
+ "thread_freeze",
  "windows",
+]
+
+[[package]]
+name = "thread_freeze"
+version = "0.1.0"
+dependencies = [
+ "windows-link",
+ "windows-sys",
 ]
 
 [[package]]

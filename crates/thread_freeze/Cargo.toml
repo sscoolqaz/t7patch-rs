@@ -1,0 +1,36 @@
+[package]
+name = "thread_freeze"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Process-local thread freezing shared by T7Patch-rs and its vendored MinHook port"
+publish = false
+
+[features]
+# Enables the per-thread fault seams for the callers' tests. Dev-dependencies turn
+# it on; a release build must not. The compile_error in lib.rs enforces that.
+test-seams = []
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Wdk_System_SystemInformation",
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]
+
+[dependencies.windows-link]
+version = "0.2.1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unreadable_literal = "allow"

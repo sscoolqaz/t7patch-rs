@@ -7,7 +7,7 @@ description = "Rust port of shiversoftdev's T7Patch for Black Ops III"
 publish = false
 
 [workspace]
-members = ["vendor/min_hook_rs"]
+members = ["vendor/min_hook_rs", "crates/thread_freeze"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -32,6 +32,11 @@ windows = { version = "0.62.2", features = [
 ] }
 # Pure-Rust port of MinHook; see `src/ffi.rs`.
 min_hook_rs = { path = "vendor/min_hook_rs" }
+# Shared thread-freeze engine; see `src/threads.rs`.
+thread_freeze = { path = "crates/thread_freeze" }
+
+[dev-dependencies]
+thread_freeze = { path = "crates/thread_freeze", features = ["test-seams"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -50,3 +50,10 @@ features = [
 [lib]
 name = "min_hook_rs"
 crate-type = ["rlib"]
+
+[dependencies.thread_freeze]
+path = "../../crates/thread_freeze"
+
+[dev-dependencies.thread_freeze]
+path = "../../crates/thread_freeze"
+features = ["test-seams"]

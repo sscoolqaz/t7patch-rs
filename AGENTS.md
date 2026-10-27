@@ -34,7 +34,9 @@ prebuilt `.lib` files, and no dependency that compiles C. Hooking uses
 `min_hook_rs`, a pure-Rust port of MinHook, vendored in `vendor/min_hook_rs`
 with fail-closed freeze patches (see its `VENDORED.md`). It is a workspace
 member, so run clippy and the tests with `--workspace`. Reach the hooking
-library only through `src/ffi.rs`.
+library only through `src/ffi.rs`. The thread-freeze mechanics it and
+`src/threads.rs` share live in the `crates/thread_freeze` workspace crate; the
+vendor depends on it by path and never on the application crate.
 
 ## Conventions
 
@@ -85,11 +87,15 @@ handling, a staged lifecycle with rollback, a managed config worker, restore on
 unload of hooks, Steam vtable slots, the lobby marker and the update-preload
 pointer, and a fixed crash queue with a safe stack probe. Further hardening:
 
-- Code writes freeze threads through `NtQuerySystemInformation`, with no
-  allocation on the Rust side after the first suspend. Under Wine the
-  enumeration itself allocates and opens `/proc` files on its Unix side; see
-  the Known limits in `vendor/min_hook_rs/VENDORED.md`. A thread that cannot
-  be resumed keeps its handle and disables further code writes (terminal).
+- Code writes and hook changes freeze threads through the shared
+  `thread_freeze` engine, with no allocation on the Rust side after the first
+  suspend. The candidate snapshot uses `NtQuerySystemInformation` before any
+  suspend; the frozen recheck re-enumerates on Windows but walks
+  `NtGetNextThread` on Wine, where the snapshot call allocates on its Unix side
+  (see the Known limits in `vendor/min_hook_rs/VENDORED.md`). A thread that
+  cannot be resumed keeps its handle and disables further code writes and hook
+  changes (terminal, one process-wide latch); the engine and callers then keep
+  their buffers rather than dropping them.
 - Each freeze, here and in the vendored hook library, is a bounded run of
   attempts. A thread created during the freeze is never suspended; it, a
   thread with no TEB yet (one Wine has not started, whose context read would
