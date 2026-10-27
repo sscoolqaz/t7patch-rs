@@ -4,8 +4,9 @@
 //! the offset table, the `MinHook` bindings, the Arxan bypass, the campaign
 //! script fix, the protection module, the Lua symbol tables, the hooks, the
 //! exception-dispatch hook, the staged patch lifecycle, thread freezing for
-//! executable code writes, and the DLL entry point. None of it has run in the
-//! game yet.
+//! executable code writes, and the DLL entry point. Earlier builds have hosted
+//! lobbies and played rounds under Proton; see `docs/validation.md` for the
+//! current tested scope and the hardening changes still unverified in game.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

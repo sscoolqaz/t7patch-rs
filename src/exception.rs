@@ -7,7 +7,8 @@
 //! fatal faults.
 //!
 //! The mechanism depends on undocumented ntdll internals. It is the riskiest
-//! part of the port and has not been run against the game.
+//! part of the port. The Wine dispatcher path has been exercised in game under
+//! Proton; the Windows path has no in-game validation. See `docs/validation.md`.
 
 use std::ffi::{CStr, c_void};
 use std::fs::OpenOptions;

@@ -295,7 +295,7 @@ descriptions below are of behaviour the engine now provides; the names
    with the entire stolen range inside its declared prologue and linear decoded
    control flow (ordinary calls allowed), is eligible. Mid-function targets, code
    past that prologue, jumps/returns, missing/unreadable/uncertain data all install
-   **without metadata**, by the user's compatibility policy. No uncertain entry
+   **without metadata**, by compatibility policy. No uncertain entry
    is registered. The lookup API itself still trusts OS image/table registration
    and third-party callbacks, just as an ordinary stack walk does.
 
@@ -479,7 +479,7 @@ Windows 11 26100 `kernelbase.dll` 10.0.26100.9278 and `ntdll.dll` 10.0.26100.954
   real caller. This patch therefore does not make that fast API walk dynamic
   frames. Actual raised-exception propagation through a slot is not tested;
   source/disassembly establish dispatcher lookup, and live tests validate frame
-  recovery. Older Windows runtimes and Phase 5 in-game behavior are unverified.
+  recovery. Older Windows runtimes and in-game behavior of the unwind metadata are unverified.
 
 - **How Wine suspends.** `SuspendThread` reaches the thread as SIGUSR1, and
   `usr1_handler` parks it in `wait_suspend`. SIGUSR1 is in `server_block_set`,

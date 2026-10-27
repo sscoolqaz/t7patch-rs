@@ -5,13 +5,20 @@ the anti-crash and security patch for Call of Duty: Black Ops III (Windows x64).
 based on commit `16b9b50662c68149526039cdf2ebdad348b9ca70` (2026-10-01, "Fix Campaign
 Transitioning and Fix Linux Password Sanitization"), with additional safety fixes on top.
 
-Status: ports upstream T7Patch plus safety fixes: bounded chat, IM and event-index
-handling, a staged lifecycle with rollback, a managed config worker, restore on unload of
-hooks, Steam vtable slots, the lobby marker and the update-preload pointer, and a fixed
-crash queue with a safe stack probe. The full patch has been exercised in game under
-Proton: it hosts a lobby and plays rounds. That does not mean every protection, campaign
-or Lua path has been verified. It is untested in game on Windows. The tests pass under
-Wine and on native Windows 11.
+The upstream patch is ported, with additional safety fixes for packet parsing,
+hook relocation and lifetime, thread freezing, rollback, configuration and crash
+handling. This is a Windows x64 DLL; Linux support means running it through
+Proton/Wine.
+
+In-game testing under Proton has hosted lobbies and played rounds. The later
+iced-x86 relocation changes also have a reported in-game smoke test. The latest
+dynamic unwind metadata changes have passed Wine and native Windows 11 tests,
+but have not been exercised in game. Campaign and Lua paths remain unverified
+in game, and there has been no Windows in-game test. See
+[validation and limitations](docs/validation.md) for the tested scope.
+
+Supported executable fingerprints are the February and September 2026 builds,
+detected by PE timestamp and image size in [`src/build.rs`](src/build.rs).
 
 Two states are deliberately retained after unload: the exception dispatcher once an
 induced-exception patch (the lobby marker or the `IsProcessorFeaturePresent` detour) has
@@ -22,6 +29,8 @@ there is no verified dvar finder address to restore them.
 
 ## Documentation
 
+- [`docs/validation.md`](docs/validation.md): current test evidence, hardening
+  coverage and remaining limitations.
 - [`docs/testing-under-proton.md`](docs/testing-under-proton.md): running the patch in
   game under Proton, switching components off with `T7PATCH_ONLY`, reading
   `crashes.log` and the trace lines, and capturing live game memory.
@@ -51,13 +60,20 @@ there is no verified dvar finder address to restore them.
 
 ## Build
 
-The project is Rust only. Hooking uses `min_hook_rs`, a pure-Rust port of
-MinHook vendored in `vendor/min_hook_rs` with fail-closed freeze patches, so no C compiler is needed, only the toolchain's linker. The crate builds
-only for Windows targets, so on Linux the tests run under Wine (below).
+Rust 1.87 or newer is required. The project is Rust only, with no C/C++ build
+scripts or prebuilt native libraries. Hooking uses the vendored pure-Rust
+`min_hook_rs`, iced-x86 relocation, a shared thread-freeze engine, and dynamic
+unwind metadata where the original prologue can be described safely. Details
+and dependency notices are in
+[`vendor/min_hook_rs/VENDORED.md`](vendor/min_hook_rs/VENDORED.md).
 
-On Windows with MSVC:
+Both build paths need the target's linker. On Linux, tests run under Wine;
+ordinary `cargo test` on a Linux target cannot build this Windows-only crate.
+
+On Windows with the MSVC linker and Windows SDK installed:
 
 ```bash
+rustup target add x86_64-pc-windows-msvc
 cargo test --workspace
 cargo build --release --target x86_64-pc-windows-msvc
 ```
@@ -70,7 +86,8 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The DLL is `target/x86_64-pc-windows-gnu/release/t7patch.dll`. It needs no
+The output is `target/<target>/release/t7patch.dll`, for example
+`target/x86_64-pc-windows-gnu/release/t7patch.dll`. It needs no
 mingw runtime DLLs, and it loads in the game under Proton. Run the tests under Wine
 with:
 
@@ -83,6 +100,44 @@ stack-cookie failures, and a Rust-only DLL has no `/GS` checks.
 Other departures from upstream are listed in
 [`docs/upstream-differences.md`](docs/upstream-differences.md).
 
+## Loading and configuration
+
+Building produces the patch DLL, not an installer or loader. The tested Proton
+setup uses upstream-compatible `dsound.dll` and `t7patchloader.dll` components;
+these are not included here. Simply placing `t7patch.dll` in the game folder
+does not invoke its installation exports. Follow
+[the loading instructions](docs/testing-under-proton.md#loading-the-dll),
+including the Proton DLL override.
+
+`t7patch.conf` is created in the game's working directory and watched for
+changes. It contains `playername`, `isfriendsonly`, `autoinstallmods`, and
+`networkpassword`. The default is friends-only, automatic mod installation off,
+and an empty password. Keep your populated config and raw crash/memory captures
+out of commits and public issue reports.
+
+`Unload` deactivates the patch logically; it does not physically unload the DLL.
+The retained dispatcher/dvar state is described above and in
+[upstream differences](docs/upstream-differences.md#state-retained-after-unload).
+
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) for address translation, unsafe-code conventions,
+provenance and commit requirements. Enable the checks with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Every commit must pass formatting, Clippy for both Windows targets, and the
+workspace tests. The exact commands are in
+[the Rust checks workflow](.skills/rust-checks/SKILL.md).
+
+## License status
+
+No project-wide license is declared for this port, matching the pinned upstream.
+Third-party dependencies and vendored components retain their own licenses;
+their notices do not constitute a license for the entire project.
+
 ## Credits
 
 Original T7Patch by shiversoftdev, with updates by Scropts. Thanks to the upstream
@@ -90,3 +145,8 @@ maintainers for their work.
 
 Hooking uses `min_hook_rs` by Rukkhadevata123, a pure-Rust port of MinHook, vendored in `vendor/min_hook_rs`
 under its MIT licence (`vendor/min_hook_rs/LICENSE`; changes in `VENDORED.md`).
+
+Relocation uses [iced-x86](https://github.com/icedland/iced) under MIT. Selected
+hardening ideas come from [neohook](https://github.com/aliendwarf/neohook)
+0.16.0; no neohook code or dependency is included. Its retained MIT notice and
+the exact provenance are documented in the vendored notes.

@@ -1,3 +1,22 @@
 /target
 *.dll
 *.pdb
+
+# Runtime settings can contain a network password; captures can contain user data.
+/t7patch.conf
+/capture/
+*.log
+*.dmp
+*.bin
+
+# Local credentials and agent/navigation state are not project source.
+.env
+.env.*
+!.env.example
+/.mcp.json
+/.graphify-local/
+/graphify-out/
+/.graphify/
+/.claude/
+/.opencode/
+/AGENTS.local.md
