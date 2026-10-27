@@ -1,8 +1,14 @@
 //! Memory buffer management for MinHook-rs
 //!
 //! This module provides memory allocation and management functionality
-//! for trampoline functions. Direct port of buffer.c.
+//! for trampoline functions. Direct port of buffer.c, with stable unwind metadata
+//! beside each 64-byte code slot (VENDORED patch 17). Function-table deletion and
+//! repair run outside freezes; an error keeps the allocation intact.
 
+use crate::error::Result;
+use crate::instruction::Trampoline;
+use crate::trampoline::Snapshot;
+use crate::unwind::Metadata;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Mutex;
@@ -27,12 +33,22 @@ const PAGE_EXECUTE_FLAGS: u32 =
 
 /// Memory slot
 #[repr(C)]
-union MemorySlot {
+union CodeSlot {
     /// Pointer to next free slot
     next: *mut MemorySlot,
     /// Buffer data
     buffer: [u8; MEMORY_SLOT_SIZE],
 }
+
+/// A code slot and its stable, separately addressed unwind metadata.
+#[repr(C)]
+struct MemorySlot {
+    code: CodeSlot,
+    metadata: Metadata,
+}
+
+/// Retirement includes pointers an active unwinder holds to the metadata.
+pub(crate) const SLOT_REACH_SIZE: usize = size_of::<MemorySlot>();
 
 /// Memory block info
 #[repr(C)]
@@ -65,6 +81,8 @@ impl BufferManager {
     fn get_memory_block(&mut self, origin: *mut c_void) -> *mut MemoryBlock {
         let mut block = self.blocks;
 
+        // SAFETY: the manager lock owns the block list; fresh VirtualAlloc
+        // memory is zeroed, writable, and partitioned into complete slots.
         unsafe {
             let mut si = std::mem::zeroed::<SYSTEM_INFO>();
             GetSystemInfo(&mut si);
@@ -158,8 +176,8 @@ impl BufferManager {
                 (*block).free = ptr::null_mut();
                 (*block).used_count = 0;
 
-                while (slot as usize) - (block as usize) <= MEMORY_BLOCK_SIZE - MEMORY_SLOT_SIZE {
-                    (*slot).next = (*block).free;
+                while (slot as usize) - (block as usize) <= MEMORY_BLOCK_SIZE - SLOT_REACH_SIZE {
+                    (*slot).code.next = (*block).free;
                     (*block).free = slot;
                     slot = slot.add(1);
                 }
@@ -173,21 +191,23 @@ impl BufferManager {
     }
 
     /// Allocate a buffer
-    fn allocate_buffer(
-        &mut self,
-        origin: *mut c_void,
-    ) -> Result<*mut c_void, crate::error::HookError> {
+    fn allocate_buffer(&mut self, origin: *mut c_void) -> Result<*mut c_void> {
         let block = self.get_memory_block(origin);
         if block.is_null() {
             return Err(crate::error::HookError::MemoryAlloc);
         }
 
+        // SAFETY: get_memory_block returned an owned block with a free physical
+        // slot, large enough for both the code and initialized metadata.
         unsafe {
             // Remove an unused slot from the list
             let slot = (*block).free;
-            (*block).free = (*slot).next;
+            (*block).free = (*slot).code.next;
             (*block).used_count += 1;
 
+            // SAFETY: the entire physical slot belongs to this fresh allocation;
+            // zero is valid for the plain metadata fields, including its bool.
+            ptr::write_bytes(slot.cast::<u8>(), 0, SLOT_REACH_SIZE);
             #[cfg(debug_assertions)]
             {
                 // Fill the slot with INT3 for debugging
@@ -199,11 +219,14 @@ impl BufferManager {
     }
 
     /// Free a buffer
-    fn free_buffer(&mut self, buffer: *mut c_void) {
+    fn free_buffer(&mut self, buffer: *mut c_void) -> Result<()> {
         if buffer.is_null() {
-            return;
+            return Ok(());
         }
 
+        // SAFETY: callers release only slots this manager owns and has verified
+        // unreachable. The list lock prevents concurrent reuse; failed deletion
+        // returns before touching the free list or the allocation.
         unsafe {
             let mut block = self.blocks;
             let mut prev: *mut MemoryBlock = ptr::null_mut();
@@ -212,6 +235,8 @@ impl BufferManager {
             while !block.is_null() {
                 if (block as usize) == target_block {
                     let slot = buffer as *mut MemorySlot;
+                    // No freeze is active. A failure keeps both code and table.
+                    (*slot).metadata.release()?;
 
                     #[cfg(debug_assertions)]
                     {
@@ -220,7 +245,7 @@ impl BufferManager {
                     }
 
                     // Restore the released slot to the list
-                    (*slot).next = (*block).free;
+                    (*slot).code.next = (*block).free;
                     (*block).free = slot;
                     (*block).used_count -= 1;
 
@@ -242,20 +267,66 @@ impl BufferManager {
                 block = (*block).next;
             }
         }
+        Ok(())
     }
 
-    /// Uninitialize the buffer system
-    fn uninitialize(&mut self) {
+    fn restore_unwind_tables(&mut self) -> Result<()> {
+        let mut block = self.blocks;
+        while !block.is_null() {
+            // SAFETY: the manager owns every block and its complete physical
+            // slots. Free slots have no described metadata. No freeze is active.
+            unsafe {
+                let mut slot = block
+                    .cast::<u8>()
+                    .add(size_of::<MemoryBlock>())
+                    .cast::<MemorySlot>();
+                while slot as usize - block as usize <= MEMORY_BLOCK_SIZE - SLOT_REACH_SIZE {
+                    (*slot).metadata.restore()?;
+                    slot = slot.add(1);
+                }
+                block = (*block).next;
+            }
+        }
+        Ok(())
+    }
+
+    /// Uninitialize only after all registrations were successfully removed.
+    fn uninitialize(&mut self) -> Result<()> {
+        let mut scan = self.blocks;
+        while !scan.is_null() {
+            // SAFETY: blocks and all physical slots remain owned until this full
+            // pass succeeds. Free slots have zero/unregistered metadata.
+            unsafe {
+                let mut slot = scan
+                    .cast::<u8>()
+                    .add(size_of::<MemoryBlock>())
+                    .cast::<MemorySlot>();
+                while slot as usize - scan as usize <= MEMORY_BLOCK_SIZE - SLOT_REACH_SIZE {
+                    if let Err(error) = (*slot).metadata.unregister() {
+                        // All allocations remain owned. Repair earlier deletions
+                        // before returning; a failed repair is retried before any
+                        // future hook change, and no code mutation may bypass it.
+                        self.restore_unwind_tables()?;
+                        return Err(error);
+                    }
+                    slot = slot.add(1);
+                }
+                scan = (*scan).next;
+            }
+        }
         let mut block = self.blocks;
         self.blocks = ptr::null_mut();
 
         while !block.is_null() {
+            // SAFETY: every table was deleted above, and the caller verified
+            // these owned blocks unreachable before requesting destruction.
             unsafe {
                 let next = (*block).next;
                 VirtualFree(block as *mut c_void, 0, MEM_RELEASE);
                 block = next;
             }
         }
+        Ok(())
     }
 }
 
@@ -268,8 +339,13 @@ pub fn initialize_buffer() {
 }
 
 /// Uninitialize the buffer system
-pub fn uninitialize_buffer() {
-    BUFFER_MANAGER.lock().unwrap().uninitialize();
+pub fn uninitialize_buffer() -> Result<()> {
+    BUFFER_MANAGER.lock().unwrap().uninitialize()
+}
+
+/// Repair incomplete table cleanup before any hook mutation or freeze.
+pub(crate) fn restore_unwind_tables() -> Result<()> {
+    BUFFER_MANAGER.lock().unwrap().restore_unwind_tables()
 }
 
 /// Find previous free region
@@ -287,6 +363,7 @@ fn find_prev_free_region(
     try_addr -= allocation_granularity as usize;
 
     while try_addr >= min_addr as usize {
+        // SAFETY: VirtualQuery only queries mappings and writes our local record.
         unsafe {
             let mut mbi = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
             if VirtualQuery(
@@ -328,6 +405,7 @@ fn find_next_free_region(
     try_addr += allocation_granularity as usize;
 
     while try_addr <= max_addr as usize {
+        // SAFETY: VirtualQuery only queries mappings and writes our local record.
         unsafe {
             let mut mbi = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
             if VirtualQuery(
@@ -355,13 +433,25 @@ fn find_next_free_region(
 }
 
 /// Allocate a buffer
-pub fn allocate_buffer(origin: *mut c_void) -> Result<*mut c_void, crate::error::HookError> {
+pub fn allocate_buffer(origin: *mut c_void) -> Result<*mut c_void> {
     BUFFER_MANAGER.lock().unwrap().allocate_buffer(origin)
 }
 
 /// Free a buffer
-pub fn free_buffer(buffer: *mut c_void) {
-    BUFFER_MANAGER.lock().unwrap().free_buffer(buffer);
+pub fn free_buffer(buffer: *mut c_void) -> Result<()> {
+    BUFFER_MANAGER.lock().unwrap().free_buffer(buffer)
+}
+
+/// Register before publication. The slot and its metadata belong to the manager.
+pub(crate) fn register_unwind(ct: &Trampoline, snapshot: &Snapshot) -> Result<()> {
+    let _manager = BUFFER_MANAGER.lock().unwrap();
+    let slot = ct.trampoline.cast::<MemorySlot>();
+    // Each table needs its own non-overlapping lookup range. Wine chooses the
+    // first dynamic table whose BaseAddress..End covers the PC, even if the
+    // table's entries then have no match. A block-wide base would shadow slots.
+    let base = ct.trampoline as usize;
+    // SAFETY: create_trampoline allocated this slot, never published or freed it.
+    unsafe { (*slot).metadata.register(base, ct, snapshot) }
 }
 
 /// Check if address is executable. The address is only queried, never dereferenced.
@@ -370,6 +460,7 @@ pub fn is_executable_address(address: usize) -> bool {
         return false;
     }
 
+    // SAFETY: VirtualQuery never dereferences address, and mi is writable.
     unsafe {
         let mut mi = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
         VirtualQuery(
@@ -397,4 +488,29 @@ pub(crate) fn used_slots() -> usize {
         }
     }
     used
+}
+
+/// Snapshot of described tables for bulk cleanup/repair tests. Outside freezes.
+#[cfg(test)]
+pub(crate) fn described_tables() -> Vec<(usize, usize)> {
+    let manager = BUFFER_MANAGER.lock().unwrap();
+    let mut tables = Vec::new();
+    let mut block = manager.blocks;
+    while !block.is_null() {
+        // SAFETY: the manager lock protects every owned block and physical slot.
+        unsafe {
+            let mut slot = block
+                .cast::<u8>()
+                .add(size_of::<MemoryBlock>())
+                .cast::<MemorySlot>();
+            while slot as usize - block as usize <= MEMORY_BLOCK_SIZE - SLOT_REACH_SIZE {
+                if let Some(table) = (*slot).metadata.described_table() {
+                    tables.push(table);
+                }
+                slot = slot.add(1);
+            }
+            block = (*block).next;
+        }
+    }
+    tables
 }

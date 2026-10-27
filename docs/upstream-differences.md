@@ -29,6 +29,14 @@ executable memory and built trampolines with it: every relocation was correct
 (RIP-relative `lea`/`cmp`, a `jne` rewritten as an inverted `je` plus an
 absolute jump, and a relative `call`).
 
+Eligible relocated prologues now have dynamic x64 unwind metadata (vendored
+patch 17). Unknown or untranslatable original metadata preserves compatibility
+without registering a table. Native lookup/virtual unwind can cross those
+trampolines; the tested Windows fast `RtlCaptureStackBackTrace` implementation
+still stops at dynamic code. The complete eligibility, lifetime rules and
+Wine/Windows evidence are in
+[`VENDORED.md`](../vendor/min_hook_rs/VENDORED.md#known-limits).
+
 ## Upstream bugs found in game
 
 ### `LobbyMsgRW_PrepReadData` pointed into `LobbyMsg_HandleIM`

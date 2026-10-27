@@ -7,7 +7,8 @@
   replaces it). `src/lib.rs` carries the lint and format changes listed under
   "Lint changes" and drops `pub mod disasm`. `src/buffer.rs` has those plus a
   test-only slot counter (`used_slots`). `src/trampoline.rs` changes for patches
-  13, 14 and 16, `src/instruction.rs` for patch 13. `src/hook.rs` drives the
+  13, 14 and 16, `src/instruction.rs` for patch 13. `src/unwind.rs` and the
+  metadata sidecars in `src/buffer.rs` implement patch 17. `src/hook.rs` drives the
   shared `thread_freeze` engine (patch 15).
 - T7Patch-rs reaches it only through `src/ffi.rs`. It is a workspace member, so
   `cargo test --workspace` and `cargo clippy --workspace` cover it.
@@ -285,16 +286,78 @@ descriptions below are of behaviour the engine now provides; the names
    any freeze; iced allocates there. Tests: `trampoline::tests`, on crafted bytes at
    fake addresses, with the decoder's own checks in `hook::tests`.
 
+
+17. **Dynamic x64 unwind tables for eligible trampolines.** Before publication,
+   `unwind::source` looks up the target outside any freeze, then copies the
+   returned `RUNTIME_FUNCTION`, header and bounded unwind slots using
+   `ReadProcessMemory`. Arithmetic, alignment, function bounds, allocation
+   ownership and a consistent header are checked. Only an exact function start,
+   with the entire stolen range inside its declared prologue and linear decoded
+   control flow (ordinary calls allowed), is eligible. Mid-function targets, code
+   past that prologue, jumps/returns, missing/unreadable/uncertain data all install
+   **without metadata**, by the user's compatibility policy. No uncertain entry
+   is registered. The lookup API itself still trusts OS image/table registration
+   and third-party callbacks, just as an ordinary stack walk does.
+
+   The pure translator validates every source operation, including dropped ones:
+   version 1/2 only, no flags (chained and exception/termination handlers refused),
+   exact bounded/padded length, descending offsets, valid opinfo/registers and
+   frame setup, payload lengths and alignment. It translates PUSH_NONVOL,
+   ALLOC_LARGE/SMALL, SET_FPREG, SAVE_NONVOL/FAR and SAVE_XMM128/FAR. Opcodes 6/7
+   (legacy v1 forms or v2 EPILOG/SPARE), PUSH_MACHFRAME (10, synthetic rather than
+   an executed instruction), and unknown opcodes are explicitly refused. Operations
+   after `source_len` are dropped; kept offsets must equal a decoded instruction
+   end and map to its relocated end, including the final body boundary. The frame
+   register is retained only when its SET_FPREG was stolen. Kept memory saves
+   with a frame register, or kept saves/frame setup when a later push/allocation/
+   frame setup is dropped, are refused: their final-frame offsets cannot simply
+   be carried into a partial frame.
+
+   Generated metadata is **version 2 without epilogue descriptors**. Windows'
+   version-1 instruction heuristic otherwise mistakes the unchanged JmpAbs tail
+   or a CallAbs return's EB08 for an epilogue, even inside SizeOfProlog, and skips
+   frame recovery. SizeOfProlog includes the body and tail to suppress Wine's
+   separate heuristic too. The relay has a second, leaf entry: it is entered
+   before the stolen prologue executes, so applying its stack state would be
+   wrong. Runtime code bytes, relocation, `source_len`, `patch_above` and boundary
+   maps are unchanged.
+
+   A physical slot now holds the original 64-byte executable area followed by
+   stable table entries, a bounded 516-byte unwind area, leaf info and lifecycle
+   state (six physical slots per 4 KiB block). Each table uses its **slot** as
+   BaseAddress; its code and info are within one RVA window. A block-wide base
+   would make Wine's first matching dynamic range shadow other slots. Retirement
+   watches the whole physical slot, including pointers held by active unwinders.
+   Retained slots retain their registrations. The hook entry is reserved before
+   registration, so no fallible allocation follows a successful add.
+
+   Registration failure refuses creation (`UnwindRegistration`, 18). Deletion
+   failure reports `UnwindDeletion` (19) and keeps code, metadata and the tracked
+   hook. Bulk cleanup unregisters all tables before freeing any allocation; after
+   a partial failure it restores earlier deletions. If restoration also fails,
+   memory and the described-but-unregistered state remain. Create and transaction
+   entry points repair that state **before** any freeze or code mutation, or
+   refuse with `UnwindRegistration`. A terminal thaw is checked first. There is no
+   drop-time deregistration and no function-table API in a frozen window.
+
+   Tests cover pure operation translation/refusal, grow/shrink/end mapping, frame
+   setup and partial frames; live public lookup/virtual unwind from the callee of
+   a stolen call to the real caller, partial prologue states, tail and CallAbs
+   return positions, leaf relay, lookup-range independence, metadata-only reach,
+   cleanup and API failures including partial deletion plus failed restoration.
+
 ## Dependencies
 
 - [`iced-x86`](https://github.com/icedland/iced) 1.21.0, MIT, `rust-version`
   1.57, pure Rust with no build script. A real dependency, linked into the DLL, not
-  an idea port. Used only by `src/trampoline.rs` (patch 16) to decode the stolen
+  an idea port. `src/trampoline.rs` (patch 16) uses it to decode the stolen
   prologue, re-encode its relative branches and RIP-relative operands with
-  `BlockEncoder`, and re-decode the result for validation. Features:
+  `BlockEncoder`, and re-decode the result for validation. `src/unwind.rs`
+  (patch 17) also decodes the snapshot to require linear flow for metadata.
+  Features:
   `default-features = false`, `no_std`, `decoder`, `block_encoder` (and thereby
   `encoder`), `instr_info` (for `is_call_near`, `is_jcc_short_or_near` and
-  `condition_code`). It brings `lazy_static` 1.5.1 (MIT OR Apache-2.0) with
+  `condition_code`, and patch 17's `flow_control`). It brings `lazy_static` 1.5.1 (MIT OR Apache-2.0) with
   `spin_no_std`, which brings `spin` 0.9.9 (MIT, `rust-version` 1.38, `once`
   feature only). Their lazy tables are first filled in `create_hook`, before any
   freeze. The workspace was checked with Rust 1.87.0.
@@ -338,6 +401,15 @@ built or linked, and is not a dependency.
   MinHook's rules for where the trampoline ends, refuses EIP-relative operands and
   accesses to the patched bytes, and re-decodes iced's output to check it. iced-x86
   itself is a real dependency here (see "Dependencies"), not an idea port.
+- Patch 17, from `src/unwind.rs` in neohook 0.16.0: its module overview
+  (lines 2-26), `register_relocated` documentation/signature (117-154),
+  `register_codes` documentation/signature (156-173), translation documentation
+  (215-224), lifecycle documentation (322-342) and test names (444-487).
+  Only the idea, interfaces and test descriptions were read; no implementation
+  code was copied. Ours adds non-faulting source reads, stricter eligibility and
+  validation, per-slot sidecars, a separate leaf relay, version-2 no-epilogue
+  metadata, metadata-pointer retirement, reported API errors and repair after
+  partial cleanup. Its suspend/settle lifecycle is not used.
 - Patch 14 is not from neohook. neohook checks only that its patch has the stolen
   length before writing (`src/transaction.rs` line 2058), not that the bytes are
   still the ones it saved.
@@ -364,6 +436,50 @@ GE patches at `01bfbf67b354`; GE-Proton11-11 reports the same `wine-11.0
 (Staging)`). Every function named below is the same in all of them apart from
 refactors. glibc is 2.44. Windows findings were read from the disassembly of
 Windows 11 26100 `kernelbase.dll` 10.0.26100.9278 and `ntdll.dll` 10.0.26100.9549.
+
+
+- **Unwind-table research (patch 17).** Read upstream Wine 11.20 and 11.0
+  `dlls/ntdll/unwind.c` and `signal_x86_64.c`, plus Valve's `981e2f0b9007`
+  versions used by the documented GE-Proton build. `RtlAddFunctionTable` forwards
+  to `RtlAddGrowableFunctionTable`, which allocates a list node on the process
+  heap and links it under `dynamic_unwind_section`. Delete unlinks under that
+  critical section and frees the node afterwards. `lookup_dynamic_function_table`
+  takes the same lock; an ordinary table lookup does not allocate, while callback
+  work is arbitrary. The x64 `RtlLookupFunctionEntry` falls back to that dynamic
+  list after image lookup. The dispatcher's `virtual_unwind` calls public lookup
+  and `RtlVirtualUnwind2`, so exceptions in a slot consult dynamic data. Wine's
+  unwinder accepts v1/v2 but still scans instruction bytes for epilogues outside
+  SizeOfProlog. None of these lookup/registration/deletion APIs belongs in a freeze.
+
+  Native findings were checked on the VM's `ntdll.dll` **10.0.26100.9711**,
+  SHA-256 `651ac9041af8e6b5ebd331d53163244c0a27d36d1433f0f15cac1f28c5f2e82c`,
+  image base `0x180000000` (addresses below are RVAs). Add (`0xF0B70`) calls
+  `RtlAllocateHeap` at `0xF0C0A` and takes SRW exclusive locks. Delete (`0xE4750`)
+  takes exclusive locks and calls `RtlFreeHeap` at `0xE48A3`/`0xE490C`.
+  Public lookup's dynamic fallback (`0x1DA12` -> helper `0xE1380`) takes an SRW
+  shared lock at `0xE1398`, releases it at `0xE1585`, and does not call the heap
+  on the ordinary-table branch; callback tables release it before the callback.
+  `KiUserExceptionDispatcher` reaches the search helper at `0xC3A70`; that loop
+  calls public lookup at `0xC3DEA` and the virtual unwind core at `0xC3E53`.
+  `RtlUnwindEx` also calls public lookup at `0x1DB25`. Private helpers are
+  identified by call targets, not by objdump's nearest-export labels.
+
+  The virtual unwind core branches on version at `0x1F596`: v1 scans instruction
+  bytes, whereas v2 at `0x1F936` goes to normal unwind when there are no leading
+  EPILOG records. Microsoft's [.NET AMD64 unwinder](https://github.com/dotnet/runtime/blob/main/src/coreclr/unwinder/amd64/unwinder.cpp)
+  and [LLVM's Win64 emitter](https://github.com/llvm/llvm-project/blob/main/llvm/lib/MC/MCWin64EH.cpp)
+  corroborate the valid version-2/no-epilogue form. No source from either was
+  copied. Native tests verify partial states, the FF25 tail and EB08 return.
+
+- **Native fast backtrace limitation.** On that DLL, `RtlCaptureStackBackTrace`
+  (`0x70D50`) calls `RtlWalkFrameChain`; its worker (`0x1E760`) uses the internal
+  image-only lookup at `0x1ED50`, without the public dynamic fallback. The live
+  test observes helper + trampoline frames and then truncation. Captured context
+  walked with public `RtlLookupFunctionEntry`/`RtlVirtualUnwind` does reach the
+  real caller. This patch therefore does not make that fast API walk dynamic
+  frames. Actual raised-exception propagation through a slot is not tested;
+  source/disassembly establish dispatcher lookup, and live tests validate frame
+  recovery. Older Windows runtimes and Phase 5 in-game behavior are unverified.
 
 - **How Wine suspends.** `SuspendThread` reaches the thread as SIGUSR1, and
   `usr1_handler` parks it in `wait_suspend`. SIGUSR1 is in `server_block_set`,

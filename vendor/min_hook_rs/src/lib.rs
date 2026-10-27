@@ -35,6 +35,7 @@ pub mod error;
 pub mod hook;
 pub mod instruction;
 pub mod trampoline;
+mod unwind;
 
 // Re-export core types
 pub use error::{HookError, Result};

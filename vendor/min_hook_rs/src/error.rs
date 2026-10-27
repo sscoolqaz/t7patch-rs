@@ -69,6 +69,12 @@ pub enum HookError {
     /// The target's bytes no longer hold what the hook expects (the original code, or
     /// its own jump once enabled), or could not be read, so nothing was written
     TargetModified = 17,
+
+    /// The dynamic unwind table could not be registered; no hook was published.
+    UnwindRegistration = 18,
+
+    /// A table could not be deleted; its code and metadata remain allocated.
+    UnwindDeletion = 19,
 }
 
 impl HookError {
@@ -93,6 +99,8 @@ impl HookError {
             HookError::ThreadResume => "Thread resume failed",
             HookError::Overlapping => "Hook overlaps another hook",
             HookError::TargetModified => "Target code changed since the hook was created",
+            HookError::UnwindRegistration => "Unwind table registration failed",
+            HookError::UnwindDeletion => "Unwind table deletion failed",
         }
     }
 
@@ -117,6 +125,8 @@ impl HookError {
             15 => HookError::ThreadResume,
             16 => HookError::Overlapping,
             17 => HookError::TargetModified,
+            18 => HookError::UnwindRegistration,
+            19 => HookError::UnwindDeletion,
             _ => HookError::Unknown,
         }
     }

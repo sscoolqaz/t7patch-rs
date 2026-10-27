@@ -102,6 +102,14 @@ pointer, and a fixed crash queue with a safe stack probe. Further hardening:
   (reach of every re-based operand and branch, boundaries, the boundary map,
   size) before anything is written to the slot; anything uncertain refuses the
   hook. A branch out of rel32 reach keeps MinHook's absolute form.
+- Eligible trampolines carry dynamic x64 unwind tables (patch 17). Translation
+  is conservative; a missing or uncertain original record installs without a
+  table, by policy. The relay has separate leaf metadata. Table APIs run only
+  outside freezes, and retirement watches metadata pointers as well as code.
+  A failed table deletion retains the allocation; failed bulk cleanup restores
+  prior registrations, and hook changes refuse until any failed repair succeeds.
+  Native fast `RtlCaptureStackBackTrace` still truncates at dynamic code on the
+  tested Windows build; public lookup/virtual unwind crosses the trampoline.
 - Each freeze, here and in the vendored hook library, is a bounded run of
   attempts. A thread created during the freeze is never suspended; it, a
   thread with no TEB yet (one Wine has not started, whose context read would

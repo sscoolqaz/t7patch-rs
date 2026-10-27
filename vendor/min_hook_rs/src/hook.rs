@@ -11,10 +11,13 @@
 //! - Utility for working with Windows modules and function addresses
 //!
 //! Vendored into T7Patch-rs and patched: the freeze fails closed and hook changes
-//! apply as one transaction. See `VENDORED.md`.
+//! apply as one transaction. Eligible trampolines carry dynamic unwind tables;
+//! registration, deletion and repair run outside the frozen transaction. See
+//! `VENDORED.md`.
 
 use crate::buffer::{
-    MEMORY_SLOT_SIZE, free_buffer, initialize_buffer, is_executable_address, uninitialize_buffer,
+    SLOT_REACH_SIZE, free_buffer, initialize_buffer, is_executable_address, register_unwind,
+    restore_unwind_tables, uninitialize_buffer,
 };
 use crate::error::{HookError, Result};
 use crate::instruction::*;
@@ -304,7 +307,7 @@ impl SlotSet {
         starts.sort_unstable();
         let malformed = starts
             .iter()
-            .any(|&start| start.checked_add(MEMORY_SLOT_SIZE).is_none());
+            .any(|&start| start.checked_add(SLOT_REACH_SIZE).is_none());
         Self { starts, malformed }
     }
 
@@ -312,11 +315,11 @@ impl SlotSet {
         self.starts.is_empty()
     }
 
-    /// True when `address` lies in `[start, start + MEMORY_SLOT_SIZE)` of a slot.
+    /// True when `address` lies in `[start, start + SLOT_REACH_SIZE)` of a slot.
     fn contains(&self, address: usize) -> bool {
         // The last slot starting at or below `address`.
         let after = self.starts.partition_point(|&start| start <= address);
-        after > 0 && address - self.starts[after - 1] < MEMORY_SLOT_SIZE
+        after > 0 && address - self.starts[after - 1] < SLOT_REACH_SIZE
     }
 
     fn contains_word(&self, word: u64) -> bool {
@@ -939,6 +942,7 @@ impl HookManager {
         if thaw_failed() {
             return Err(HookError::ThreadResume);
         }
+        restore_unwind_tables()?;
         if batch.is_empty() && watch.is_empty() {
             return Ok(true);
         }
@@ -1201,7 +1205,7 @@ impl HookManager {
         let watch: Vec<usize> = (0..self.hooks.size).collect();
         let clear = self.transact_owned(batch, watch)?;
         if clear && !self.retain_buffers {
-            uninitialize_buffer();
+            uninitialize_buffer()?;
         } else {
             self.retain_buffers = true;
         }
@@ -1219,9 +1223,13 @@ impl HookManager {
     /// target's code, which is also the backup [`HookManager::transact`] checks
     /// before every write.
     fn create_hook(&mut self, target: *mut c_void, detour: *mut c_void) -> Result<*mut c_void> {
+        if thaw_failed() {
+            return Err(HookError::ThreadResume);
+        }
         if !self.heap {
             return Err(HookError::NotInitialized);
         }
+        restore_unwind_tables()?;
         if !is_executable_address(target as usize) || !is_executable_address(detour as usize) {
             return Err(HookError::NotExecutable);
         }
@@ -1238,7 +1246,7 @@ impl HookManager {
         let mut trampoline = Trampoline::new(target, detour, ptr::null_mut());
         if let Err(error) = create_trampoline(&mut trampoline, &snapshot) {
             // Never published: nothing points into the slot.
-            free_buffer(trampoline.trampoline);
+            free_buffer(trampoline.trampoline)?;
             return Err(error);
         }
         let mut entry = HookEntry::new();
@@ -1255,20 +1263,28 @@ impl HookManager {
             .then(|| snapshot_bytes(&snapshot, target as usize, start, len))
             .flatten();
         let Some(original) = original else {
-            free_buffer(trampoline.trampoline);
+            free_buffer(trampoline.trampoline)?;
             return Err(HookError::UnsupportedFunction);
         };
         entry.original[..len].copy_from_slice(&original[..len]);
         if self.overlaps_existing(start, len) {
-            free_buffer(trampoline.trampoline);
+            free_buffer(trampoline.trampoline)?;
             return Err(HookError::Overlapping);
         }
         let Some(slot) = self.add_hook_entry() else {
-            free_buffer(trampoline.trampoline);
+            free_buffer(trampoline.trampoline)?;
             return Err(HookError::MemoryAlloc);
         };
         *slot = entry;
-        Ok(slot.trampoline)
+        // Reserve the entry before registration: no fallible allocation follows
+        // a successful add. Both table APIs stay outside the frozen window.
+        if let Err(error) = register_unwind(&trampoline, &snapshot) {
+            let last = self.hooks.size - 1;
+            self.delete_hook_entry(last);
+            free_buffer(trampoline.trampoline)?;
+            return Err(error);
+        }
+        Ok(trampoline.trampoline)
     }
 
     /// True when `[start, start + len)` overlaps the footprint of an existing hook.
@@ -1296,7 +1312,7 @@ impl HookManager {
         };
         let clear = self.transact(batch, &[pos])?;
         if clear && !self.retain_buffers {
-            free_buffer(self.hooks.items[pos].trampoline);
+            free_buffer(self.hooks.items[pos].trampoline)?;
         } else {
             self.retain_buffers = true;
         }
@@ -1447,6 +1463,12 @@ mod tests {
         VirtualQuery,
     };
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable,
+        RtlCaptureContext, RtlCaptureStackBackTrace, RtlDeleteFunctionTable,
+        RtlLookupFunctionEntry, RtlVirtualUnwind,
+    };
 
     /// Hook tests share the global manager, so they run one at a time.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1941,8 +1963,8 @@ mod tests {
         let set = slots(&[0x9000, 0x1000]);
         assert!(!set.is_empty());
         assert!(set.contains(0x1000));
-        assert!(set.contains(0x1000 + MEMORY_SLOT_SIZE - 1));
-        assert!(!set.contains(0x1000 + MEMORY_SLOT_SIZE));
+        assert!(set.contains(0x1000 + SLOT_REACH_SIZE - 1));
+        assert!(!set.contains(0x1000 + SLOT_REACH_SIZE));
         assert!(!set.contains(0x0FFF));
         assert!(set.contains(0x9010));
         assert!(!set.contains(0x5000));
@@ -2590,7 +2612,7 @@ mod tests {
         // SAFETY: the slot was just allocated and filled by create_trampoline.
         let copied = unsafe { ptr::read(built.trampoline as *const [u8; 3]) };
         assert_eq!(copied, [0x31, 0xC0, 0xC3]);
-        free_buffer(built.trampoline);
+        free_buffer(built.trampoline).unwrap();
 
         // A snapshot that cuts an instruction off refuses the hook rather than
         // decode it short: mov eax, imm32 with only three of its five bytes read.
@@ -2605,6 +2627,381 @@ mod tests {
             create_trampoline(&mut short, &snapshot),
             Err(HookError::UnsupportedFunction)
         );
-        free_buffer(short.trampoline);
+        free_buffer(short.trampoline).unwrap();
+    }
+
+    static WALK_SLOT: AtomicU64 = AtomicU64::new(0);
+
+    fn runtime_entry(pc: usize) -> (*mut IMAGE_RUNTIME_FUNCTION_ENTRY, u64) {
+        let mut base = 0;
+        // SAFETY: queries registered unwind information, without a history cache.
+        let entry = unsafe { RtlLookupFunctionEntry(pc as u64, &mut base, ptr::null_mut()) };
+        (entry, base)
+    }
+
+    #[inline(never)]
+    extern "system" fn capture_from_stolen_call(_: u64) -> u64 {
+        let mut frames = [ptr::null_mut(); 32];
+        // SAFETY: writable array holds the requested maximum number of frames.
+        let count =
+            unsafe { RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), ptr::null_mut()) };
+        let frames = &frames[..usize::from(count)];
+        let slot = WALK_SLOT.load(Ordering::Relaxed) as usize;
+        let expected = runtime_entry(call_unwind_fixture as *const () as usize);
+        if !frames
+            .iter()
+            .any(|&pc| (slot..slot + 64).contains(&(pc as usize)))
+        {
+            return 0;
+        }
+        // Windows' fast CaptureStackBackTrace stops at the dynamic frame on
+        // 26100. Walk it with the documented lookup/virtual-unwind pair too.
+        #[repr(align(16))]
+        struct Aligned(CONTEXT);
+        let mut captured = Aligned(CONTEXT::default());
+        // SAFETY: aligned, writable context owned by this calling thread.
+        unsafe { RtlCaptureContext(&mut captured.0) };
+        for _ in 0..32 {
+            let pc = captured.0.Rip as usize;
+            let (entry, base) = runtime_entry(pc);
+            if entry.is_null() {
+                return 0;
+            }
+            let mut data = ptr::null_mut();
+            let mut frame = 0;
+            // SAFETY: the captured context walks our still-live calling stack;
+            // both compiler-generated and dynamic entries remain registered.
+            unsafe {
+                RtlVirtualUnwind(
+                    0,
+                    base,
+                    pc as u64,
+                    entry,
+                    &mut captured.0,
+                    &mut data,
+                    &mut frame,
+                    ptr::null_mut(),
+                )
+            };
+            if (slot..slot + 64).contains(&pc)
+                && !expected.0.is_null()
+                && runtime_entry(captured.0.Rip as usize) == expected
+            {
+                return 1;
+            }
+        }
+        0
+    }
+
+    #[inline(never)]
+    fn call_unwind_fixture(function: MixFn) -> u64 {
+        // Work after the call prevents tail-call elimination of the real caller.
+        std::hint::black_box(function(7)).wrapping_add(1)
+    }
+
+    /// A dynamic function: sub rsp,40; call [helper]; add rsp,40; ret.
+    /// The stolen call returns at the injected jump back with a non-leaf frame.
+    struct UnwindFixture {
+        code: Crafted,
+        entry: *const IMAGE_RUNTIME_FUNCTION_ENTRY,
+    }
+
+    impl UnwindFixture {
+        fn new() -> Self {
+            let code = Crafted::new();
+            code.put(
+                0x700,
+                &[
+                    0x48, 0x83, 0xEC, 0x28, 0xFF, 0x15, 54, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28, 0xC3,
+                ],
+            );
+            code.put(
+                0x740,
+                &(capture_from_stolen_call as *const () as usize).to_le_bytes(),
+            );
+            // Prologue includes the call. The only stack effect is sub rsp,40.
+            code.put(0x980, &[1, 10, 1, 0, 4, 0x42, 0, 0]);
+            let record = IMAGE_RUNTIME_FUNCTION_ENTRY {
+                BeginAddress: 0x700,
+                EndAddress: 0x70F,
+                Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 { UnwindData: 0x980 },
+            };
+            let entry = code.address(0x900) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
+            // SAFETY: aligned space in this fixture's writable page; it stays live
+            // through deletion of this original table and every hook using it.
+            unsafe { ptr::write(entry, record) };
+            // SAFETY: entry and metadata are valid and stable in this allocation.
+            assert!(unsafe { RtlAddFunctionTable(entry, 1, code.base as u64) });
+            Self { code, entry }
+        }
+
+        fn target(&self) -> *mut c_void {
+            self.code.address(0x700) as *mut c_void
+        }
+        fn hook(&mut self) -> usize {
+            self.code.hook(0x700).unwrap() as usize
+        }
+
+        fn unwind_at(&self, pc: usize, allocated: bool) {
+            let mut stack = [0u64; 16];
+            stack[8] = 0x12345678;
+            let stack_top = stack.as_ptr() as usize + 8 * 8;
+            let (entry, base) = runtime_entry(pc);
+            assert!(!entry.is_null(), "missing metadata at {pc:X}");
+            let mut context = CONTEXT {
+                Rip: pc as u64,
+                Rsp: (stack_top - if allocated { 40 } else { 0 }) as u64,
+                ..CONTEXT::default()
+            };
+            let mut data = ptr::null_mut();
+            let mut establisher = 0;
+            // SAFETY: the registered metadata describes this synthetic frame;
+            // every memory read made by unwinding is inside `stack`.
+            unsafe {
+                RtlVirtualUnwind(
+                    0,
+                    base,
+                    pc as u64,
+                    entry,
+                    &mut context,
+                    &mut data,
+                    &mut establisher,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(
+                context.Rip, 0x12345678,
+                "pc={pc:X} allocated={allocated} base={base:X} rsp={:X} expected_stack={stack_top:X}",
+                context.Rsp
+            );
+            assert_eq!(context.Rsp, (stack_top + 8) as u64);
+        }
+    }
+
+    impl Drop for UnwindFixture {
+        fn drop(&mut self) {
+            crate::unwind::fault::ADD_FAIL.with(|f| f.set(false));
+            crate::unwind::fault::DELETE_FAIL.with(|f| f.set(false));
+            crate::unwind::fault::DELETE_SKIP.with(|f| f.set(0));
+            // Crafted's drop also handles failed-test cleanup; normal tests remove
+            // explicitly and assert the result, never relying on drop to unhook.
+            for target in self.code.targets.clone() {
+                let _ = remove_hook(target as *mut c_void);
+            }
+            self.code.targets.clear();
+            // SAFETY: no calls remain into this fixture; its table is still live.
+            assert!(unsafe { RtlDeleteFunctionTable(self.entry) });
+        }
+    }
+
+    #[test]
+    fn unwind_walk_crosses_a_stolen_call_and_partial_prologue_tail_and_relay() {
+        let _fixture = Fixture::new();
+        let mut generated = UnwindFixture::new();
+        let slot = generated.hook();
+        WALK_SLOT.store(slot as u64, Ordering::Relaxed);
+        generated.unwind_at(slot, false);
+        generated.unwind_at(slot + 4, true);
+        generated.unwind_at(slot + 10, true); // jump back, NOT an epilogue
+        let relay = {
+            let manager = get_manager().lock().unwrap();
+            manager.hooks.items[manager.find_hook_entry(generated.target())].detour as usize
+        };
+        generated.unwind_at(relay, false); // relay has not run the stolen sub
+        // SAFETY: the crafted function and trampoline follow MixFn's ABI.
+        let through: MixFn = unsafe { std::mem::transmute(slot) };
+        assert_eq!(
+            call_unwind_fixture(through),
+            2,
+            "walk did not reach the real caller"
+        );
+        generated.code.enable(0x700).unwrap();
+        generated.code.disable(0x700).unwrap();
+        generated.code.unhook(0x700).unwrap();
+        if !retain_buffers() {
+            assert!(runtime_entry(slot).0.is_null());
+        }
+    }
+
+    #[test]
+    fn metadata_only_stack_and_register_references_keep_the_unwind_table() {
+        let fixture = Fixture::new();
+        for on_stack in [false, true] {
+            let mut generated = UnwindFixture::new();
+            let slot = generated.hook();
+            let entry = runtime_entry(slot).0;
+            assert!(!entry.is_null());
+            // This pointer is OUTSIDE the executable 64-byte slot.
+            assert!(entry as usize >= slot + 64);
+            let holder = Holder::start(entry as usize, on_stack);
+            generated.code.unhook(0x700).unwrap();
+            assert_eq!(
+                fault::reach_of(holder.id),
+                Some(if on_stack {
+                    Reach::Stack
+                } else {
+                    Reach::Register
+                })
+            );
+            assert_eq!(runtime_entry(slot).0, entry);
+            assert!(retain_buffers());
+            drop(holder);
+        }
+        fixture.assert_threads_run();
+    }
+
+    #[test]
+    fn unwind_api_failures_keep_memory_and_report_errors() {
+        let _fixture = Fixture::new();
+        let mut generated = UnwindFixture::new();
+        let before = crate::buffer::used_slots();
+        crate::unwind::fault::ADD_FAIL.with(|f| f.set(true));
+        let result = generated.code.create(0x700);
+        crate::unwind::fault::ADD_FAIL.with(|f| f.set(false));
+        assert_eq!(result, Err(HookError::UnwindRegistration));
+        assert_eq!(crate::buffer::used_slots(), before);
+        let slot = generated.hook();
+        let entry = runtime_entry(slot).0;
+        // Direct buffer release isolates API error behavior from conservative
+        // reach findings made by unrelated test-harness threads.
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(true));
+        let released = free_buffer(slot as *mut c_void);
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(false));
+        assert_eq!(released, Err(HookError::UnwindDeletion));
+        assert_eq!(runtime_entry(slot).0, entry);
+        assert_eq!(crate::buffer::used_slots(), before + 1);
+        generated.code.unhook(0x700).unwrap();
+    }
+
+    #[test]
+    fn dynamic_tables_for_distinct_slots_do_not_shadow_each_other() {
+        let _fixture = Fixture::new();
+        let mut first = UnwindFixture::new();
+        let mut second = UnwindFixture::new();
+        let a = first.hook();
+        let b = second.hook();
+        assert!(!runtime_entry(a).0.is_null());
+        assert!(!runtime_entry(b).0.is_null());
+        assert_ne!(runtime_entry(a).0, runtime_entry(b).0);
+        first.unwind_at(a + 10, true);
+        second.unwind_at(b + 10, true);
+        first.code.unhook(0x700).unwrap();
+        second.code.unhook(0x700).unwrap();
+    }
+
+    #[test]
+    fn missing_mid_function_and_unreadable_unwind_data_use_compatibility_fallback() {
+        let _fixture = Fixture::new();
+        let mut generated = UnwindFixture::new();
+        let missing = generated.code.hook(NOPS).unwrap();
+        assert!(runtime_entry(missing as usize).0.is_null());
+        generated.code.unhook(NOPS).unwrap();
+        let mid = generated.code.hook(0x701).unwrap();
+        assert!(runtime_entry(mid as usize).0.is_null());
+        generated.code.unhook(0x701).unwrap();
+        // Original runtime entry remains registered, but its info RVA points
+        // outside the allocation. RPM fails safely; no metadata is registered.
+        let original = IMAGE_RUNTIME_FUNCTION_ENTRY {
+            BeginAddress: 0x700,
+            EndAddress: 0x70F,
+            Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 {
+                UnwindData: 0x7FFF_FFFC,
+            },
+        };
+        // SAFETY: fixture owns this writable table and no other thread uses it.
+        unsafe { ptr::write(generated.entry.cast_mut(), original) };
+        let slot = generated.hook();
+        assert!(runtime_entry(slot).0.is_null());
+        generated.code.unhook(0x700).unwrap();
+    }
+
+    #[test]
+    fn partial_table_cleanup_repairs_or_blocks_every_subsequent_mutation() {
+        let _fixture = Fixture::new();
+        let mut first = UnwindFixture::new();
+        let mut second = UnwindFixture::new();
+        first.hook();
+        second.hook();
+        let tables = crate::buffer::described_tables();
+        assert!(tables.len() >= 2);
+        crate::unwind::fault::DELETE_SKIP.with(|f| f.set(1));
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(true));
+        let result = uninitialize_buffer();
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(false));
+        assert_eq!(result, Err(HookError::UnwindDeletion));
+        for &(pc, entry) in &tables {
+            assert_eq!(runtime_entry(pc).0 as usize, entry);
+        }
+        // The same partial deletion, now with a failed restoration too.
+        crate::unwind::fault::DELETE_SKIP.with(|f| f.set(1));
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(true));
+        crate::unwind::fault::ADD_FAIL.with(|f| f.set(true));
+        assert_eq!(uninitialize_buffer(), Err(HookError::UnwindRegistration));
+        crate::unwind::fault::DELETE_FAIL.with(|f| f.set(false));
+        let before = first.code.get(0x700, 15);
+        assert_eq!(
+            enable_hook(first.target()),
+            Err(HookError::UnwindRegistration)
+        );
+        assert_eq!(first.code.create(NOPS), Err(HookError::UnwindRegistration));
+        assert_eq!(first.code.get(0x700, 15), before);
+        crate::unwind::fault::ADD_FAIL.with(|f| f.set(false));
+        restore_unwind_tables().unwrap();
+        for &(pc, entry) in &tables {
+            assert_eq!(runtime_entry(pc).0 as usize, entry);
+        }
+        first.code.enable(0x700).unwrap();
+        first.code.disable(0x700).unwrap();
+        first.code.unhook(0x700).unwrap();
+        second.code.unhook(0x700).unwrap();
+    }
+
+    #[test]
+    fn a_successful_slot_release_deletes_both_body_and_relay_entries() {
+        let _fixture = Fixture::new();
+        let mut generated = UnwindFixture::new();
+        let slot = generated.hook();
+        assert!(!runtime_entry(slot).0.is_null());
+        let relay = {
+            let manager = get_manager().lock().unwrap();
+            manager.hooks.items[manager.find_hook_entry(generated.target())].detour as usize
+        };
+        generated.code.unhook(0x700).unwrap();
+        if !runtime_entry(slot).0.is_null() {
+            // Conservative retirement may see stale harness pointers. The
+            // fixture is disabled, never executed, and its hook is gone: check
+            // successful physical release deterministically at the buffer seam.
+            free_buffer(slot as *mut c_void).unwrap();
+        }
+        assert!(runtime_entry(slot).0.is_null());
+        assert!(runtime_entry(relay).0.is_null());
+    }
+
+    #[test]
+    fn an_expanded_calls_short_jump_return_is_not_an_epilogue() {
+        let _fixture = Fixture::new();
+        let mut generated = UnwindFixture::new();
+        let mut expanded = false;
+        // Depending on which side the slot landed, one extreme external rel32
+        // destination is outside its reach. This code is unwound, never executed.
+        for displacement in [i32::MAX, i32::MIN] {
+            let mut code = vec![0x48, 0x83, 0xEC, 0x28, 0xE8];
+            code.extend_from_slice(&displacement.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+            generated.code.put(0x700, &code);
+            let slot = generated.hook();
+            // SAFETY: fresh, owned trampoline contains the validated body.
+            let prefix = unsafe { ptr::read((slot + 4) as *const [u8; 2]) };
+            if prefix == [0xFF, 0x15] {
+                // CallAbs returns to EB08, with the full stolen sub still live.
+                generated.unwind_at(slot + 10, true);
+                expanded = true;
+            }
+            generated.code.unhook(0x700).unwrap();
+            if expanded {
+                break;
+            }
+        }
+        assert!(expanded, "neither extreme destination used CallAbs");
     }
 }

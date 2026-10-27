@@ -1,6 +1,8 @@
 //! Wrappers over `min_hook_rs`, a pure-Rust port of `MinHook`, vendored and
 //! patched in `vendor/min_hook_rs` (see its `VENDORED.md`).
 //!
+//! Eligible trampolines carry dynamic x64 unwind metadata; unknown source data
+//! preserves compatibility without a table. See vendored patch 17 for limits.
 //! The port keeps `MinHook`'s design: trampolines allocated near the target
 //! (within 1 GB) and thread suspension while patching. Trampolines are relocated
 //! with iced-x86 and validated before they are written.
@@ -41,6 +43,10 @@ use min_hook_rs::{ALL_HOOKS, HookError};
 /// - [`HookError::TargetModified`] (17): just before a write, a hook's bytes no longer
 ///   held what the hook left there (the original code, or its own jump once
 ///   enabled), or could not be read. Nothing was written and no hook changed state.
+/// - [`HookError::UnwindRegistration`] (18): registration or repair of a dynamic
+///   unwind table failed; creation or mutation was refused.
+/// - [`HookError::UnwindDeletion`] (19): a dynamic table could not be deleted;
+///   its allocation remains live and cleanup can be retried.
 pub type MinHookError = HookError;
 
 /// True once the hooking library could not flush the instruction cache over a patch.
@@ -177,6 +183,30 @@ mod tests {
         seed ^ 0xA5A5
     }
 
+    /// Only the integration test retries safe refusals. The parallel harness
+    /// starts/exits threads throughout every lifecycle step; each production
+    /// freeze still has its original bounded budget and reports a refusal.
+    fn during_churn(mut action: impl FnMut() -> Result<(), MinHookError>, check: impl Fn()) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match action() {
+                Ok(()) => break,
+                Err(error @ (MinHookError::ThreadSuspend | MinHookError::ThreadContext)) => {
+                    check();
+                    assert!(!crate::threads::thaw_failed());
+                    assert!(std::time::Instant::now() < deadline, "freeze: {error}");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("freeze: {error}"),
+            }
+        }
+    }
+
+    fn mix_bytes() -> [u8; 5] {
+        // SAFETY: mix's first five bytes are readable mapped function code.
+        unsafe { std::ptr::read(mix as *const [u8; 5]) }
+    }
+
     #[test]
     fn hook_redirects_and_trampoline_calls_original() {
         let call: MixFn = std::hint::black_box(mix);
@@ -184,22 +214,43 @@ mod tests {
         let target = mix as MixFn as usize;
 
         let _ = initialize();
-        // SAFETY: `mix` and `mix_detour` share the signature `MixFn` and live for the test.
+        // SAFETY: mix and mix_detour share MixFn's signature and live for the test.
         let trampoline =
             unsafe { create_hook(target, mix_detour as MixFn as usize) }.expect("create_hook");
-        // SAFETY: `target` was hooked above.
-        unsafe { enable_hook(target) }.expect("enable_hook");
-        assert_eq!(call(7), 7 ^ 0xA5A5);
-
-        // SAFETY: the trampoline runs the original `mix`, so it has the type `MixFn`.
+        // SAFETY: the trampoline runs the original mix, so it has type MixFn.
         let through: MixFn = unsafe { std::mem::transmute::<usize, MixFn>(trampoline) };
+        let before = mix_bytes();
+        during_churn(
+            // SAFETY: target was hooked above and remains live.
+            || unsafe { enable_hook(target) },
+            || {
+                assert_eq!(mix_bytes(), before);
+                assert_eq!(call(7), original);
+                assert_eq!(through(7), original);
+            },
+        );
+        assert_eq!(call(7), 7 ^ 0xA5A5);
         assert_eq!(through(7), original);
-
-        // SAFETY: `target` was hooked above.
-        unsafe { disable_hook(target) }.expect("disable_hook");
+        let enabled = mix_bytes();
+        during_churn(
+            // SAFETY: target was hooked above and remains live.
+            || unsafe { disable_hook(target) },
+            || {
+                assert_eq!(mix_bytes(), enabled);
+                assert_eq!(call(7), 7 ^ 0xA5A5);
+                assert_eq!(through(7), original);
+            },
+        );
         assert_eq!(call(7), original);
-        // SAFETY: `target` was hooked above.
-        unsafe { remove_hook(target) }.expect("remove_hook");
+        during_churn(
+            // SAFETY: target is still a live, disabled hook.
+            || unsafe { remove_hook(target) },
+            || {
+                assert_eq!(mix_bytes(), before);
+                assert_eq!(call(7), original);
+                assert_eq!(through(7), original); // refused remove must keep the slot
+            },
+        );
         uninitialize().expect("uninitialize");
     }
 
