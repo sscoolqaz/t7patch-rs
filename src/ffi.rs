@@ -1,8 +1,9 @@
 //! Wrappers over `min_hook_rs`, a pure-Rust port of `MinHook`, vendored and
 //! patched in `vendor/min_hook_rs` (see its `VENDORED.md`).
 //!
-//! The port keeps `MinHook`'s design: the HDE64 length decoder, trampolines
-//! allocated within 2 GB of the target, and thread suspension while patching.
+//! The port keeps `MinHook`'s design: trampolines allocated near the target
+//! (within 1 GB) and thread suspension while patching. Trampolines are relocated
+//! with iced-x86 and validated before they are written.
 //! The vendored copy freezes fail closed and applies each change as one
 //! transaction: on an error no hook changes state, with two exceptions. After
 //! [`HookError::ThreadResume`] the change may have applied. After

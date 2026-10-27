@@ -2592,8 +2592,10 @@ mod tests {
         assert_eq!(copied, [0x31, 0xC0, 0xC3]);
         free_buffer(built.trampoline);
 
-        // A snapshot cut short refuses the hook rather than decode a partial window.
-        snapshot.len = 15;
+        // A snapshot that cuts an instruction off refuses the hook rather than
+        // decode it short: mov eax, imm32 with only three of its five bytes read.
+        snapshot.code[..5].copy_from_slice(&[0xB8, 0x11, 0x22, 0x33, 0x44]);
+        snapshot.len = 3;
         let mut short = Trampoline::new(
             target as *mut c_void,
             detour as MixFn as *mut c_void,

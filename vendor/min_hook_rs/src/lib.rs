@@ -31,7 +31,6 @@ compile_error!("This crate only supports Windows");
 
 // Core modules
 pub mod buffer;
-pub mod disasm;
 pub mod error;
 pub mod hook;
 pub mod instruction;

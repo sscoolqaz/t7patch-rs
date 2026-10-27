@@ -2,11 +2,13 @@
 
 - Upstream: [`min_hook_rs`](https://github.com/Rukkhadevata123/min_hook_rs) 2.2.1 from crates.io,
   by Rukkhadevata123, MIT (see `LICENSE`). A pure-Rust port of MinHook.
-- Copied from the cargo registry source. `src/disasm.rs`, `README.md` and `LICENSE`
-  are unchanged. `src/lib.rs` carries only the lint and format changes listed under
-  "Lint changes". `src/buffer.rs` has those plus a test-only slot counter
-  (`used_slots`). `src/trampoline.rs` and `src/instruction.rs` change for patches 13
-  and 14. `src/hook.rs` drives the shared `thread_freeze` engine (patch 15).
+- Copied from the cargo registry source. `README.md` and `LICENSE` are unchanged.
+  `src/disasm.rs`, upstream's HDE-style decoder, is removed (patch 16; iced-x86
+  replaces it). `src/lib.rs` carries the lint and format changes listed under
+  "Lint changes" and drops `pub mod disasm`. `src/buffer.rs` has those plus a
+  test-only slot counter (`used_slots`). `src/trampoline.rs` changes for patches
+  13, 14 and 16, `src/instruction.rs` for patch 13. `src/hook.rs` drives the
+  shared `thread_freeze` engine (patch 15).
 - T7Patch-rs reaches it only through `src/ffi.rs`. It is a workspace member, so
   `cargo test --workspace` and `cargo clippy --workspace` cover it.
 
@@ -18,13 +20,15 @@
   `windows-sys` for patch 9, and a path dependency on the workspace's
   `thread_freeze` crate (patch 15; a dev-dependency on it with the `test-seams`
   feature for the hook tests' fault wrapper).
+- It adds a dependency on `iced-x86` 1.21.0 (patch 16; see "Dependencies").
 - The registry files `.cargo-ok`, `.cargo_vcs_info.json`, `.gitignore` and
   `Cargo.lock` are not copied.
 
 ## Patches
 
 The behaviour patches are in `src/hook.rs` and `src/error.rs`, and for patches 13
-and 14 also in `src/trampoline.rs` and `src/instruction.rs`.
+and 14 also in `src/trampoline.rs` and `src/instruction.rs`, and patch 16 is in
+`src/trampoline.rs`.
 
 Since patch 15 the thread-freeze mechanics (patches 2–5, 9, 10) live in the
 workspace crate `thread_freeze`, shared with `src/threads.rs` in T7Patch-rs, so
@@ -203,12 +207,13 @@ descriptions below are of behaviour the engine now provides; the names
    `create_trampoline` now frees its slot too (upstream leaked it).
 14. **The original bytes are re-checked just before every write.** `create_hook`
    reads the target's code once, without faulting (`ReadProcessMemory`, split at a
-   page boundary): the hot-patch bytes above it and 35 bytes from it. The trampoline
-   is decoded and copied from that snapshot, never from live memory, so a writer that
-   changes the code and changes it back while the trampoline is built cannot leave a
-   trampoline that differs from the backup. Each decode gets a full 16-byte window or
-   the hook is refused (`UnsupportedFunction`): the decoder silently shortens an
-   instruction its input cuts off. The footprint's bytes from the snapshot are the
+   page boundary): the hot-patch bytes above it and 19 bytes from it (an
+   instruction the scan decodes starts at offset 4 or less and is at most 15 bytes).
+   The trampoline is decoded and copied from that snapshot, never from live memory,
+   so a writer that changes the code and changes it back while the trampoline is
+   built cannot leave a trampoline that differs from the backup. Only the bytes the
+   snapshot read are decoded; an instruction they cut off is refused
+   (`UnsupportedFunction`) rather than decoded short (patch 16). The footprint's bytes from the snapshot are the
    hook's backup (`HookEntry::original`; a disable writes back its patch range). In
    `transact`, with every thread frozen and after every footprint was made writable
    (the whole footprint, so a source byte on an execute-only page can be read back),
@@ -234,6 +239,65 @@ descriptions below are of behaviour the engine now provides; the names
    scratch (`moves`/`journal`/`slots`; `batch`/`watch`; `reports`), because a stuck
    thread may hold the heap lock a drop would take. The enumeration's Wine recheck
    now uses `NtGetNextThread` (patch 9).
+
+16. **The prologue is relocated with iced-x86.** Upstream relocated by hand from
+   its HDE-style decoder: a RIP-relative displacement was re-based and narrowed with
+   `as u32` with no range check, so a trampoline more than 2 GiB from the data was
+   silently wrong, and the decoder shortened an instruction its input cut off.
+   `trampoline::relocate` now decodes the snapshot with iced's `Decoder` at the
+   target's real address, keeping upstream's rules for where the trampoline ends:
+   after 5 bytes (then a `JmpAbs` back to `target + source_len`), at a `ret`, a
+   `jmp [rip + x]` or an external jump once past every internal jump (one into
+   `[target, target + 5)`). A `jmp reg` does not end it, as upstream. Each source
+   instruction becomes one *unit*:
+   - a relative `call`/`jmp`/`jcc`, internal or with an external target in rel32
+     reach of the whole slot, and a RIP-relative operand, are re-encoded by iced's
+     `BlockEncoder` for the trampoline's address, which also re-targets an internal
+     branch to the relocated instruction;
+   - an external branch out of that reach keeps upstream's absolute form
+     (`JmpAbs`, `CallAbs`, or `JccAbs` with the condition inverted), so branch
+     reach refuses no hook upstream accepted (the refusals below do);
+   - anything else is copied byte for byte. Copied and absolute-form units are
+     given to iced as declared bytes at their original IP, so an internal branch
+     still lands on them.
+   Refused with `UnsupportedFunction`: an invalid or cut-off instruction; `LOOP`,
+   `LOOPcc`, `JrCXZ`, `XBEGIN` and any other relative branch; an EIP-relative
+   operand; a branch into the hot-patch bytes above the target, or into the patch
+   range other than at a decoded boundary; a RIP-relative access whose bytes overlap
+   `[target - 5, target + max(5, source_len))` (a `lea` only by its address),
+   whose size iced reports as unknown, or that is a `bt`/`bts`/`btr`/`btc` with a
+   register bit index (the register moves the access past the operand), or that
+   has an `fs:`/`gs:` prefix (the segment base moves it); a slot
+   whose end would wrap the address space; a RIP-relative operand iced cannot reach with
+   rel32 (iced's EIP-relative fallback is refused too). The encoding is then checked
+   independently of how iced built it: one offset per unit, starting at 0, strictly
+   increasing, none of iced's long forms (`u32::MAX`); copied and absolute units
+   hold exactly the expected bytes; each re-encoded unit decodes, at its new
+   address, to one instruction that fills it, with the same code (a branch may
+   change between its short and near forms), the same absolute memory address on a
+   RIP base, and a branch target that is the original one or, for an internal
+   target, the relocated boundary. The body and the jump back must fit
+   `TRAMPOLINE_MAX_SIZE` (the slot less the relay), and the boundary map (each
+   unit's start, plus the jump back) its eight `u8` entries. All of this builds into
+   a fixed buffer; only then does `create_trampoline` copy it into the slot and
+   write the relay. `patch_above`, `source_len` and the map keep their meaning: the
+   Crafted layouts in `hook::tests` are unchanged. It runs in `create_hook`, before
+   any freeze; iced allocates there. Tests: `trampoline::tests`, on crafted bytes at
+   fake addresses, with the decoder's own checks in `hook::tests`.
+
+## Dependencies
+
+- [`iced-x86`](https://github.com/icedland/iced) 1.21.0, MIT, `rust-version`
+  1.57, pure Rust with no build script. A real dependency, linked into the DLL, not
+  an idea port. Used only by `src/trampoline.rs` (patch 16) to decode the stolen
+  prologue, re-encode its relative branches and RIP-relative operands with
+  `BlockEncoder`, and re-decode the result for validation. Features:
+  `default-features = false`, `no_std`, `decoder`, `block_encoder` (and thereby
+  `encoder`), `instr_info` (for `is_call_near`, `is_jcc_short_or_near` and
+  `condition_code`). It brings `lazy_static` 1.5.1 (MIT OR Apache-2.0) with
+  `spin_no_std`, which brings `spin` 0.9.9 (MIT, `rust-version` 1.38, `once`
+  feature only). Their lazy tables are first filled in `create_hook`, before any
+  freeze. The workspace was checked with Rust 1.87.0.
 
 ## Ideas borrowed from neohook
 
@@ -264,6 +328,16 @@ built or linked, and is not a dependency.
   refuse a hook whose bytes overlap a queued or installed hook's. Ours compares
   footprints, which add the hot-patch bytes and every relocated source byte, and
   checks once, under the hook-manager lock that every change holds.
+- Patch 16, from `src/disasm.rs` (`relocate`, lines 293-360, and its tests): build
+  the trampoline by decoding the stolen bytes with iced-x86 and re-encoding them
+  with `BlockEncoder`, using `RETURN_NEW_INSTRUCTION_OFFSETS` as the old-to-new
+  boundary map, and refuse a branch into the middle of a stolen instruction. Only
+  its dependency list, signatures and test names were read for this; no code was
+  taken. Ours differs: it copies plain instructions as declared bytes instead of
+  re-encoding them, keeps MinHook's absolute forms for branches out of reach and
+  MinHook's rules for where the trampoline ends, refuses EIP-relative operands and
+  accesses to the patched bytes, and re-decodes iced's output to check it. iced-x86
+  itself is a real dependency here (see "Dependencies"), not an idea port.
 - Patch 14 is not from neohook. neohook checks only that its patch has the stolen
   length before writing (`src/transaction.rs` line 2058), not that the bytes are
   still the ones it saved.

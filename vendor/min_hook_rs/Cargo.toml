@@ -57,3 +57,9 @@ path = "../../crates/thread_freeze"
 [dev-dependencies.thread_freeze]
 path = "../../crates/thread_freeze"
 features = ["test-seams"]
+
+# Decodes and relocates the stolen prologue (patch 16). Pure Rust, MIT.
+[dependencies.iced-x86]
+version = "1.21.0"
+default-features = false
+features = ["no_std", "decoder", "block_encoder", "instr_info"]

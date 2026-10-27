@@ -32,7 +32,9 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --workspace --target x
 The project is Rust only: no C or C++ sources, no `cc` build scripts, no
 prebuilt `.lib` files, and no dependency that compiles C. Hooking uses
 `min_hook_rs`, a pure-Rust port of MinHook, vendored in `vendor/min_hook_rs`
-with fail-closed freeze patches (see its `VENDORED.md`). It is a workspace
+with fail-closed freeze patches (see its `VENDORED.md`). Its trampolines are
+relocated with `iced-x86` (pure Rust, MIT, `no_std`); its VENDORED.md lists
+it and the two crates it brings in. The vendored crate is a workspace
 member, so run clippy and the tests with `--workspace`. Reach the hooking
 library only through `src/ffi.rs`. The thread-freeze mechanics it and
 `src/threads.rs` share live in the `crates/thread_freeze` workspace crate; the
@@ -96,6 +98,10 @@ pointer, and a fixed crash queue with a safe stack probe. Further hardening:
   cannot be resumed keeps its handle and disables further code writes and hook
   changes (terminal, one process-wide latch); the engine and callers then keep
   their buffers rather than dropping them.
+- Trampolines are relocated with iced-x86 into an owned buffer and checked
+  (reach of every re-based operand and branch, boundaries, the boundary map,
+  size) before anything is written to the slot; anything uncertain refuses the
+  hook. A branch out of rel32 reach keeps MinHook's absolute form.
 - Each freeze, here and in the vendored hook library, is a bounded run of
   attempts. A thread created during the freeze is never suspended; it, a
   thread with no TEB yet (one Wine has not started, whose context read would
