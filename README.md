@@ -102,12 +102,21 @@ Other departures from upstream are listed in
 
 ## Loading and configuration
 
-Building produces the patch DLL, not an installer or loader. The tested Proton
-setup uses upstream-compatible `dsound.dll` and `t7patchloader.dll` components;
-these are not included here. Simply placing `t7patch.dll` in the game folder
-does not invoke its installation exports. Follow
-[the loading instructions](docs/testing-under-proton.md#loading-the-dll),
-including the Proton DLL override.
+This project builds only `t7patch.dll`, a drop-in replacement for upstream's
+DLL. Install it the normal T7Patch way:
+
+1. Install upstream T7Patch with
+   [its instructions](https://github.com/Scroptss/T7Patch#windows-instructions)
+   (Windows, or the Linux/Steam Deck zip and launch options under Proton). This
+   provides the `dsound.dll` and `t7patchloader.dll` loader and `t7patch.conf`.
+2. Replace `t7patch.dll` in the game folder with the one from
+   [this project's releases](https://github.com/sscoolqaz/t7patch-rs/releases/latest)
+   or your own build.
+
+The loader, launch options and config stay upstream's, so setups that expect the
+standard T7Patch layout keep working. On its own, `t7patch.dll` in the game
+folder does nothing: the loader calls its installation exports. Diagnostic
+launch options are in [Proton testing](docs/testing-under-proton.md).
 
 `t7patch.conf` is created in the game's working directory and watched for
 changes. It contains `playername`, `isfriendsonly`, `autoinstallmods`, and
