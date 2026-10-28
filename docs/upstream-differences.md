@@ -116,6 +116,23 @@ message. Code 1 is an unreadable header field, 2 an unreadable `valid`, and 3
 an unreadable lobby field. Fewer elements are accepted, as the game accepts
 them.
 
+### The lobby password prefix gates every set password
+
+Upstream appends the two prefix bytes (bits 16..24 and 24..32 of the password
+hash) only when the first byte is non-zero, and its reader skips the check
+the same way. A zero first byte doubled as "no password", so about 1 in 256
+passwords turned the check off. `zbr_prefix` now returns `None` only when no
+password is set (hash 0), and any set password writes and checks both bytes.
+For those 1-in-256 passwords, a lobby with this port and upstream peers
+won't agree: upstream sends no prefix and this port expects one.
+
+### Overflowed instant messages are not dispatched
+
+The `dwInstantDispatchMessage` detour copies the payload with `MSG_ReadData`
+and then calls `LobbyMsg_HandleIM`. Upstream dispatches even when the read
+overflowed. `dispatch_im_payload` now returns 0 instead, as the game's own
+`dwInstantHandleLobbyMessage` does.
+
 ### `__report_gsfailure` is not hooked
 
 Upstream hooks `__report_gsfailure` to catch MSVC `/GS` stack-cookie
@@ -153,8 +170,5 @@ a 2048-byte stack buffer in run 13.
 
 ## Open
 
-- Shared with upstream: the normal path calls `LobbyMsg_HandleIM` without
-  checking `msg.overflowed` after `MSG_ReadData`. The game's own handler skips
-  dispatch on overflow.
 - `MAX_SCRIPT_VMS = 2` comes from the engine enum and was not checked against
   the Arxan-encrypted binary.

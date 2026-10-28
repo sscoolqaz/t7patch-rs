@@ -746,16 +746,19 @@ fn byte_at(value: i64, shift: u32) -> u8 {
     u8::try_from((value >> shift) & 0xFF).unwrap_or_default()
 }
 
-/// `(ZBR_PREFIX_BYTE, ZBR_PREFIX_BYTE2)` of one password hash: bits 16..24 and 24..32.
+/// `(ZBR_PREFIX_BYTE, ZBR_PREFIX_BYTE2)` of one password hash: bits 16..24 and
+/// 24..32. `None` when no password is set (hash 0). Upstream treats a zero first
+/// byte as "no password", which turned the check off for 1 in 256 passwords; a
+/// set password always has a prefix here, whatever its bytes are.
 #[must_use]
-pub fn zbr_prefix_of(hash: i64) -> (u8, u8) {
-    (byte_at(hash, 16), byte_at(hash, 24))
+pub fn zbr_prefix_of(hash: i64) -> Option<(u8, u8)> {
+    (hash != 0).then(|| (byte_at(hash, 16), byte_at(hash, 24)))
 }
 
 /// Both prefix bytes of the current password hash, read under one lock, so a
 /// packet never mixes bytes from a password before and after a rotation.
 #[must_use]
-pub fn zbr_prefix() -> (u8, u8) {
+pub fn zbr_prefix() -> Option<(u8, u8)> {
     zbr_prefix_of(lock(&PRIVATE_PASSWORD)[1])
 }
 
@@ -3695,9 +3698,26 @@ mod tests {
 
     #[test]
     fn prefix_bytes_come_from_one_hash() {
-        assert_eq!(zbr_prefix_of(0x0000_0000_AABB_CCDD), (0xBB, 0xAA));
-        assert_eq!(zbr_prefix_of(0), (0, 0));
-        assert_eq!(zbr_prefix_of(-1), (0xFF, 0xFF));
+        assert_eq!(zbr_prefix_of(0x0000_0000_AABB_CCDD), Some((0xBB, 0xAA)));
+        assert_eq!(zbr_prefix_of(-1), Some((0xFF, 0xFF)));
+    }
+
+    #[test]
+    fn prefix_is_none_only_without_a_password() {
+        assert_eq!(zbr_prefix_of(network_password_key(b"")), None);
+        assert_eq!(zbr_prefix_of(0), None);
+    }
+
+    #[test]
+    fn prefix_with_a_zero_first_byte_still_gates() {
+        // Upstream skipped the prefix whenever bits 16..24 were zero.
+        assert_eq!(zbr_prefix_of(0x0000_0000_AA00_CCDD), Some((0x00, 0xAA)));
+        assert_eq!(zbr_prefix_of(0x0000_0000_0000_0001), Some((0x00, 0x00)));
+        let password = (0..10_000u32)
+            .map(|n| format!("pw{n}").into_bytes())
+            .find(|pw| byte_at(network_password_key(pw), 16) == 0)
+            .expect("some password hashes to a zero first prefix byte");
+        assert!(zbr_prefix_of(network_password_key(&password)).is_some());
     }
 
     #[test]

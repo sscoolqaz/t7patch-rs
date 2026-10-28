@@ -886,8 +886,7 @@ unsafe extern "system" fn hk_lobby_msg_rw_prep_write_msg(
     if !unsafe { ORIG_LOBBY_MSG_RW_PREP_WRITE_MSG.get()(lobby_msg, data, length, msg_type) } {
         return false;
     }
-    let (prefix1, prefix2) = protection::zbr_prefix();
-    if prefix1 != 0 {
+    if let Some((prefix1, prefix2)) = protection::zbr_prefix() {
         // SAFETY: `lobby_msg` is the handle the original just wrote into.
         unsafe { msg_write_byte(lobby_msg, prefix1) };
         // SAFETY: as above.
@@ -901,10 +900,9 @@ unsafe extern "system" fn hk_lobby_msg_rw_prep_read_msg(lm: i64) -> bool {
     if !unsafe { ORIG_LOBBY_MSG_RW_PREP_READ_MSG.get()(lm) } {
         return false;
     }
-    let (expected1, expected2) = protection::zbr_prefix();
-    if expected1 == 0 {
+    let Some((expected1, expected2)) = protection::zbr_prefix() else {
         return true;
-    }
+    };
     // SAFETY: `lm` is the lobby message the original just prepared for reading.
     let prefix1 = unsafe { msg_read_byte(addr(lm) as *mut c_void) };
     // SAFETY: as above.
@@ -1407,19 +1405,44 @@ unsafe extern "system" fn hk_dw_instant_dispatch_message(
         return 0;
     }
 
-    if is_valid {
-        let size = msg.cursize.wrapping_sub(msg.readcount);
-        if size < 2048 {
-            let mut data = [0u8; 2048];
-            // SAFETY: `data` holds 2048 bytes and `size` is below that.
-            unsafe { msg_read_data(&raw mut msg, data.as_mut_ptr().cast(), size.cast_signed()) };
-            // SAFETY: `data` holds `size` bytes just read from the message.
-            return unsafe {
-                lobby_msg_handle_im(0, sender_xuid, data.as_mut_ptr().cast(), size.cast_signed())
-            };
-        }
+    if !is_valid {
+        return 0;
     }
-    0
+    dispatch_im_payload(
+        &mut msg,
+        |msg, data, size| {
+            // SAFETY: `data` holds 2048 bytes and `size` is below that.
+            unsafe { msg_read_data(msg, data.as_mut_ptr().cast(), size) };
+        },
+        |data, size| {
+            // SAFETY: `data` holds `size` bytes just read from the message.
+            unsafe { lobby_msg_handle_im(0, sender_xuid, data.as_mut_ptr().cast(), size) }
+        },
+    )
+}
+
+/// Copies the rest of `msg` into a 2048-byte buffer with `read` and passes it to
+/// `handle` (`LobbyMsg_HandleIM`). Returns 0 without calling `handle` when the
+/// payload doesn't fit or the read overflowed, as the game's own
+/// `dwInstantHandleLobbyMessage` does; upstream dispatched overflowed reads.
+fn dispatch_im_payload(
+    msg: &mut Msg,
+    read: impl FnOnce(&mut Msg, &mut [u8; 2048], i32),
+    handle: impl FnOnce(&mut [u8; 2048], i32) -> i64,
+) -> i64 {
+    let size = msg.cursize.wrapping_sub(msg.readcount);
+    let Ok(size) = i32::try_from(size) else {
+        return 0;
+    };
+    if size >= 2048 {
+        return 0;
+    }
+    let mut data = [0u8; 2048];
+    read(msg, &mut data, size);
+    if msg.overflowed {
+        return 0;
+    }
+    handle(&mut data, size)
 }
 
 unsafe extern "system" fn hk_cl_connectionless_cmd(
@@ -2224,6 +2247,59 @@ pub fn disable_all() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zeroed message with `remaining` unread bytes.
+    fn msg_with_remaining(remaining: u32) -> Msg {
+        // SAFETY: a zeroed `msg_t` is valid, as in `hk_dw_instant_dispatch_message`.
+        let mut msg: Msg = unsafe { std::mem::zeroed() };
+        msg.cursize = remaining + 4;
+        msg.readcount = 4;
+        msg
+    }
+
+    #[test]
+    fn im_payload_is_dispatched_when_the_read_succeeds() {
+        let mut msg = msg_with_remaining(3);
+        let result = dispatch_im_payload(
+            &mut msg,
+            |_, data, size| {
+                assert_eq!(size, 3);
+                data[..3].copy_from_slice(b"abc");
+            },
+            |data, size| {
+                assert_eq!(&data[..3], b"abc");
+                i64::from(size) + 100
+            },
+        );
+        assert_eq!(result, 103);
+    }
+
+    #[test]
+    fn overflowed_im_payload_is_not_dispatched() {
+        let mut msg = msg_with_remaining(3);
+        let result = dispatch_im_payload(
+            &mut msg,
+            |msg, _, _| msg.overflowed = true,
+            |_, _| panic!("an overflowed read reached LobbyMsg_HandleIM"),
+        );
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn oversized_or_negative_im_payload_is_not_read() {
+        for (cursize, readcount) in [(2048 + 4, 4), (2, 4)] {
+            // SAFETY: as in `msg_with_remaining`.
+            let mut msg: Msg = unsafe { std::mem::zeroed() };
+            msg.cursize = cursize;
+            msg.readcount = readcount;
+            let result = dispatch_im_payload(
+                &mut msg,
+                |_, _, _| panic!("read an oversized payload"),
+                |_, _| panic!("dispatched an oversized payload"),
+            );
+            assert_eq!(result, 0);
+        }
+    }
 
     /// A byte source over a fixed table, for `callsite_from_return`.
     fn bytes_at(table: &[(usize, u8)]) -> impl Fn(usize) -> u8 + '_ {
